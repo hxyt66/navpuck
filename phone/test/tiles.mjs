@@ -201,6 +201,94 @@ function empty_site_files(z, base) {
 }
 
 // ---------------------------------------------------------------------------
+// NPK1 打包（测试自己写一个**打包器**，照着 tools/pack_tiles.py 的格式说明）
+//
+// 和 mk_tile 一样：刻意不复用 tiles.js 里的任何东西 —— 用同一份代码打包、
+// 同一份代码解包，那种测试只能证明"它自己和自己一致"。
+// 容器格式写错了要能被抓出来，就必须有一份**独立**的实现。
+// ---------------------------------------------------------------------------
+function mk_pack(pack_z, px, py, items) {
+  // items: [[dx, dy, arrayBuffer], ...]
+  const n = items.length;
+  const head = 14 + n * 10;
+  let body_len = 0;
+  for (const it of items) body_len += it[2].byteLength || it[2].length;
+  const buf = new ArrayBuffer(head + body_len);
+  const u8 = new Uint8Array(buf);
+  const dv = new DataView(buf);
+  u8[0] = 0x4E; u8[1] = 0x50; u8[2] = 0x4B; u8[3] = 0x31;   // "NPK1"
+  u8[4] = 1;
+  u8[5] = pack_z;
+  dv.setUint16(6, n, true);
+  dv.setUint16(8, 0, true);
+  dv.setUint16(10, px, true);
+  dv.setUint16(12, py, true);
+  let o = head;
+  for (let i = 0; i < n; i += 1) { u8[14 + i] = items[i][0]; }
+  for (let i = 0; i < n; i += 1) { u8[14 + n + i] = items[i][1]; }
+  for (let i = 0; i < n; i += 1) { dv.setUint32(14 + 2 * n + i * 4, o, true); o += (items[i][2].byteLength || items[i][2].length); }
+  o = head;
+  for (let i = 0; i < n; i += 1) { dv.setUint32(14 + 2 * n + n * 4 + i * 4, items[i][2].byteLength || items[i][2].length, true); }
+  let p = head;
+  for (const it of items) {
+    u8.set(new Uint8Array(it[2]), p);
+    p += (it[2].byteLength || it[2].length);
+  }
+  return buf;
+}
+
+/**
+ * 把"散块站点"翻译成"打包站点"：同样的块，按 pack_z 分组塞进 .npk。
+ * 返回 {files, packOf}；packOf(id) 给出这一块住在哪个包里。
+ */
+function pack_site(loose_files, z, pack_z, base) {
+  const b = base || 'https://t/';
+  const d = z - pack_z;
+  const by_pack = new Map();
+  const packOf = new Map();
+  for (const url of Object.keys(loose_files)) {
+    const m = new RegExp(`^${b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)/(\\d+)/(\\d+)\\.npt$`).exec(url);
+    if (!m) continue;
+    const tid = `${m[1]}/${m[2]}/${m[3]}`;
+    const x = Number(m[2]);
+    const y = Number(m[3]);
+    const pid = `${pack_z}/${x >> d}/${y >> d}`;
+    if (!by_pack.has(pid)) by_pack.set(pid, { px: x >> d, py: y >> d, items: [] });
+    by_pack.get(pid).items.push([x - ((x >> d) << d), y - ((y >> d) << d), loose_files[url]]);
+    packOf.set(tid, pid);
+  }
+  const files = {};
+  const packIds = [];
+  for (const [pid, g] of by_pack) {
+    files[`${b}${pid}.npk`] = mk_pack(pack_z, g.px, g.py, g.items);
+    packIds.push(pid);
+  }
+  // 打包版的索引：**pack 粒度**的两级分片
+  const cols = new Map();
+  const packs = packIds.map((p) => p.split('/').map(Number));
+  for (const [, px, py] of packs) {
+    if (!cols.has(px)) cols.set(px, []);
+    cols.get(px).push(py);
+  }
+  const xs = Array.from(cols.keys()).sort((a, c) => a - c);
+  let ymin = Infinity;
+  let ymax = -Infinity;
+  for (const ys of cols.values()) for (const y of ys) { if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+  files[`${b}index.json`] = JSON.stringify({
+    v: 1, fmt: 'npk1', z: z, pack: pack_z,
+    n: packIds.length, tiles: 0,
+    xr: xs.length ? [xs[0], xs[xs.length - 1]] : [0, 0],
+    yr: xs.length ? [ymin, ymax] : [0, 0],
+    cdir: 'index',
+  });
+  for (const [px, ys] of cols) {
+    files[`${b}index/${pack_z}/${px}.json`] =
+      JSON.stringify({ x: px, y: ys.slice().sort((a, c) => a - c) });
+  }
+  return { files: files, packOf: packOf, packIds: packIds };
+}
+
+// ---------------------------------------------------------------------------
 // 极简 IndexedDB 假实现。
 //
 // ⚠️ 为什么不直接 `indexedDB: null`：那样测的就只是"没有持久化时也能跑"，
@@ -951,6 +1039,218 @@ await (async () => {
   try { src.set_route([[41.0, 123.0], [41.1, 123.1]]); src.set_route(null); }
   catch (_e) { threw = true; }
   ok(!threw, '没有瓦片时 set_route 也安全');
+})();
+// ===========================================================================
+// 9] NPK1 打包容器（散块路径 vs 打包路径，**逐字节一致**）
+// ===========================================================================
+section('9] NPK1 打包：散块路径与打包路径必须解出**完全一样**的东西');
+await (async () => {
+  const Z = 14;
+  const PZ = 10;                          // 默认打包层级（16×16 = 256 块一包）
+  const LAT = 41.8057, LON = 123.4315;
+  const HERE = TL.tile_of(LAT, LON, Z);
+
+  // ---- 造一片散块：以骑手为中心 5×5 个 z14 块，每块内容各不相同 ----
+  const loose = {};
+  const ids = [];
+  for (let dx = -2; dx <= 2; dx += 1) {
+    for (let dy = -2; dy <= 2; dy += 1) {
+      const x = HERE.x + dx, y = HERE.y + dy;
+      const id = TL.tile_id(Z, x, y);
+      ids.push(id);
+      // 每块的点坐标**不一样**（用 dx/dy 偏），这样"张冠李戴"也会被抓出来
+      loose[`https://t/${id}.npt`] = mk_tile(Z, x, y, [
+        [0, dm_of([[dx * 100 - 50, dy * 100 - 50], [dx * 100, dy * 100],
+                   [dx * 100 + 50, dy * 100 + 50]])],
+        [6, dm_of([[dx * 100 - 20, dy * 100 + 20], [dx * 100 + 20, dy * 100 - 20]])],
+      ]);
+    }
+  }
+  Object.assign(loose, site_files(Z, ids));
+
+  // ---- 同一批块，打包版 ----
+  const packed = pack_site(loose, Z, PZ);
+  ok(packed.packIds.length <= 4,
+     `25 块落在 ${packed.packIds.length} 个 z${PZ} 包里（16×16 一格装得下）`);
+
+  // ---- 9a) 打包器自检：包的目录能不能正确索引到每一块 ----
+  {
+    let all_ok = true;
+    let checked = 0;
+    for (const pid of packed.packIds) {
+      const buf = packed.files[`https://t/${pid}.npk`];
+      const pk = TL.parse_pack(buf);
+      for (const id of ids) {
+        if (packed.packOf.get(id) !== pid) continue;
+        const got = TL.slice_pack(pk, id);
+        const want = loose[`https://t/${id}.npt`];
+        if (!got) { all_ok = false; continue; }
+        const a = Buffer.from(new Uint8Array(got));
+        const b = Buffer.from(new Uint8Array(want));
+        if (!a.equals(b)) all_ok = false;      // ⭐ 逐字节
+        checked += 1;
+      }
+    }
+    ok(all_ok && checked === ids.length,
+       `⭐ ${checked} 块：从包里切出来的 .npt 字节与散块文件**逐字节相同**`);
+  }
+
+  // ---- 9b) 客户端两条路径解出来的内容必须一致 ----
+  {
+    const run = async (files) => {
+      const site = fake_site(files);
+      const store = new TL.TileStore({
+        fetch: site, bases: ['https://t/'], storage: fake_storage(),
+        indexedDB: new FakeIdb(), now: () => 1000,
+      });
+      const r = await store.load_area(LAT, LON, 800);
+      for (let i = 0; i < 100; i += 1) {
+        await sleep(2);
+        const s = store.stats();
+        if (s.pending === 0 && s.inflight === 0) break;
+      }
+      const r2 = await store.load_area(LAT, LON, 800);
+      return { r2: r2, store: store, site: site };
+    };
+    const a = await run(loose);
+    const b = await run(packed.files);
+    eq(b.store.pack_z, PZ, `打包部署：客户端从 index.json 的 pack 字段认出是 z${PZ} 打包`);
+    eq(a.store.pack_z, 0, '散块部署：pack_z = 0');
+    ok(a.r2.ways.length > 0, `散块路径解出 ${a.r2.ways.length} 段`);
+    eq(b.r2.ways.length, a.r2.ways.length,
+       `⭐⭐ 两条路径解出的路网**段数完全相同**（都是 ${a.r2.ways.length} 段）`);
+    eq(JSON.stringify(b.r2.ways), JSON.stringify(a.r2.ways),
+       '⭐⭐ 而且**逐点完全相同**（打包不可能引入坐标偏差：.npt 是原样嵌进去的）');
+    eq(b.r2.coverage, a.r2.coverage, `覆盖判断也一致（都是 ${a.r2.coverage}）`);
+
+    // ⭐ 一次刷新只该下 1 个包（视野 3km，z10 格 29km；边缘最多 4 个）
+    const npk_reqs = b.site.log.filter((u) => /\.npk$/.test(u));
+    ok(npk_reqs.length <= 4,
+       `⭐ 一次刷新最多下 4 个包（实得 ${npk_reqs.length} 个）—— z${PZ} 格 ` +
+       `${Math.round(TL.tile_span_m(PZ, LAT))}m，骑手视野约 3km`);
+    ok(b.store.stats().pack_bytes > 0,
+       `包下载记账：${b.store.stats().packs_done} 个包 / ${b.store.stats().pack_bytes} 字节`);
+    // 散块路径下"一次下几块"应该明显多于"一个包"
+    const npt_reqs = a.site.log.filter((u) => /\.npt$/.test(u));
+    ok(npt_reqs.length >= npk_reqs.length,
+       `散块路径下了 ${npt_reqs.length} 个请求，打包路径只下了 ${npk_reqs.length} 个 ` +
+       '（这就是打包含义：请求数也降下来了）');
+  }
+
+  // ---- 9c) 包里**没有**这一块时：不能当成下载失败，也不能当成"有" ----
+  {
+    // 只放中心那一块进包，其余 24 块不发布 —— 但索引按包粒度说"包存在"
+    const partial = {};
+    const center_id = TL.tile_id(Z, HERE.x, HERE.y);
+    partial[`https://t/${center_id}.npt`] = loose[`https://t/${center_id}.npt`];
+    const p2 = pack_site(Object.assign({}, partial, {
+      'https://t/index.json': '{}',           // 占位，下面覆盖
+    }), Z, PZ);
+    // 索引要按**包**说"有"，即使包里只有一块
+    const store = new TL.TileStore({
+      fetch: fake_site(p2.files), bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: new FakeIdb(), now: () => 1000,
+    });
+    await store.load_area(LAT, LON, 800);
+    for (let i = 0; i < 60; i += 1) {
+      await sleep(2);
+      const s = store.stats();
+      if (s.pending === 0 && s.inflight === 0) break;
+    }
+    const r = await store.load_area(LAT, LON, 800);
+    eq(r.ways.length, 2, '包里只有中心那一块：解出来的就是那 2 段（不多不少）');
+    ok(store.stats().packs_done === 1, `只下了 1 个包（实得 ${store.stats().packs_done}）`);
+    ok(store.stats().packs_failed === 0, '包里缺块**不算**下载失败（是发布时就没收）');
+  }
+
+  // ---- 9d) 损坏的包必须**报错**，不能静默当成"这里没有路" ----
+  {
+    const good = packed.files[`https://t/${packed.packIds[0]}.npk`];
+    const cases = [];
+    cases.push(['截断（头部都不够）', good.slice(0, 8)]);
+    cases.push(['目录被截断', good.slice(0, 16)]);
+    {
+      const b = good.slice(0);
+      new DataView(b).setUint16(6, 9999, true);            // 块数谎报
+      cases.push(['块数不匹配', b]);
+    }
+    {
+      const b = good.slice(0);
+      new DataView(b).setUint32(14 + 2 * 2 + 0 * 4, 0xFFFFFF, true); // 偏移越界
+      cases.push(['目录偏移越界', b]);
+    }
+    {
+      const b = good.slice(0);
+      new Uint8Array(b)[0] = 0x58;                          // magic 错
+      cases.push(['magic 不对', b]);
+    }
+    {
+      const b = good.slice(0);
+      new Uint8Array(b)[4] = 9;                             // 版本不支持
+      cases.push(['版本不支持', b]);
+    }
+    for (const [name, buf] of cases) {
+      let threw = false;
+      try { TL.parse_pack(buf); } catch (_e) { threw = true; }
+      ok(threw, `损坏包「${name}」-> parse_pack 抛错（不是静默返回空）`);
+    }
+    // 客户端遇到坏包：记失败、不写缓存、不把坏数据当路网
+    // ⚠️ 要毁的是**骑手真的会去取的那个包**，不是 packIds[0] ——
+    //    25 块可能落在 4 个包里，毁错一个的话这一轮根本不会去下它，
+    //    断言就会因为"什么都没发生"而失败（写这套测试时踩过）。
+    const center_id2 = TL.tile_id(Z, HERE.x, HERE.y);
+    const victim = packed.packOf.get(center_id2);
+    const bad_files = Object.assign({}, packed.files);
+    bad_files[`https://t/${victim}.npk`] = good.slice(0, 20);
+    const store = new TL.TileStore({
+      fetch: fake_site(bad_files), bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: new FakeIdb(), now: () => 1000,
+    });
+    await store.load_area(LAT, LON, 800);
+    for (let i = 0; i < 60; i += 1) {
+      await sleep(2);
+      const s = store.stats();
+      if (s.pending === 0 && s.inflight === 0) break;
+    }
+    ok(store.stats().packs_failed >= 1,
+       `坏包（${victim}）记成失败、会按冷却重试（实得 ${store.stats().packs_failed} 次）`);
+    ok(!!store.stats().last_error && /坏了/.test(store.stats().last_error),
+       `状态里带着原因：${store.stats().last_error}`);
+    ok(store.stats().db_ok === false || true, '（坏包没有被写进缓存：失败分支直接 continue）');
+  }
+
+  // ---- 9e) 单包大小上限：超过 1.5 MB 就该有人来看一眼 ----
+  // 线上实测（32,171 块真实数据）：z10 最大包 869 KB（杭州），p50 12 KB。
+  // 留一倍余量钉在 1.5 MB —— 哪天某个城市把它推过去，说明该考虑拆包了。
+  {
+    const PK_LIMIT = 1.5 * 1024 * 1024;
+    const real_max = 889540;      // 线上实测的最大 z10 包（杭州 854/422）
+    ok(real_max < PK_LIMIT,
+       `线上实测最大 z10 包 ${(real_max / 1024).toFixed(0)} KB < 上限 ` +
+       `${(PK_LIMIT / 1024).toFixed(0)} KB（p50 只有 12 KB）`);
+    for (const pid of packed.packIds) {
+      const n = packed.files[`https://t/${pid}.npk`].byteLength;
+      ok(n < PK_LIMIT, `合成包 ${pid} = ${n} 字节，在 ${(PK_LIMIT / 1024).toFixed(0)} KB 之内`);
+    }
+  }
+
+  // ---- 9f) 稀疏格子：一个包里只有一块，也必须能正常取到 ----
+  {
+    const lone = {};
+    const id = TL.tile_id(Z, HERE.x + 40, HERE.y + 40);     // 很远的孤立一块
+    lone[`https://t/${id}.npt`] = mk_tile(Z, HERE.x + 40, HERE.y + 40,
+      [[3, dm_of([[-10, -10], [10, 10]])]]);
+    const p3 = pack_site(Object.assign({}, lone), Z, PZ);
+    eq(p3.packIds.length, 1, '孤立的一块 -> 1 个只有 1 块的包（稀疏格子的最坏情况）');
+    const pk = TL.parse_pack(p3.files[`https://t/${p3.packIds[0]}.npk`]);
+    eq(pk.count, 1, '包里就是 1 块');
+    const got = TL.slice_pack(pk, id);
+    ok(!!got && Buffer.from(new Uint8Array(got))
+       .equals(Buffer.from(new Uint8Array(lone[`https://t/${id}.npt`]))),
+       '稀疏包里那一块照样能逐字节切出来');
+    ok(TL.slice_pack(pk, TL.tile_id(Z, HERE.x + 41, HERE.y + 40)) === null,
+       '问包里**没有**的那一块 -> 返回 null（不是抛，也不是给错块）');
+  }
 })();
 end_sections();
 

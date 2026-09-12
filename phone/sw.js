@@ -100,8 +100,15 @@
  *          比不缓存糟得多。
  *        ⚠️ 第十一次同样的坑：不 bump，手机上还是那份"没有任何瓦片逻辑"的
  *        index.html + map.js —— 而这一版修的正是"底图时有时无"。
+ *    v14：底图改成**打包布局**（NPK1 容器）。动了 phone/tiles.js（加容器解包层：
+ *        一个 .npk 装 256 个 z14 块、整包缓存）—— 而 tiles.js 在预缓存清单里，
+ *        所以**必须**再 bump 一次。
+ *        ⚠️ 第十二次同样的坑：不 bump，手机上的 PWA 会一直吃旧的 tiles.js，
+ *        而那一版**不认识 .npk**（它只会去取 14/<x>/<y>.npt，全 404）——
+ *        症状是"底图整个没了"，看起来像瓦片没发布。
+ *        同时客户端按 index.json 的 pack 字段判形态，旧代码连这个字段都不看。
  */
-const CACHE = 'navpuck-phone-v13';
+const CACHE = 'navpuck-phone-v14';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [

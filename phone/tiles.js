@@ -107,6 +107,36 @@
   const EARTH_M_PER_DEG_LAT = 110540.0;
   const EARTH_M_PER_DEG_LON_EQ = 111320.0;
 
+  // ---- NPK1 容器（把 16×16 个 z14 块装进一个文件）------------------------
+  //
+  // 为什么要有容器：散块布局下**一个瓦片一个文件**。实测全国按 way 数外推
+  // 约 101 万块 —— GitHub 单仓库建议 5 万文件以内，超 20 倍。打包把文件数
+  // 降两个数量级，而 `.npt` 的字节**一个都没改**（原样嵌进容器），
+  // 所以解码走的还是同一个 decode_tile，容器不可能引入坐标偏差。
+  //
+  // 格式（小端）：
+  //   0   char[4]  "NPK1"
+  //   4   u8       version = 1
+  //   5   u8       pack_z
+  //   6   u16      count
+  //   8   u16      flags
+  //   10  u16      x（本包的 pack 坐标，自证用）
+  //   12  u16      y
+  //   14  u8[count]  dx
+  //   14+c u8[count] dy
+  //   14+2c u32[count] off
+  //   14+2c+4c u32[count] len
+  //   然后是顺序拼接的 .npt 原样字节
+  const NPK_MAGIC = [0x4E, 0x50, 0x4B, 0x31];
+  const NPK_VERSION = 1;
+  const NPK_HEAD = 14;
+  // 默认打包层级：z10。实测（辽宁+浙江+沈阳+杭州，32,171 块）——
+  //   z11（8×8=64）：1,228 个文件，平均只装 26 块，全国外推 ≈ 3.8 万文件
+  //                  （紧贴 GitHub 的 5 万建议上限，只剩 23% 余量）
+  //   z10（16×16=256）：359 个文件，平均装 90 块，全国外推 ≈ 1.1 万文件 ✅
+  // 稀疏地区根本填不满一个格子，所以"每个格子都装满"的外推是错的。
+  const PACK_LEVEL_DEFAULT = 10;
+
   // Pages 上的绝对地址。换仓库名/换账号时**只改这一行**。
   const PAGES_BASE = 'https://hxyt66.github.io/navpuck/tiles/';
   // 相对地址：只有在页面确实位于 .../phone/ 里时才有意义（PWA 的情况）。
@@ -188,7 +218,75 @@
   }
 
   /**
-   * 解码一块 .npt。返回 {z, x, y, lat_c, lon_c, segs:[[rank,[[lat,lon],...]]]}。
+   * 解析 NPK1 容器。返回 {pack_z, x, y, count, tiles: Map<slot, {off, len}>}。
+   *
+   * slot = dx * 256 + dy（dx/dy 是块相对本包原点的偏移，0..15）。
+   * 用数字当键而不是字符串：一个包 256 块，查表在热路径上（每次 _refresh）。
+   *
+   * ⚠️ 所有越界都**抛**。坏包被当成"这些块不存在"的话，症状是"某一带的
+   *    路网莫名其妙少一片"，而且完全没有线索 —— 和 decode_tile 同一个理由。
+   */
+  function parse_pack(buf) {
+    const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+    if (u8.length < NPK_HEAD) throw new Error(`NPK1 太短：${u8.length} 字节`);
+    for (let i = 0; i < 4; i += 1) {
+      if (u8[i] !== NPK_MAGIC[i]) throw new Error('NPK1 magic 不对（不是包文件？）');
+    }
+    if (u8[4] !== NPK_VERSION) throw new Error(`NPK1 版本不支持：${u8[4]}`);
+    const pack_z = u8[5];
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const count = dv.getUint16(6, true);
+    const px = dv.getUint16(10, true);
+    const py = dv.getUint16(12, true);
+    const need = NPK_HEAD + count * 10;
+    if (u8.length < need) {
+      throw new Error(`NPK1 被截断：${u8.length} 字节，目录需要 ${need}`);
+    }
+    const tiles = new Map();
+    const dx_off = NPK_HEAD;
+    const dy_off = NPK_HEAD + count;
+    const o_off = NPK_HEAD + count * 2;
+    const l_off = NPK_HEAD + count * 6;
+    for (let i = 0; i < count; i += 1) {
+      const dx = u8[dx_off + i];
+      const dy = u8[dy_off + i];
+      const off = dv.getUint32(o_off + i * 4, true);
+      const len = dv.getUint32(l_off + i * 4, true);
+      if (len < HEADER_BYTES) throw new Error(`NPK1 第 ${i} 块长度非法：${len}`);
+      if (off + len > u8.length) {
+        throw new Error(`NPK1 第 ${i} 块越界：off=${off} len=${len} 文件 ${u8.length}`);
+      }
+      if (u8[off] !== MAGIC[0] || u8[off + 1] !== MAGIC[1] ||
+          u8[off + 2] !== MAGIC[2] || u8[off + 3] !== MAGIC[3]) {
+        throw new Error(`NPK1 第 ${i} 块不是 .npt（偏移 ${off} 处 magic 不对）`);
+      }
+      const slot = dx * 256 + dy;
+      if (tiles.has(slot)) throw new Error(`NPK1 目录里有重复的块：dx=${dx} dy=${dy}`);
+      tiles.set(slot, { off: off, len: len });
+    }
+    return { pack_z: pack_z, x: px, y: py, count: count, tiles: tiles, buf: u8 };
+  }
+
+  /** 从解好的包里切出某一块的 .npt 字节；包里没有就返回 null。 */
+  function slice_pack(pk, id) {
+    const p = String(id).split('/');
+    const x = Number(p[1]);
+    const y = Number(p[2]);
+    const d = pk.pack_z;
+    const base_x = (x >> (TILE_ZOOM - d)) << (TILE_ZOOM - d);
+    const base_y = (y >> (TILE_ZOOM - d)) << (TILE_ZOOM - d);
+    const dx = x - base_x;
+    const dy = y - base_y;
+    const rec = pk.tiles.get(dx * 256 + dy);
+    if (!rec) return null;
+    return pk.buf.subarray(rec.off, rec.off + rec.len);
+  }
+
+  function _byte_len(b) {
+    return (b && (b.byteLength || b.length)) || 0;
+  }
+
+  /** 解码一块 .npt。返回 {z, x, y, lat_c, lon_c, segs:[[rank,[[lat,lon],...]]]}。
    *
    * ⚠️ 任何异常都**抛**（这里是纯函数，调用方负责吞）—— 和网络/存储那两条
    *    "绝不抛"的路径不同：一块损坏的瓦片是**我们自己产出的东西坏了**，
@@ -481,24 +579,60 @@
 
       // ---- 运行时状态 ----
       this.mem = new Map();            // tile_id -> 解码结果（有上限，见 _mem_put）
-      // 覆盖索引（**分列**）：x -> {t, ys}。ys 为 Set = 有这些 y，
-      // null = 这一列确定没有，整条记录不存在 = 还没取过（不知道）。
+      // ⭐ 容器层：散块部署时"容器 = 这块瓦片自己"，打包部署时"容器 = 它所在的 .npk"。
+      //    **只有一条代码路径** —— 下载、缓存、去重、冷却全都按容器 id 记账，
+      //    两种部署的差别只剩"取哪个 URL"和"要不要从目录里切一刀"。
+      //    （两套平行的下载/缓存路径 = 两倍的 bug 面，不值得。）
+      this.pack_z = 0;                 // 0 = 散块部署；>0 = 打包部署（读 index.json 的 pack）
+      this._packmem = new Map();       // 容器 id -> {buf, pk}
+      this.packs_done = 0;             // 这次运行下了几个包
+      this.pack_bytes = 0;
+      this.packs_failed = 0;
+      // 覆盖索引（**分列**）：x -> {t, ys}。坐标是**容器**的坐标
+      // （散块 = z14，打包 = z10）。ys 为 Set = 有这些 y，null = 这一列确定没有，
+      // 整条记录不存在 = 还没取过（不知道）。
       this._cols = new Map();
       this.present_count = 0;          // 已加载的列里一共有多少块（只用于显示）
       this.root = null;                // index.json 的头部（范围 + 计数）
       this.root_t = 0;
       this.root_state = 'idle';        // idle | loading | ok | failed | none
-      this.absent = new Set();         // 这一轮确认过"上游没有"的瓦片
-      this._queue = [];                // 待下载的 tile_id（按优先级）
+      this.absent = new Set();         // 这一轮确认过"上游没有"的**容器**
+      this._queue = [];                // 待下载的容器 id
       this._queued = new Set();
       this._inflight = 0;
-      this._fail_at = new Map();       // tile_id -> 上次失败时刻（秒）
-      this.done = 0;                   // 这次运行成功下载了几块
-      this.bytes = 0;                  // 这次运行下载了多少字节
+      this._fail_at = new Map();       // 容器 id -> 上次失败时刻（秒）
+      this.done = 0;                   // 散块模式下 = 下了几块；打包模式看 packs_done
+      this.bytes = 0;
       this.failed = 0;
       this.last_error = '';
       this.base = this.bases.length ? (this._preferred || this.bases[0]) : '';
       this.gap_reason = '';            // "没有瓦片覆盖"时的一句话原因（界面用）
+    }
+
+    // -- 容器（散块 / 打包 两种部署的唯一差别）-----------------------------
+
+    /** 这块瓦片住在哪个容器里。散块部署时就是它自己。 */
+    container_id(id) {
+      if (!this.pack_z) return id;
+      const p = String(id).split('/');
+      const d = this.zoom - this.pack_z;
+      return `${this.pack_z}/${Number(p[1]) >> d}/${Number(p[2]) >> d}`;
+    }
+
+    /** 容器的 (x, y) —— 覆盖索引和 index.json 的 xr/yr 都用这套坐标。 */
+    _container_xy(id) {
+      const c = this.container_id(id);
+      const p = c.split('/');
+      return [Number(p[1]), Number(p[2])];
+    }
+
+    _pack_put(pid, rec) {
+      this._packmem.set(pid, rec);
+      // 最多留 4 个包（一个包最大近 1 MB，不能让它们无限涨）
+      while (this._packmem.size > 4) {
+        const oldest = this._packmem.keys().next().value;
+        this._packmem.delete(oldest);
+      }
     }
 
     /** 这一端有没有瓦片能力（没有 = 完全退回 Overpass，行为和以前一样）。 */
@@ -606,6 +740,10 @@
           this.root = j;
           this.root_t = this._now();
           this.root_state = 'ok';
+          // ⭐ 部署形态由**索引**说了算，不是客户端猜的：有 `pack` 字段就是打包部署。
+          //    这样一来同一次发布里不可能出现"客户端以为散块、服务端是包"的错配。
+          this.pack_z = (typeof j.pack === 'number' && j.pack > 0 &&
+                         j.pack < this.zoom) ? j.pack : 0;
           if (this.db) this.db.meta_put('root', { t: this.root_t, j: j });
           return this.root;
         } catch (e) {
@@ -620,6 +758,19 @@
     }
 
     /**
+     * 覆盖索引用的是哪一级的坐标。
+     *
+     * ⚠️ 打包部署时是 **pack_z**（z10），散块部署时是 zoom（z14）——
+     *    列文件的路径、IndexedDB 的键、头部 xr/yr，**全都**必须是这一级。
+     *    这里写错过一次（用了 this.zoom），症状是"列文件永远 404 →
+     *    客户端认定这一带没有覆盖 → 退回 Overpass"，而且在线上的表现
+     *    和"瓦片没发布"一模一样，极难分辨。
+     */
+    index_level() {
+      return this.pack_z || this.zoom;
+    }
+
+    /**
      * 取**一列**的 y 列表。
      *
      * 返回值有三种，**必须分清**（这一版的核心之一）：
@@ -630,24 +781,25 @@
      * 而那正是用户最烦的"让我猜"。
      */
     async _load_column(x, force) {
+      const lvl = this.index_level();
       const hit = this._cols.get(x);
       if (hit && !force && (this._now() - hit.t) < INDEX_MAX_AGE_S) return hit.ys;
       if (!force && this.db) {
-        const rec = await this.db.meta_get('col:' + x);
+        const rec = await this.db.meta_get(`col:${lvl}:` + x);
         if (rec && typeof rec.t === 'number' && Array.isArray(rec.y)) {
           const ys = new Set(rec.y);
           this._set_col(x, ys, rec.t);
           if ((this._now() - rec.t) < INDEX_MAX_AGE_S) return ys;
         }
       }
-      const r = await this._get_text(`index/${this.zoom}/${x}.json`);
+      const r = await this._get_text(`index/${lvl}/${x}.json`);
       if (r.ok) {
         try {
           const j = JSON.parse(r.text);
           const ys = new Set(Array.isArray(j && j.y) ? j.y : []);
           this._set_col(x, ys, this._now());
           if (this.db) {
-            this.db.meta_put('col:' + x, { t: this._now(), y: Array.from(ys) });
+            this.db.meta_put(`col:${lvl}:` + x, { t: this._now(), y: Array.from(ys) });
           }
           return ys;
         } catch (e) {
@@ -677,15 +829,13 @@
       return uniq.length;
     }
 
-    /** 一块瓦片在不在上游。true / false / undefined（不知道）。 */
+    /** 一块瓦片在不在上游（按**容器**粒度问；散块时容器就是它自己）。 */
     is_present(id) {
-      const p = String(id).split('/');
-      const x = Number(p[1]);
-      const y = Number(p[2]);
-      const c = this._cols.get(x);
+      const xy = this._container_xy(id);
+      const c = this._cols.get(xy[0]);
       if (c === undefined) return undefined;
       if (c.ys === null) return false;
-      return c.ys.has(y);
+      return c.ys.has(xy[1]);
     }
 
     /** 头部里的范围能不能直接判"这一带根本没覆盖"。返回 true/false/undefined。 */
@@ -808,18 +958,43 @@
     async _local(id) {
       const hit = this._mem_get(id);
       if (hit) return hit;
-      if (!this.db) return null;
-      const buf = await this.db.get(id);
-      if (!buf) return null;
+      let bytes = null;
+      if (this.pack_z) {
+        const pid = this.container_id(id);
+        let rec = this._packmem.get(pid);
+        if (!rec && this.db) {
+          const buf = await this.db.get('pack:' + pid);
+          if (buf) {
+            try {
+              rec = { buf: buf, pk: parse_pack(buf) };
+              this._pack_put(pid, rec);
+            } catch (e) {
+              // 本地这份包坏了：删掉，下次重新下。
+              // ⚠️ 绝不能当成"这里没有路" —— 那会让一整片 29km×29km 的底图消失
+              //    而界面上什么线索都没有。
+              this.last_error = `本地包 ${pid} 损坏，已丢弃：${e}`;
+              this.db.del('pack:' + pid);
+              return null;
+            }
+          }
+        }
+        if (!rec) return null;
+        bytes = slice_pack(rec.pk, id);
+        if (bytes === null) return null;    // 包里确实没有这一块（发布时就没收）
+      } else {
+        if (!this.db) return null;
+        bytes = await this.db.get(id);
+        if (!bytes) return null;
+      }
       try {
-        const dec = decode_tile(buf);
+        const dec = decode_tile(bytes);
         dec.id = id;
         this._mem_put(id, dec);
         return dec;
       } catch (e) {
         // 本地这份坏了：删掉，下次重新下。**不要**把它当成"这里没有路"。
         this.last_error = `本地瓦片 ${id} 损坏，已丢弃：${e}`;
-        this.db.del(id);
+        if (!this.pack_z && this.db) this.db.del(id);
         return null;
       }
     }
@@ -891,9 +1066,14 @@
     /**
      * 排几块要下载的瓦片。**立即返回**，真正的下载在后台按并发上限慢慢跑。
      *
+     * ⚠️ 队列里存的是**容器 id**：打包部署时 9 块 z14 很可能属于同一个 z10 包，
+     *    按瓦片排队会把这些块当成 9 次独立下载（虽然下面有去重兜着），
+     *    而且 plan_max 那个闸门也会被同一个包吃掉 —— 换成按容器排队，
+     *    "一次最多排几块"才真的等于"最多几个请求"。
+     *
      * @param {string[]} ids
      * @param {string} why  'area' | 'route'（只用于诊断）
-     * @returns {number} 这次真的排进去几块
+     * @returns {number} 这次真的排进去几个容器
      */
     enqueue(ids, why) {
       if (!this.ready()) return 0;
@@ -901,17 +1081,19 @@
       let n = 0;
       for (const id of ids) {
         if (n >= this.plan_max) break;
-        if (this._queued.has(id)) continue;
-        if (this.mem.has(id)) continue;
-        if (this.absent.has(id)) continue;                    // 上游确认没有
+        const cid = this.container_id(id);
+        if (this._queued.has(cid)) continue;
+        if (this.absent.has(cid)) continue;              // 上游确认没有
         if (this.is_present(id) === false) {
-          this.absent.add(id);                                // 索引说没有 -> 不用试
+          this.absent.add(cid);                          // 索引说没有 -> 不用试
           continue;
         }
-        const f = this._fail_at.get(id);
+        const f = this._fail_at.get(cid);
         if (f !== undefined && (now - f) < TILE_RETRY_COOLDOWN_S) continue;
-        this._queue.push(id);
-        this._queued.add(id);
+        // 本地已经有了就不用下（散块看这块自己，打包看那个包在不在）
+        if (this.pack_z ? this._packmem.has(cid) : this.mem.has(id)) continue;
+        this._queue.push(cid);
+        this._queued.add(cid);
         n += 1;
       }
       if (n > 0) this._pump(why);
@@ -920,9 +1102,9 @@
 
     _pump(why) {
       while (this._inflight < this.max_inflight && this._queue.length > 0) {
-        const id = this._queue.shift();
+        const cid = this._queue.shift();
         this._inflight += 1;
-        this._download(id, why)
+        this._download(cid, why)
           .catch(() => { /* _download 内部已经全部收好了 */ })
           .then(() => {
             this._inflight -= 1;
@@ -938,53 +1120,76 @@
       }
     }
 
-    /** 下载一块。**永远不抛**：所有失败都记进状态。 */
-    async _download(id, why) {
-      const t0 = this._now_ms();
+    /**
+     * 下载一个**容器**。**永远不抛**：所有失败都记进状态。
+     *
+     * 散块部署：容器就是一块瓦片，下来直接解码。
+     * 打包部署：容器是一个 .npk，下来整个存进 IndexedDB（**整包缓存**），
+     *          具体的块在 _local() 里按目录切 —— 一次请求换 256 块的覆盖。
+     *          ⚠️ 不做"按需只取包里的一块"（HTTP Range）：那要多一次往返、
+     *             还要假设服务端支持 Range，而整包一次下完是**确定性**的，
+     *             并且落盘之后整片 29km×29km 全离线。
+     */
+    async _download(cid, why) {
+      const packed = !!this.pack_z;
       const order = this._base_order();
       let last = '没有可用的瓦片地址';
       for (const b of order) {
-        const r = await this._fetch_one(this._url(id + '.npt', b), 'binary');
+        const r = await this._fetch_one(
+          this._url(cid + (packed ? '.npk' : '.npt'), b), 'binary');
         if (r.ok) {
-          let dec = null;
-          try {
-            dec = decode_tile(r.buf);
-          } catch (e) {
-            // 下回来的东西不是瓦片（GitHub Pages 的 404 页面？被劫持？）
-            // —— 记下来并**继续**（别把坏数据写进缓存）
-            last = `瓦片内容坏了：${e}`;
-            this.failed += 1;
-            this.last_error = last;
-            continue;
+          if (packed) {
+            let pk = null;
+            try {
+              pk = parse_pack(r.buf);
+            } catch (e) {
+              // 下回来的东西不是包（GitHub Pages 的 404 页面？截断？）
+              // —— 记下来并**继续**试下一个地址，绝不把坏数据写进缓存
+              last = `包内容坏了：${e}`;
+              this.packs_failed += 1;
+              this.last_error = last;
+              continue;
+            }
+            this._pack_put(cid, { buf: r.buf, pk: pk });
+            if (this.db) this.db.put('pack:' + cid, r.buf);
+            this.packs_done += 1;
+            this.pack_bytes += _byte_len(r.buf);
+          } else {
+            let dec = null;
+            try {
+              dec = decode_tile(r.buf);
+            } catch (e) {
+              last = `瓦片内容坏了：${e}`;
+              this.failed += 1;
+              this.last_error = last;
+              continue;
+            }
+            dec.id = cid;
+            this._mem_put(cid, dec);
+            if (this.db) this.db.put(cid, r.buf);
+            this.done += 1;
+            this.bytes += _byte_len(r.buf);
           }
-          dec.id = id;
-          this._mem_put(id, dec);
-          if (this.db) this.db.put(id, r.buf);
-          this.done += 1;
-          this.bytes += (r.buf.byteLength || r.buf.length || 0);
-          this._fail_at.delete(id);
+          this._fail_at.delete(cid);
           if (b !== this.base) this._remember_base(b);
           this.last_error = '';
           if (this._queue.length === 0 && this._inflight <= 1) this._notify();
           return true;
         }
         if (r.status === 404) {
-          // 上游确实没有这一块 -> 记成"不存在"，这一轮不再试它。
+          // 上游确实没有这个容器 -> 记成"不存在"，这一轮不再试它。
           // ⚠️ 和"下载失败"**必须分开**：一个说明"这里没覆盖"（要落到 Overpass
           //    兜底 + 界面说清楚），一个说明"网络/服务有问题"（要重试）。
-          this.absent.add(id);
-          last = null;
-          continue;
+          this.absent.add(cid);
+          return false;
         }
         last = r.reason;
         if (b === this._preferred) this._forget_base();
       }
-      if (last !== null) {
-        this.failed += 1;
-        this.last_error = `瓦片 ${id} 下载失败：${last}`;
-        this._fail_at.set(id, this._now());
-      }
-      this._fail_ms = this._now_ms() - t0;
+      this.failed += 1;
+      this.last_error = packed ? `包 ${cid} 下载失败：${last}`
+                               : `瓦片 ${cid} 下载失败：${last}`;
+      this._fail_at.set(cid, this._now());
       return false;
     }
 
@@ -1012,28 +1217,29 @@
 
       // ⭐ 先用头部里的范围把"**确定在发布范围之外**"的块摘出去：
       //    它们既不用取列文件、也不用去下（省掉的是纯粹的 404 往返）。
+      //    ⚠️ 坐标是**容器**坐标（打包部署时 z10，散块时 z14），
+      //       和 index/<pz>/<x>.json 那一列是同一套。
       //    ⚠️ 只是"摘出去"，**不能**因此就下结论说"整片没覆盖" ——
       //    范围内那几块仍然要照常查、照常下。
       const in_range = [];
       const out_range = [];
       if (this.root) {
         for (const id of missing) {
-          const p = id.split('/');
-          const x = Number(p[1]);
-          const y = Number(p[2]);
-          if (this.root_covers([x], [y]) === false) out_range.push(id);
+          const xy = this._container_xy(id);
+          if (this.root_covers([xy[0]], [xy[1]]) === false) out_range.push(id);
           else in_range.push(id);
         }
       } else {
         for (const id of missing) in_range.push(id);
       }
-      for (const id of out_range) this.absent.add(id);
+      for (const id of out_range) this.absent.add(this.container_id(id));
 
       let col_state = 'ok';
       if (in_range.length) {
-        // ⭐ 只取**需要的 x 列**（不是整个索引）。这就是分列的全部意义：
+        // ⭐ 只取**需要的列**（不是整个索引）。这就是分列的全部意义：
         //    一次启动的元数据下载量是几百字节，和城市/全国规模无关。
-        await this.ensure_columns(in_range.map((id) => Number(id.split('/')[1])), false);
+        await this.ensure_columns(
+          in_range.map((id) => this._container_xy(id)[0]), false);
         for (const id of in_range) {
           if (this.is_present(id) === undefined) { col_state = 'unknown'; break; }
         }
@@ -1151,12 +1357,18 @@
     // -- 诊断 --------------------------------------------------------------
 
     stats() {
-      return {
+      const s = {
         enabled: this.ready(),
         base: this.base,
         bases: this.bases.slice(),
         preferred: this._preferred,
-        // 索引分两层：头部（几十~几百字节）+ 已经加载的列（一列几百字节）
+        // 部署形态：0 = 散块（一块一个文件），>0 = 打包（一个 .npk 装 16×16 块）
+        pack_z: this.pack_z,
+        packs_mem: this._packmem.size,
+        packs_done: this.packs_done,
+        pack_bytes: this.pack_bytes,
+        packs_failed: this.packs_failed,
+        // 索引分两层：头部（几十~几百字节）+ 已经加载的列
         index_state: this.root_state,
         index_cols: this._cols.size,
         index_tiles: this.present_count,
@@ -1176,11 +1388,16 @@
         zoom: this.zoom,
         span_m: Math.round(tile_span_m(this.zoom, 40.0)),
       };
+      // 打包部署时"一次刷新下了几个包、多少字节"是界面和验证脚本都要看的数字
+      s.span_pack_m = this.pack_z
+        ? Math.round(tile_span_m(this.pack_z, 40.0)) : 0;
+      return s;
     }
 
     /** 清空本地瓦片（界面上"清空底图缓存"会调）。**不动 sticky base。** */
     async clear() {
       this.mem.clear();
+      this._packmem.clear();
       this._queue = [];
       this._queued.clear();
       this.absent.clear();
@@ -1190,6 +1407,10 @@
       this.root = null;
       this.root_t = 0;
       this.root_state = 'idle';
+      this.pack_z = 0;
+      this.packs_done = 0;
+      this.pack_bytes = 0;
+      this.packs_failed = 0;
       if (this.db) await this.db.clear();
       this.done = 0;
       this.bytes = 0;
@@ -1226,12 +1447,15 @@
     TileStore, TileDb, decode_tile,
     tile_of, tile_bounds, tile_center, tile_span_m, tile_id,
     candidate_bases, _seg_key,
+    // NPK1 容器（打包部署）：自测要直接解析包来对拍，所以导出
+    parse_pack, slice_pack,
     // 常量：自测和界面文案都要读，所以导出
     TILE_ZOOM, PAGES_BASE, REL_BASE, BASE_KEY, INDEX_T_KEY,
     TILE_TIMEOUT_MS, TILE_MAX_INFLIGHT, TILE_RETRY_COOLDOWN_S,
     TILE_PLAN_MAX_PER_CALL, TILE_PREFETCH_AHEAD_M, TILE_MEM_KEEP,
     INDEX_MAX_AGE_S, IDB_NAME, STORE_TILES, STORE_META,
     FORMAT_VERSION, MAGIC, HEADER_BYTES, DM,
+    NPK_MAGIC, NPK_VERSION, NPK_HEAD, PACK_LEVEL_DEFAULT,
     EARTH_M_PER_DEG_LAT, EARTH_M_PER_DEG_LON_EQ, MERCATOR_CIRCUMFERENCE_M,
   };
 }));
