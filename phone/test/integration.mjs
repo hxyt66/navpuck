@@ -370,6 +370,8 @@ section('3] 队满时丢的是 update，route 绝不丢');
   eq(dev.parser.crc_errors, 0, '垃圾载荷不产生 CRC 错误（连帧头都没凑齐）');
   eq(link.frames_offered, link.frames_sent + link.frames_dropped,
      `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
+  eq(link.frames_enqueued + link.dropped_refused, link.frames_offered,
+     `每一帧的去向都唯一：enqueued ${link.frames_enqueued} + refused ${link.dropped_refused} = offered ${link.frames_offered}`);
 }
 
 // ---------------------------------------------------------------------------
