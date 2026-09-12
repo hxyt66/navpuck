@@ -1925,7 +1925,12 @@
       if (md) {
         md.textContent = ms.detail || '';
         md.hidden = !ms.detail;
-        md.classList.toggle('warn', ms.state === 'unavailable' || ms.state === 'stale');
+        // ⚠️ 需要"黄色警告"的状态列表。新加的 gap-busy（没瓦片覆盖 + Overpass
+        //    也忙）**必须**在里面 —— 它是这一版最需要被看见的一句话，
+        //    样式上和普通"底图正常"一样的话就等于没说。
+        md.classList.toggle('warn', ms.state === 'unavailable' || ms.state === 'stale'
+          || ms.state === 'busy' || ms.state === 'gap-busy' || ms.state === 'empty'
+          || ms.state === 'tiles-partial');
       }
       // 模拟行驶的实时读数：走到哪了、速度多少、航向多少（过弯时会变）。
       // 每帧都刷，因为它就是"这条路真的在动"的证据。
@@ -2005,8 +2010,9 @@
         }
         return {
           state: 'idle', short: '—',
-          detail: '还没有开始导航：街道路网底图会在导航启动后自动拉取，' +
-            '单个镜像最多 12 秒、整轮最多 30 秒就会给结论。',
+          detail: '还没有开始导航：底图会在导航启动后自动准备 —— 优先取**离线瓦片**' +
+            '（预先做好的路网，从项目自己的站点下载，几十 KB 一块），' +
+            '只有瓦片覆盖不到的地方才去问 Overpass。',
         };
       }
       const src = nav.map_src || this.map_source;
@@ -2685,6 +2691,25 @@
                  '但路线和箭头照常');
       } else {
         map_src.set_enabled(true);
+        // ⭐ 把航线交给底图 —— 它要沿这条路**预先下载瓦片**（见 phone/tiles.js
+        //    的 prefetch_route）。这是"骑到哪底图都已经在手上"的唯一来源：
+        //    等骑到了再下，弱网下就是几百米的空白。
+        //
+        // ⚠️ 传的是**折线点**（[[lat,lon],...]），不是 Route 对象：
+        //    底图只关心"要经过哪些瓦片"，不需要里程/转向那一套。
+        //    包一层 try：底图出任何问题都不该让"开始导航"失败。
+        if (typeof map_src.set_route === 'function') {
+          try {
+            map_src.set_route(route.points.map((p) => [p.lat, p.lon]));
+            const ts = map_src.tiles;
+            this.log(`[map] 已把航线交给底图：${route.points.length} 点，` +
+              (ts ? `沿路预取 ${(ts.prefetch_ahead_m / 1000).toFixed(0)}km 内的瓦片` +
+                    `（地址 ${ts.base || '未定'}）`
+                  : '这一端没有离线瓦片（只走 Overpass）'));
+          } catch (e) {
+            this.log(`[map] 航线交给底图时出错（忽略，底图退回 Overpass）：${e}`);
+          }
+        }
       }
       try {
         this.nav = new Navigator(route, src, {
@@ -2817,6 +2842,14 @@
     }
 
     stop_nav() {
+      // 航线没了 = 沿路预取也该停：留着它会让底图继续为一条不存在的路线
+      // 下载瓦片（用户可能是换了目的地，也可能是取消了）。
+      // ⚠️ 只是**停止排新的**，已经下到本地的瓦片一块都不删 ——
+      //    它们本来就该留着，下次骑回来直接就是离线的。
+      try {
+        const ms = this.map_source || (this.nav && this.nav.map_src);
+        if (ms && typeof ms.set_route === 'function') ms.set_route(null);
+      } catch (_e) { /* 底图的事不能挡住"停止导航" */ }
       if (this.nav) {
         this.crash_marker('nav_stop', '用户或重新规划触发的停止');
         this.nav.stop();

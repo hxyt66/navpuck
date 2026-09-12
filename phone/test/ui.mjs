@@ -248,10 +248,13 @@ section('1] index.html 自身的完整性');
   //    NavPuckBleNative）、fgs.js（前台服务封装）、fgs_ui.js（后台运行面板）都是
   //    新增的独立模块，顺序上必须在 ble.js / app.js 之前。
   //    —— 改这里不是因为代码错了，而是因为这条契约本身就是"当前文件清单"。
+  //    底图改成离线优先后新增了 tiles.js（瓦片格式解码 + IndexedDB 缓存 +
+  //    沿路预取）。map.js 在构造 OsmMapSource 时就要用 root.NavPuckTiles，
+  //    所以它必须排在 route.js **之后**、map.js **之前**。
   eq(SCRIPT_SRCS,
-     ['crashlog.js', 'navmath.js', 'proto.js', 'route.js', 'map.js',
+     ['crashlog.js', 'navmath.js', 'proto.js', 'route.js', 'tiles.js', 'map.js',
       'ble_native.js', 'ble.js', 'fgs.js', 'fgs_ui.js', 'app.js'],
-     'script 加载顺序与依赖顺序一致（crashlog -> navmath -> proto -> route -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
+     'script 加载顺序与依赖顺序一致（crashlog -> navmath -> proto -> route -> tiles -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
 
   // 重复 id 会让 getElementById 静默取到第一个，是"界面上有个元素永远不更新"的经典原因
   const seen = new Map();

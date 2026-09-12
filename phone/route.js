@@ -87,18 +87,111 @@
   // 视野固定，全程一个比例，**不再自适应**（navigator.py 的 ROUTE_FAR_M）
   const ROUTE_FAR_M = 160.0;
 
-  // 路网底图
-  const MAP_RADIUS_M = 260.0;
+  // ---- 路网底图 ----------------------------------------------------------
+  //
+  // ⚠️⚠️ 这一组常量从这一版起分成**两类**，别再混着看：
+  //
+  //   A. **下发/显示**半径（MAP_RADIUS_M）—— 骑手周围这么大一圈路才会被画到
+  //      设备上。真正裁剪用的是 build() 里的 view_m × 1.6（≈256m，见 map.js），
+  //      MAP_RADIUS_M 是它的名义上界。它和 MAP_REFRESH_S / MAP_REFRESH_MOVE_M /
+  //      MAP_CACHE_REUSE_M / MAP_CACHE_MAX / MAP_SIMPLIFY_M / MAP_MAX_* 一样，
+  //      **和 tools/navigator.py 逐个对拍**（phone/test/parity.mjs 第 5 节），
+  //      所以数值一个都不能动 —— 动它们就得同时改 Python，那不在本次范围内。
+  //
+  //   B. **抓取**半径（MAP_FETCH_RADIUS_M 一族）—— 一次 Overpass 请求拉多大
+  //      一圈。这一族**只存在于手机端**（Python 的 PC 侧每次导航只跑一小段、
+  //      缓存是磁盘上的小文件，没有这个需求），所以不参与对拍。
+  //
+  // 为什么要分成两类（现场问题）：以前两者**是同一个数**（都叫 MAP_RADIUS_M），
+  // 于是"每走 80 米就发一次请求、每次只问 260 米"。对着一个已经满负荷
+  // （Overpass /api/status 显示 "0 slots available"）的免费公共服务，
+  // 这种打法基本每次都会失败 —— 而且每一次失败还烧掉一份退避预算。
+  // 修法就一句话：**抓大、少问**（一次抓 1.5km，走 1.7km 才再问一次），
+  // 发给设备的帧**一点都没变大**（还是 build() 按 view×1.6 裁剪的那一份）。
+  const MAP_RADIUS_M = 260.0;       // A：下发/显示半径（与 Python 对拍）
   const MAP_SIMPLIFY_M = 7.0;
   const MAP_MAX_POINTS = 330;       // 设备端上限 400，留余量
   const MAP_MAX_SEGMENTS = 60;
   const MAP_SEND_PERIOD_S = 0.5;
-  const MAP_REFRESH_S = 40.0;
-  const MAP_REFRESH_MOVE_M = 80.0;
+  const MAP_REFRESH_S = 40.0;       // A：抓取半径 260m 时的刷新周期（见 map_refresh_period_s）
+  const MAP_REFRESH_MOVE_M = 80.0;  // A：抓取半径 260m 时的移动阈值（见 map_fetch_reach_m）
   const MAP_FAIL_COOLDOWN_S = 60.0;
-  const MAP_CACHE_REUSE_M = 180.0;
+  const MAP_CACHE_REUSE_M = 180.0;  // A：抓取半径 260m 时的缓存复用距离
   const MAP_CACHE_MAX = 60;
   const MAP_CACHE_MAX_AGE_S = 7 * 86400.0;
+
+  // B：抓取半径（手机端专用，不对拍）。
+  //
+  // 1500 米这个数是**实测**选的（开发机，对 maps.mail.ru 发真的
+  // `way[highway](around:R,...);out geom;`，位置 = 内置演示航线起点）：
+  //
+  //   | 半径  | 响应     | 耗时  | 条数 | 备注                        |
+  //   |-------|----------|-------|------|-----------------------------|
+  //   |  300m |  51.4 KB | 13.2s |   50 | 旧版用的就是这个量级        |
+  //   |  600m | 133.1 KB | 11.2s |  159 |                             |
+  //   | 1000m | 260.3 KB |  4.9s |  316 |                             |
+  //   | 1500m | 574.0 KB |  7.9s |  751 | ← 取它                      |
+  //   | 2000m |    ——    | 38.0s |   —— | **HTTP 504**（服务太忙）    |
+  //   | 3000m |   2.8 MB |  7.1s | 3845 | 太大：一次就吃掉大半个存储配额 |
+  //
+  // 注意耗时和半径**不成正比**（300m 反而比 1000m 慢）：慢的原因是服务端排队，
+  // 不是查询大小 —— 这正是"被限流"的形状。所以选半径的依据是**字节数**：
+  // 1.5km 一次 574KB，走 1.7km 才再问一次（≈34KB/km，比旧版 51KB/80m 省得多），
+  // 3km 一次 2.8MB 反而更费流量、也更难在 45 秒切片里下载完。
+  const MAP_FETCH_RADIUS_M = 1500.0;
+
+  // 抓到的这一圈里，最外面留这么厚一层**不用**：骑手离锚点再近，也要保证
+  // "要画的 260m"离抓取边界还有富余（GPS 误差、路线偏离、锚点本身都会吃掉一点）。
+  // 400m > 名义下发半径 260m（实际裁剪 256m），留了 144m 余量。
+  const MAP_FETCH_EDGE_KEEP_M = 400.0;
+
+  // 圆盘**前向偏置**：把抓取中心放在"沿航线前方 MAP_FETCH_BIAS_M"的位置，
+  // 而不是骑手脚下。
+  //
+  //   ← 后向覆盖 900m ──骑手── 前向覆盖 2100m →
+  //   （圆心在骑手前方 600m，半径 1500m）
+  //
+  // 骑手是往前骑的，把圆盘往前挪就等于是把"白抓的那一半"换成"前方能多骑
+  // 1.5 倍的距离"：移动阈值 1100m（= 1500 − 400）不变，但能骑到 600+1100 =
+  // **1700m** 才需要再问一次（不偏置只有 1100m）。后向只留 500m 的余量，
+  // 因为那是"骑错了掉头"才会用到的方向。
+  //
+  // ⚠️ 不变量（集成自测钉着）：BIAS < RADIUS − KEEP，否则骑手自己会跑到抓取
+  //    圈外面去（那时候这圈数据连"当前这一屏"都盖不住）。
+  const MAP_FETCH_BIAS_M = 600.0;
+
+  /**
+   * 骑手离**当前那份路网的锚点**多远就必须重新抓（米）。
+   *
+   * = 抓取半径 − 边缘余量，下限是 MAP_REFRESH_MOVE_M（与 Python 对拍的那条，
+   * 也是"抓取半径小到 260m 时"的取值）。同一个数也被缓存复用用：
+   * "锚点离我这么近，那份路网就还盖得住我"。
+   *
+   * ⚠️ 手机端**不要**再直接用 rt.MAP_REFRESH_MOVE_M / rt.MAP_CACHE_REUSE_M：
+   *    那两个在抓取半径 1500m 下早就该被撑大了，留着它们只是为了和
+   *    tools/navigator.py 对拍（Python 侧的抓取半径仍然是 260m）。
+   */
+  function map_fetch_reach_m(fetch_radius_m) {
+    const r = Number.isFinite(fetch_radius_m) && fetch_radius_m > 0
+      ? fetch_radius_m : MAP_FETCH_RADIUS_M;
+    return Math.max(MAP_REFRESH_MOVE_M, MAP_CACHE_REUSE_M, r - MAP_FETCH_EDGE_KEEP_M);
+  }
+
+  /**
+   * 同一份路网最多用多久就该再问一次（秒）。
+   *
+   * = MAP_REFRESH_S × (抓取半径 / MAP_RADIUS_M)。理由：一份数据能顶多久，跟它
+   * 盖住的半径成正比（骑手要走过的路越长，数据才越可能过时）。260m/40s 是本
+   * 工程唯一实测过的配比，按同一配比放大到 1500m 就是 ≈231 秒。
+   *
+   * 它只是**保险**：正常骑行时"走远了"那条（1700m）先触发；这一条管的是
+   * "原地停着"和"骑得特别慢"——那时候问一次也是几分钟才一次，不会打限流。
+   */
+  function map_refresh_period_s(fetch_radius_m) {
+    const r = Number.isFinite(fetch_radius_m) && fetch_radius_m > 0
+      ? fetch_radius_m : MAP_FETCH_RADIUS_M;
+    return MAP_REFRESH_S * Math.max(1.0, r / MAP_RADIUS_M);
+  }
 
   // 道路等级：数字越小越优先保留。点预算不够时先丢次要道路。
   // 摩托车不画人行道/台阶/自行车道 —— 骑车时那些只会把屏幕塞满。
@@ -439,6 +532,9 @@
     MAP_RADIUS_M, MAP_SIMPLIFY_M, MAP_MAX_POINTS, MAP_MAX_SEGMENTS,
     MAP_SEND_PERIOD_S, MAP_REFRESH_S, MAP_REFRESH_MOVE_M, MAP_FAIL_COOLDOWN_S,
     MAP_CACHE_REUSE_M, MAP_CACHE_MAX, MAP_CACHE_MAX_AGE_S,
+    // 抓取半径一族：**手机端专用**，不对拍（见上面那段说明）
+    MAP_FETCH_RADIUS_M, MAP_FETCH_EDGE_KEEP_M, MAP_FETCH_BIAS_M,
+    map_fetch_reach_m, map_refresh_period_s,
     HIGHWAY_RANK, OSRM_ENDPOINT,
     _densify, RoutePoint, Route, load_osrm, straight_route,
     window_needs_reanchor, build_route_window,

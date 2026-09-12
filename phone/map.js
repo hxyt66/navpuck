@@ -4,6 +4,39 @@
  * 从 Overpass API（免费、不需要 API key）拉周边路网，做成设备能画的矢量底图，
  * 投影到**路线起点**为原点的正北平面（米），和 NAV_ROUTE 同源。
  *
+ * ===========================================================================
+ * ⭐⭐ 这一版的核心：**离线优先**——Overpass 从"唯一的路"降级成"兜底的路"
+ * ===========================================================================
+ * 现场事实（用户自己在手机上打开 overpass-api.de/api/status 看到的）：
+ * 页面上写的是 **"0 slots available"**。公共 Overpass 是**别人捐出来的算力**，
+ * 长期满负荷 —— 所以"底图时有时无"不是配置问题，是这个方案本身不稳。
+ * 本机复验：抓沈阳一块瓦片，8 分钟里 overpass-api.de 连续回 HTTP 504。
+ *
+ * 唯一稳的解法：**把路网预先做成静态文件，放在我们自己的 GitHub Pages 上**
+ * （用户从那里下 APK 和网页版从来没出过问题），手机按需下几十 KB 一块，
+ * 下过就永久缓存。生成端在 tools/（make_tiles_pbf.py 全国 / make_tiles.py 局部），
+ * 运行时的另一半在 phone/tiles.js。
+ *
+ * 于是这个文件里的抓取顺序变成：
+ *
+ *     ① 本地瓦片（IndexedDB / 内存）—— **完全不联网**，骑手离线也能有底图
+ *     ② 上游瓦片（GitHub Pages）—— 几十 KB 一块，只下缺的那些
+ *     ③ Overpass —— **只在"确认没有瓦片覆盖"时才走**，而且完全照旧
+ *        （退避、镜像 sticky、busy/empty 的区分一个都没动）
+ *
+ * ⚠️ 三条不能破的边界：
+ *   a) **协议一个字都没改**。NAV_MAP 还是 4 字节头 + int16 米（相对路线原点），
+ *      设备端仍然 64 段 / 400 点。瓦片只是"数据从哪来"变了，
+ *      build() 该裁还是裁 —— **缓存变大不等于发出去的帧变大**。
+ *   b) **没有 location 就没有瓦片**（Node 自测就是这种）。
+ *      那时候 this.tiles === null，整个类退化成上面三个步骤里的第 ③ 步，
+ *      和上一版**逐字节相同**。老的那些自测因此一条都没改。
+ *   c) 瓦片这一层出任何问题（存储坏了、地址不对、块损坏）都只表现为
+ *      "退回 Overpass"，绝不能变成"底图崩了"或者"导航卡住"。
+ *
+ * ---------------------------------------------------------------------------
+ * 下面是原来那一版（Overpass 唯一路径）的完整说明，行为一个字都没变
+ * ---------------------------------------------------------------------------
  * ⚠️ 与 Python 版一致的三条关键行为，别改：
  *
  * 1. **必须检查 remark。** Overpass 被限流/超时的时候**不报错**，而是返回
@@ -16,6 +49,35 @@
  * 3. **抓取绝不能阻塞导航循环。** Python 版用后台线程；浏览器里用 fetch 的
  *    天然异步性 —— refresh() 只负责发起，build() 永远拿"上一份好数据"继续画。
  *    绝对不要在这里 await 之后再发帧。
+ *
+ * ---------------------------------------------------------------------------
+ * ⭐ 这一版的核心：**抓大、少问**（抓取半径 ≠ 下发半径）
+ * ---------------------------------------------------------------------------
+ * 真机（红米 + Android 16）上的现场结论：底图几乎不出。用户自己在手机浏览器里
+ * 打开 overpass-api.de 的 /api/status，页面上写的是 **"返回零条可用线路"** ——
+ * 也就是**对方是通的、在跟我们说话，但已经满负荷/在限流**。
+ *
+ * 这既不是网络不通，也不是 CORS。是**我们的请求节奏**把它放大了：
+ * 旧版每走 80 米就发一次请求、每次只问 260 米。对着一个"0 个空闲线路"的服务，
+ * 这种小碎步请求几乎必然全部失败，而且每一次失败还烧掉一份退避额度。
+ *
+ * 修法就是把一直混在一起的两个半径拆开（常量在 route.js，那里有完整说明）：
+ *
+ *   | | 旧版 | 这一版 |
+ *   |---|---|---|
+ *   | 一次抓多大（抓取半径） | 260m | **1500m**（实测 574KB / 751 条 / 7.9 秒） |
+ *   | 圆心在哪 | 骑手脚下 | 沿航线**前方 600m**（前向覆盖 2100m） |
+ *   | 走多远才再问一次 | 80m | **1700m**（前向；= 600 偏置 + 1100 阈值） |
+ *   | 停着不动多久再问 | 40s | ≈231s |
+ *   | 缓存复用距离 | 180m | 1100m |
+ *   | 发给设备的帧 | build() 按 view×1.6 裁剪 | **一个字都没改** |
+ *
+ * 100km 骑行：约 1250 次请求 → **约 59 次**（见 route.js 里那张实测表）。
+ * 一次成功抓取能连着骑 1.7km（不再是 80m）。
+ *
+ * ⚠️ 坐标原点**没有变**：build() 仍然投影到**路线原点**（origin_lat/origin_lon），
+ *    抓取锚点只用来决定"去哪抓"和"缓存还盖不盖得住"，一个点都不参与投影。
+ *    所以放大抓取半径**不会**改变任何一点是怎么表达的（集成自测钉着这条）。
  *
  * ---------------------------------------------------------------------------
  * 失败要快、要说得清楚、绝不能拖累导航
@@ -68,9 +130,24 @@
  *   5. **状态机说得清楚**（status()）：在试第几个镜像 / 不可用（含逐镜像的失败
  *      原因）/ 好（多少段多少点、是否来自缓存）。界面直接照抄，不再有含糊的
  *      "等待路网"。文案常量就在这个文件里，只有一份。
+ *   6. ⭐ **"被限流"和"这里真的没有路"必须长得不一样**（这一版补的）。
+ *      Overpass 忙起来有三种表现，旧版把它们揉成了一句"无响应"，读起来像我们
+ *      自己的 bug：
+ *        a) HTTP 429 / 503 / **504**（实测 overpass-api.de 的 504 body 里写着
+ *           "The server is probably too busy to handle your request."）；
+ *        b) HTTP 200 + `elements:[]` + `remark:"runtime error: Query timed out"`；
+ *        c) 200 + 空 elements + **没有** remark —— 这一带确实没有我们认识的路。
+ *      a/b 是 `busy`（服务太忙/被限流），c 是 `empty`（这一带没有路）。两者的
+ *      短状态、详情、退避时长全都不同，见 MAP_BUSY_TEXT / MAP_EMPTY_TEXT。
+ *      退避也分档：限流走 120→240→…→1800 秒（比网络错误狠得多，因为被限流时
+ *      再打只会更糟），普通网络错误仍是 60→…→600 秒。
  *
  * 存储从磁盘文件换成 localStorage：
- *   - 每份 15KB 左右，localStorage 一般有 5MB，60 份约 900KB，够用；
+ *   - 抓取半径从 260m 放大到 1500m 之后，**一份缓存从 ~15KB 涨到 ~0.6MB**，
+ *     所以条数上限（MAP_CACHE_MAX，和 Python 对拍的那个）不再是真正的约束：
+ *     真正管用的是**字节预算** MAP_CACHE_MAX_BYTES + _trim_cache()。
+ *     Chrome 的 localStorage 配额 ≈ 5MB 且**按 UTF-16 算**（一个字符 2 字节），
+ *     所以预算按"字符数 1.8M ≈ 3.6MB"给，留出余量。
  *   - 超配额时（QuotaExceededError）**丢掉最旧的一半再重试**，失败就算了 ——
  *     缓存没了只是下次要重新联网，不能让导航崩掉。
  */
@@ -80,11 +157,12 @@
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = factory(require('./navmath.js'), require('./proto.js'),
-                             require('./route.js'));
+                             require('./route.js'), require('./tiles.js'));
   } else {
-    root.NavPuckMap = factory(root.NavPuckMath, root.NavPuckProto, root.NavPuckRoute);
+    root.NavPuckMap = factory(root.NavPuckMath, root.NavPuckProto,
+                              root.NavPuckRoute, root.NavPuckTiles);
   }
-}(typeof globalThis !== 'undefined' ? globalThis : this, function (nm, proto, rt) {
+}(typeof globalThis !== 'undefined' ? globalThis : this, function (nm, proto, rt, tl) {
 
   const MAP_CACHE_KEY = 'navpuck.osm_cache.v1';
   // "上次成功的镜像"（sticky）。**单独一个键**，和路网缓存互不影响：
@@ -121,15 +199,74 @@
   // 失败退避的上限（秒）。指数退避：60 -> 120 -> 240 -> 480 -> 600。
   // 服务刚恢复时最怕一堆客户端同时回来把它再打死。
   const MAP_FAIL_COOLDOWN_MAX_S = 600;
+  // ⭐ 被限流（服务太忙）时的退避**另一档、更狠**：120 -> 240 -> 480 -> … -> 1800。
+  //
+  // 为什么必须分开：网络不通是"我们这边的问题"，过一会儿自己就好；被限流是
+  // "对方已经满了"，这时候**再打只会更糟**（Overpass 的公平使用策略会因为
+  // 高频请求把来源关得更久）。所以起始值翻倍、上限 30 分钟。
+  // 上限不设得更大是为了"服务一空出来就能自己恢复"：1800 秒是"骑到一半
+  // 问了 10 次都满"的最坏情况下最长的一次等待。
+  const MAP_BUSY_COOLDOWN_S = 120;
+  const MAP_BUSY_COOLDOWN_MAX_S = 1800;
+
+  // 缓存字节预算（JSON 字符串的**字符数**）。Chrome 的 localStorage 配额约 5MB
+  // 且按 UTF-16 计（1 字符 2 字节），所以 1.8M 字符 ≈ 3.6MB，留出余量。
+  // 抓取半径 1500m 时一份 ≈0.57MB 字符，也就是**存得住最近 3 份**左右 ——
+  // 够"骑到一半 App 被后台杀掉、重开接着用"。
+  const MAP_CACHE_MAX_BYTES = 1800000;
+
+  // 沿航线预取的重算节流（见 _maybe_prefetch）。8km 的窗口下，
+  // 每 150m 或每 20 秒重算一次绰绰有余，而且骑手停着不动时完全不重算。
+  const MAP_TILE_PREFETCH_MIN_MOVE_M = 150.0;
+  const MAP_TILE_PREFETCH_MIN_PERIOD_S = 20.0;
 
   // ---- 界面文案 ----------------------------------------------------------
   //
-  // 这两句话同时被 map.js 的 status() 和 app.js 用（"map.js 都没加载成功"
+  // 这几句话同时被 map.js 的 status() 和 app.js 用（"map.js 都没加载成功"
   // 那条路径也得说同一句话）。**只有这一份**，改文案改这里。
   const MAP_DOWN_TEXT = '底图服务（Overpass）暂时无响应，不影响导航，路线和箭头照常工作。';
   const MAP_DISABLED_TEXT =
     '街道路网底图已关闭：不再向 Overpass 发任何请求。不影响导航 —— ' +
     '路线、箭头、转向提示和 10Hz 更新都照常；勾选"显示街道路网底图"可以重新打开。';
+  // ⭐ 被限流：**必须**和"无响应"分开说。用户看到"无响应"会以为是我们 app 的
+  //    bug（于是去重启、去重装）；而实际情况是那个**免费公共服务**现在满了。
+  const MAP_BUSY_TEXT =
+    '底图服务（Overpass）现在太忙（免费公共服务被限流，服务端返回"没有空闲线路"），' +
+    '不是我们这边出错，也不代表这里没有路。导航不受影响 —— ' +
+    '一旦有一次请求挤进去，底图立刻就会画出来，中间会自动重试。';
+  // ⭐ 真的没有路：Overpass 正常答复了、也没有 remark，就是这一带没有我们认识的
+  //    道路等级（水面、荒地、封闭施工区）。这和"服务太忙"是两件事，不能同一句话。
+  const MAP_EMPTY_TEXT =
+    '这一带没有可用道路：Overpass 正常答复了查询（没有报错、也没有限流），' +
+    '只是周围没有任何我们认识的道路等级。不影响导航 —— 路线和箭头照常工作。';
+
+  // ---- 瓦片（离线底图）那一套文案 ----------------------------------------
+  //
+  // ⭐ 用户的原始诉求是"底图对我很重要，可以作为参照"，以及
+  //    "不要让我猜"。所以下面每一句都回答了同一个问题：
+  //    **现在屏幕上这张底图是从哪来的、还缺什么、我在为它做什么。**
+  //
+  // 三种状态必须一眼分得开（这也是这一版新增状态的**全部理由**）：
+  //   ① 瓦片覆盖正常       -> 'tiles' / 'tiles-cache'：正常，别废话
+  //   ② 瓦片正在下载       -> 'tiles-fetching'：**有东西看**，同时在补
+  //   ③ 这一带没覆盖 + Overpass 也忙 -> 'gap-busy'：**两件事都说清楚**
+  const MAP_TILES_TEXT =
+    '底图来自离线瓦片（预先做好的路网，从项目自己的站点下载，不经过 Overpass）。';
+  const MAP_TILES_DOWNLOADING_TEXT =
+    '正在下载离线瓦片：屏幕上已经有本地缓存的那一部分，缺的几块在后台补，' +
+    '补好会自动画上去。导航不受影响。';
+  // ⭐ 这一句是"再也不要让用户猜"的落点：**同时**说清两件事 ——
+  //   a) 这一带**没有**预先做好的瓦片（不是下载失败、不是我们出错）；
+  //   b) 唯一的退路 Overpass 现在也忙。
+  //   用户看到这句话应该得到的结论是"换一条路/等一会儿"，而不是"重启 App"。
+  const MAP_GAP_BUSY_TEXT =
+    '这一带没有离线瓦片覆盖（预生成的瓦片只包含主路和次干道），' +
+    '而唯一的退路 Overpass 现在也满负荷（免费公共服务被限流）。' +
+    '不是我们这边出错，导航完全不受影响 —— 路线、箭头、转向提示照常。' +
+    '会按退避自动重试；骑回有瓦片覆盖的区域会立刻恢复。';
+  const MAP_NO_TILES_TEXT =
+    '这一带没有离线瓦片覆盖（预生成的瓦片只包含主路和次干道），' +
+    '正在用 Overpass 兜底抓取。';
 
   /**
    * Overpass 实例。按这个顺序试，全失败才算失败。
@@ -187,6 +324,79 @@
     return msg;
   }
 
+  /**
+   * Overpass 报"我忙/在限流"的**服务端**信号。
+   *
+   * ⚠️ 必须一起匹配错误页的正文，不能只看 HTTP 码：实测 overpass-api.de 在
+   *    满负荷时回的是 **504 + 一整页 HTML**，里面那句人话是
+   *    "The server is probably too busy to handle your request."；
+   *    而"查询超时"是 **HTTP 200 + remark:"runtime error: Query timed out"**。
+   *    两种都不是"这里没有路"。
+   */
+  const _BUSY_RE = new RegExp([
+    'rate.?limit', 'too many requests', 'too busy',
+    'no slots?', 'slots? (are )?(not )?available', 'slots available now',
+    'query timed out', 'timed out', 'timeout', 'gateway time-?out',
+    'service unavailable', 'temporarily unavailable',
+    'please try again', 'try again later', 'throttl', 'quota', 'overload',
+    'dispatcher_client', 'request_read_and_idx',
+  ].join('|'), 'i');
+
+  /** HTML/多余空白清掉，截断成一句能塞进状态行的短提示。 */
+  function _plain_text(s, max) {
+    let t = (s === undefined || s === null) ? '' : String(s);
+    t = t.replace(/<[^>]*>/g, ' ')                 // 504 那种整页 HTML
+         .replace(/&(amp|lt|gt|quot|#39|nbsp);/g, ' ')
+         .replace(/\s+/g, ' ')
+         .trim();
+    const n = max === undefined ? 160 : max;
+    return t.length > n ? (t.slice(0, n) + '…') : t;
+  }
+
+  /**
+   * 读错误响应的正文，**读不到就返回空串**。
+   *
+   * ⚠️ 这个函数曾经**在调用点存在、但根本没有定义**（工作副本里漏了），
+   *    后果非常隐蔽也非常严重：`!resp.ok` 那一支会抛 ReferenceError，
+   *    被外面的 catch 收成 kind='other' —— 于是**每一次 429/503/504 都被
+   *    报成"底图不可用"**，而不是"服务太忙"。也就是说
+   *    "被限流"和"我们这边出错"这两件事在界面上又混成了一件，
+   *    而那正是这一版专门要分开的东西。
+   *    phone/test/tiles.mjs 第 7 节现在钉着这条路径（喂真的 HTTP 429）。
+   *
+   * 为什么不能直接 `await resp.text()`：这一段只在服务端**已经在报错**时走，
+   * 这时候读正文本身就可能抛（连接被掐、body 已被消费、CORS 只给状态码）。
+   * 我们要的只是"正文里有没有'忙'的信号"，读不到就当没有 ——
+   * 绝不能让"读正文失败"把真正的失败原因（HTTP 码）也一起吃掉。
+   */
+  async function _safe_text(resp) {
+    try {
+      if (resp && typeof resp.text === 'function') return await resp.text();
+    } catch (_e) { /* 读不到就当空正文，下面的分类仍然按 HTTP 码走 */ }
+    return '';
+  }
+
+  /**
+   * 一次失败到底是哪一种？——**"服务太忙"和"这里没有路"必须分开**。
+   *
+   * @param {number} http_status  HTTP 码（200 = 服务端正常答复）
+   * @param {string} text         remark 或错误页正文
+   * @returns {string} busy | empty | http | other
+   *   - busy  服务太忙 / 被限流（429、503、504，或正文里有"忙"的信号）
+   *   - empty HTTP 200、没有 remark、就是一条路都没有（这一带真的没有路）
+   *   - http  其它 HTTP 错误（400 这类，多半是我们自己的查询有问题）
+   *   - other 说不上来
+   */
+  function classify_overpass_failure(http_status, text) {
+    const s = Number(http_status) || 0;
+    const plain = _plain_text(text, 400);
+    if (s === 429 || s === 503 || s === 504) return 'busy';
+    if (plain && _BUSY_RE.test(plain)) return 'busy';
+    if (s === 200) return 'empty';
+    if (s >= 400) return 'http';
+    return 'other';
+  }
+
   class OsmMapSource {
     /**
      * @param {object} opts
@@ -197,14 +407,20 @@
      *   endpoints   Overpass 实例列表
      *   endpoint_timeout_ms / budget_ms / min_slice_ms  网络预算（自测会调小）
      *   enabled     false = 彻底关掉底图：一个 Overpass 请求都不发
-     *   radius_m / max_points / max_segs  抓取与裁剪预算
+     *   fetch_radius_m / max_points / max_segs  抓取与裁剪预算
+     *   radius_m    fetch_radius_m 的旧名字（仍然接受，含义相同）
      */
     constructor(opts) {
       const o = opts || {};
-      this.radius_m = o.radius_m === undefined ? rt.MAP_RADIUS_M : o.radius_m;
+      // ⚠️ 这是**抓取**半径（一次 Overpass 请求拉多大一圈），不是下发半径。
+      //    下发半径是 build() 里的 view_m × 1.6，两者这一版起正式分开 ——
+      //    见 route.js 里 MAP_FETCH_RADIUS_M 那段说明。
+      this.fetch_radius_m = (o.fetch_radius_m !== undefined) ? o.fetch_radius_m
+        : ((o.radius_m !== undefined) ? o.radius_m : rt.MAP_FETCH_RADIUS_M);
       // 帧长是可以调的：设备端接收环到底吃不吃得下大帧，靠扫这几个值就能测出来。
       // 但注意 MAX_PAYLOAD = 1536 这条硬线：60 段 / 330 点的 payload 是 1384，
       // 再往上调就会 encode_nav_map() 抛错（见 proto.js 里那段说明）。
+      // ⚠️ 抓取半径变大**不会**让这几个数变大：帧还是按 view×1.6 裁剪出来的那一份。
       this.max_points = o.max_points === undefined ? rt.MAP_MAX_POINTS : o.max_points;
       this.max_segs = o.max_segs === undefined ? rt.MAP_MAX_SEGMENTS : o.max_segs;
       this.endpoints = o.endpoints || ENDPOINTS;
@@ -218,9 +434,11 @@
       this._storage = o.storage === undefined ? _defaultStorage() : o.storage;
       this._now = o.now || (() => Date.now() / 1000);
       this._now_ms = o.now_ms || (() => Date.now());
-
+      // 抓取锚点 = **抓取圆心**（这一版起它可能被前向偏置到骑手前方几百米，
+      // 见 refresh() 的 ahead 参数）。只用来看"缓存还盖不盖得住"和"走远了没有"，
+      // **绝不参与坐标投影**（投影原点是路线原点，由 build() 的调用方给）。
       this.ways = [];                     // [[rank, [[lat,lon],...]], ...]
-      this.anchor = null;                 // [lat, lon]
+      this.anchor = null;                 // [lat, lon] 抓取圆心
       this.last_fetch_t = -1e9;
       this.fail_until_t = -1e9;
       this.last_error = '';
@@ -232,17 +450,22 @@
       this._load_cache();
 
       // ---- 状态机（status() 的原料，界面只读它）----
-      // idle | trying | ok | cached | stale | unavailable | disabled
+      // idle | trying | ok | cached | stale | unavailable | busy | empty | disabled
       this.state = this.enabled ? 'idle' : 'disabled';
       this.attempt = 0;                   // 这一轮试到第几个镜像（1 起）
       this.current_endpoint = '';
-      this.errors = [];                   // [{endpoint, reason, ms}] 最近的失败原因
+      this.errors = [];                   // [{endpoint, reason, kind, ms}] 最近的失败原因
       this.from_cache = false;
       this.stale = false;
       this.cache_t = null;                // 当前这份缓存的抓取时刻（秒）
       this.cache_endpoint = '';           // 当前这份缓存当初是谁给的（只用于显示）
       this.consecutive_fails = 0;
       this.fail_cooldown_used_s = 0;
+      // 这一轮失败的性质：'' | busy | empty | timeout | network | http | internal
+      // 界面文案、退避档位、以及"和网络错误区分开"全都看它。
+      this.last_failure_kind = '';
+      // 连续多少次是"服务太忙"。它决定退避用哪一档（busy 那一档更狠）。
+      this.busy_streak = 0;
       // 下一次从哪个镜像开始试（失败后轮换，见 _endpoint_order）
       this._start = 0;
       // 上次成功的镜像（sticky，见 _endpoint_order）。必须在 _storage 和
@@ -252,6 +475,63 @@
       this.last_ok_t = -1e9;
       this.built_segs = 0;                // build() 真的画出去过多少段/点（界面读）
       this.built_pts = 0;
+
+      // ---- ⭐ 离线瓦片那一层（见文件头"离线优先"）-------------------------
+      //
+      // this.tiles === null 是**完全正常**的一种情况，有两条来路：
+      //   1) tiles.js 没加载成功（老浏览器 / 文件被删 / 单元测试里没挂全局）；
+      //   2) **没有 location**——也就是根本不在浏览器里（Node 自测就是这种）。
+      // 两种都退化成"只有 Overpass"的上一版行为，一条分支都不多走。
+      // 这是刻意的：**测试跑的是真实代码路径，而不是一个测试专用分支**，
+      // 所以"新功能没生效时的老行为"必须由真实的分支来表达。
+      this.tiles = null;
+      this.tiles_error = '';
+      this.tiles_dirty = false;           // 后台下好一块 -> 置上 -> 下一轮强制重画
+      this.route_pts = null;              // 航线折线（app.js 调 set_route 给）
+      this._prefetch_t = -1e9;            // 上次算预取计划的时刻（秒）
+      this._prefetch_at = null;           // 上次算预取计划时的位置
+      this.last_tiles = null;             // 最近一次 load_area 的结果（界面/diagnose 读）
+      this.tile_segs = 0;                 // 当前这份路网里有多少段来自瓦片
+      this.tiles_used = false;            // 当前这份路网是不是瓦片给的
+      this.tiles_have = 0;
+      this.tiles_need = 0;
+      this.coverage = 'off';              // off | have | partial | none | unknown
+      if (tl && o.tiles !== false) {
+        try {
+          this.tiles = new tl.TileStore({
+            // ⚠️ 瓦片走**自己的** fetch 通道（o.tile_fetch）。这不只是洁癖：
+            //    自测里注入的假 fetch 只认 Overpass 的查询，
+            //    混在一起会让"注入 fetch"这个动作的含义变得不明确。
+            fetch: o.tile_fetch || this._fetch,
+            storage: this._storage,
+            indexedDB: o.indexedDB,
+            location: o.location,
+            bases: o.tile_bases,
+            zoom: o.tile_zoom,
+            now: o.now,
+            now_ms: o.now_ms,
+            max_inflight: o.tile_max_inflight,
+            plan_max: o.tile_plan_max,
+            timeout_ms: o.tile_timeout_ms,
+            prefetch_ahead_m: o.tile_prefetch_ahead_m,
+            // 后台下好一块就置脏：_refresh 下一轮（≤0.5 秒）就会用上新数据。
+            // 没有这条的话，新下的瓦片要等"走远 1100m / 停 231 秒"才会被用上 ——
+            // 那正是"地图感觉不跟手"的来路。
+            on_change: () => { this.tiles_dirty = true; },
+          });
+          if (!this.tiles.ready()) {
+            this.tiles_error = '这一端没有可用的瓦片地址（不是浏览器环境？）';
+            this.tiles = null;
+          }
+        } catch (e) {
+          this.tiles = null;
+          this.tiles_error = `瓦片层建不起来：${e}`;
+        }
+      } else if (!tl) {
+        this.tiles_error = 'tiles.js 没有加载（底图只走 Overpass）';
+      } else {
+        this.tiles_error = '构造参数 tiles:false 明确关掉了瓦片';
+      }
     }
 
     // -- 存储 --------------------------------------------------------------
@@ -261,6 +541,9 @@
         if (!raw) { this.cache = []; return; }
         const j = JSON.parse(raw);
         this.cache = (j && j.entries) || [];
+        // 读进来先按预算剪一遍：老版本写下的、或者别人手工塞进来的超大缓存
+        // 不该在内存里一直待着（它下一次保存时本来也会被剪掉）。
+        this._trim_cache();
       } catch (e) {
         // 缓存坏了就当作没有 —— 绝不能因为一份垃圾 JSON 让导航起不来
         this.last_error = `缓存读取失败（忽略）：${e}`;
@@ -270,16 +553,22 @@
 
     _save_cache() {
       if (!this._storage) return;
-      const entries = this.cache.slice(-rt.MAP_CACHE_MAX);
+      // ⚠️ 写之前先按预算修剪：抓取半径放大之后，一份缓存就 ~0.57MB（字符），
+      //    不修剪的话一次写入就能把 localStorage 配额撑爆 —— 而配额爆掉的表现
+      //    是"缓存永远存不进去"，用户下次打开还是空屏。
+      this._trim_cache();
+      const entries = this.cache.slice();
       const write = (list) => this._storage.setItem(
         MAP_CACHE_KEY, JSON.stringify({ entries: list }));
       try {
         write(entries);
       } catch (e) {
-        // 配额爆了：丢掉最旧的一半再试一次。再失败就放弃本轮写入。
+        // 配额爆了（别的键也可能占了地方）：丢掉最旧的一半再试一次。
+        // 再失败就放弃本轮写入 —— 缓存没了只是下次要重新联网。
         try {
-          write(entries.slice(Math.floor(entries.length / 2)));
-          this.cache = entries.slice(Math.floor(entries.length / 2));
+          const half = entries.slice(Math.floor(entries.length / 2));
+          write(half);
+          this.cache = half;
         } catch (_e2) {
           this.last_error = `缓存写入失败（忽略）：${e}`;
         }
@@ -336,6 +625,10 @@
      * ⚠️ **不**看新旧、**不**看当初是哪个镜像抓的：过期由调用方决定怎么用
      * （先用上再刷新），endpoint 只写进缓存里供显示。镜像列表变化时旧缓存
      * 照样能用 —— 这是"公共实例换了一批，手机上的缓存就全废了"那种坑的解药。
+     *
+     * "足够近"= map_fetch_reach_m(抓取半径)：抓取圈半径 1500m、边缘留 400m，
+     * 所以锚点在 1100m 以内时那一圈数据**一定还盖得住**骑手要画的 260m。
+     * （旧版是固定的 180m；半径变大之后 180m 会把明明能用的缓存判成不能用。）
      */
     _cache_lookup(lat, lon) {
       let best = null;
@@ -345,8 +638,47 @@
         const d = nm.distance_m(lat, lon, e.lat, e.lon);
         if (d < best_d) { best = e; best_d = d; }
       }
-      if (best !== null && best_d <= rt.MAP_CACHE_REUSE_M) return best;
+      if (best !== null && best_d <= this.cache_reuse_m()) return best;
       return null;
+    }
+
+    /** 这一份抓取半径对应的"缓存还能用"的距离（米）。 */
+    cache_reuse_m() {
+      return rt.map_fetch_reach_m(this.fetch_radius_m);
+    }
+
+    /** 这一份抓取半径对应的"走多远才值得再问一次"（米）。 */
+    fetch_move_m() {
+      return rt.map_fetch_reach_m(this.fetch_radius_m);
+    }
+
+    /** 这一份抓取半径对应的"最多多久再问一次"（秒）。 */
+    refresh_period_s() {
+      return rt.map_refresh_period_s(this.fetch_radius_m);
+    }
+
+    /**
+     * 按**字节预算**修剪缓存（外加 Python 对拍的那条条数上限）。
+     *
+     * 为什么非要有：抓取半径 260m 时一份缓存 ~15KB，60 份 900KB，条数就是天然
+     * 的闸门；放大到 1500m 之后一份 ~0.57MB（字符），60 份就是 34MB —— 远超
+     * localStorage 的配额，一次写入就把整个缓存搞死。所以真正的闸门换成字节：
+     * 从**最新**那份往前留，直到装不下为止（旧的那几份本来也离骑手越来越远）。
+     */
+    _trim_cache() {
+      if (!this.cache || this.cache.length === 0) { this.cache = this.cache || []; return; }
+      const list = this.cache.slice(-rt.MAP_CACHE_MAX);
+      let total = 0;
+      const kept = [];
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const n = _entry_chars(list[i]);
+        // 至少留一份：宁可让唯一那份把预算占满，也不要一条缓存都没有
+        if (kept.length > 0 && (total + n) > MAP_CACHE_MAX_BYTES) break;
+        total += n;
+        kept.push(list[i]);
+      }
+      kept.reverse();
+      this.cache = kept;
     }
 
     _apply_cache(e) {
@@ -392,21 +724,21 @@
     /**
      * 拼 Overpass 查询。
      *
-     * ⚠️ 半径就是 MAP_RADIUS_M（260 米），**不能调小也不能调大**：
-     *   - 调小不行：navigator.py 那条约束算的是
-     *     "MAP_RADIUS_M - MAP_REFRESH_MOVE_M > 可视半径"，也就是
-     *     260 - 80 = 180 > ROUTE_FAR_M(160)。再小的话，锚点落后（车已经往前
-     *     跑了 80 米还没刷新）时前方就会出现一圈"没有路网"的空洞。
-     *     而且 MAP_RADIUS_M 是和 Python 对拍的常量，这里更不能动。
-     *   - 调大也不行：实测一个 around:300 的"小"查询在唯一能用的镜像上就要
-     *     17.6 秒（文件头）。半径每大一档，超时的概率就高一档，而我们只需要
-     *     160 米的视野 —— 拿超时换一圈画不出来的路，是纯亏。
+     * ⚠️ **查询形状一个字都没改**，只有半径这个数字变了：
+     *   旧：`way[highway](around:260,lat,lon);out geom;`
+     *   新：`way[highway](around:1500,lat,lon);out geom;`
      *
-     * ⚠️ 这条查询**和实测时用的那条是同一串字节**（`way[highway](around:...)`，
-     *    只在数字上不同）。maps.mail.ru 那次 "200 / 17.6 秒 / 43.9 KB / 46 条路"
-     *    就是**这条查询**测出来的。所以没有重新实测之前**不要改它的形状**：
-     *    别调半径、别加标签值过滤、别换过滤器顺序。改了，那份实测就不再说明
-     *    任何事 —— 而"哪个镜像能用、要等多久"目前只剩这一份实测撑着。
+     *   文件头那张实测表就是**这条查询**（同一个过滤器、同一个 `out geom`）
+     *   在不同半径下测出来的：300m→51KB、1500m→574KB、3000m→2.8MB，
+     *   而且 2000m 那一次撞上了 **HTTP 504（服务太忙）**。所以：
+     *     - 半径不能再往上加：3km 一次 2.8MB，一次就吃掉大半个 localStorage
+     *       配额，下载也更容易在 45 秒切片里超时；
+     *     - 也不能加标签过滤"顺手省流量"：改了过滤条件，那份实测就不再说明
+     *       任何事，而"哪个镜像能用、要多久"目前只剩这一份实测撑着。
+     *
+     * ⚠️ `lat/lon` 是**抓取圆心**，不一定是骑手脚下：refresh() 会把圆心沿航线
+     *    往前偏置 MAP_FETCH_BIAS_M（默认 600m），让圆盘的前向覆盖变成 2100m。
+     *    圆心和"要画的 260m"之间的关系由 MAP_FETCH_EDGE_KEEP_M 保证。
      *
      * [timeout:N] 是**服务端**自己的超时，比客户端的 abort 早
      * MAP_QUERY_TIMEOUT_MARGIN_S 秒：这样它还有机会回一个带 remark 的 200
@@ -418,7 +750,8 @@
       const server_s = Math.max(5,
         Math.floor(timeout_ms / 1000) - MAP_QUERY_TIMEOUT_MARGIN_S);
       return `[out:json][timeout:${server_s}];` +
-             `way[highway](around:${Math.trunc(this.radius_m)},${lat.toFixed(6)},${lon.toFixed(6)});` +
+             `way[highway](around:${Math.trunc(this.fetch_radius_m)},` +
+             `${lat.toFixed(6)},${lon.toFixed(6)});` +
              `out geom;`;
     }
 
@@ -470,7 +803,10 @@
      *      之后并不会立刻 reject，只靠 signal 的话一个装死的镜像能把整轮预算
      *      无限拖下去。没有 AbortController 的老浏览器就只剩这一层。
      *
-     * @returns {Promise<{ok:boolean, json?:object, reason?:string, ms:number}>}
+     * ⭐ 失败**带性质**（kind）：busy / timeout / network / http / empty。
+     *    "服务太忙"和"这里没有路"必须分得开，所以这里既读 HTTP 码，也读正文。
+     *
+     * @returns {Promise<{ok:boolean, json?:object, reason?:string, kind?:string, ms:number}>}
      *          永远 resolve，不抛 —— 调用方只需要看 ok。
      */
     async _try_endpoint(ep, q, timeout_ms) {
@@ -488,10 +824,29 @@
             body: 'data=' + encodeURIComponent(q),
             signal: ac ? ac.signal : undefined,
           });
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          if (!resp.ok) {
+            // ⚠️ 这里以前只留一句 `HTTP 504` 就完事 —— 于是 504 被当成和
+            //    "网络不通"一样的普通失败，用户看到的是一句"无响应"。
+            //    实测 overpass-api.de 满负荷时回的正是 504 + 一整页 HTML，
+            //    正文里那句人话（"The server is probably too busy..."）才是
+            //    真正的病因，必须读出来参与分类。
+            const body = await _safe_text(resp);
+            const kind = classify_overpass_failure(resp.status, body);
+            const err = new Error(`HTTP ${resp.status}`);
+            err.map_kind = kind;
+            err.map_hint = _plain_text(body, 120);
+            throw err;
+          }
           const j = await resp.json();
           // 关键：Overpass 限流/超时时是 HTTP 200 + 空 elements + remark。
-          if (j && j.remark) throw new Error(`Overpass remark: ${j.remark}`);
+          // 不看 remark 就会把它当成"这里本来就没有路"。
+          if (j && j.remark) {
+            const kind = classify_overpass_failure(200, j.remark);
+            const err = new Error(`Overpass remark: ${j.remark}`);
+            err.map_kind = kind;
+            err.map_hint = _plain_text(j.remark, 120);
+            throw err;
+          }
           return j;
         })();
         const timeout = new Promise((_res, rej) => {
@@ -508,11 +863,26 @@
       } catch (e) {
         const msg = (e && e.message !== undefined) ? String(e.message) : String(e);
         const timed_out = /请求超时/.test(msg) || (e && e.name === 'AbortError');
-        return {
-          ok: false,
-          ms: this._now_ms() - t0,
-          reason: timed_out ? `请求超时（${secs} 秒）` : _err_text(e),
-        };
+        if (timed_out) {
+          return {
+            ok: false, kind: 'timeout', ms: this._now_ms() - t0,
+            reason: `请求超时（${secs} 秒）`,
+          };
+        }
+        const explicit = (e && e.map_kind) ? String(e.map_kind) : '';
+        const text = _err_text(e);
+        const kind = explicit || (/网络不可达|请求被中断/.test(text) ? 'network' : 'other');
+        // 原因里带上"为什么"：被限流时要让人一眼看出是**服务端太忙**，
+        // 而不是我们这边出了什么毛病。
+        let reason = text;
+        if (kind === 'busy') {
+          reason = e && e.map_hint
+            ? `服务太忙/被限流（${text}：${e.map_hint}）`
+            : `服务太忙/被限流（${text}）`;
+        } else if (kind === 'http' && e && e.map_hint) {
+          reason = `${text}（${e.map_hint}）`;
+        }
+        return { ok: false, kind, ms: this._now_ms() - t0, reason };
       } finally {
         if (timer) clearTimeout(timer);
       }
@@ -527,28 +897,63 @@
     /**
      * 记一次失败并进入冷却。
      *
-     * 退避是**指数**的：60 → 120 → 240 → 480 → 600（上限
-     * MAP_FAIL_COOLDOWN_MAX_S）。公共实例恢复的瞬间最怕一堆客户端同时回来把它
-     * 再打死一次 —— 那会变成"服务回来了但所有人都还在被限流"。
+     * ⭐ **两档退避**，这一版才分开的：
+     *   - 被限流/服务太忙（`busy`）：120 → 240 → 480 → … → **1800** 秒。
+     *     为什么狠得多：网络不通是"我们这边一会儿自己就好"，而对方已经满了
+     *     的时候**再打只会更糟**（公平使用策略会把高频来源关得更久）。
+     *   - 其它（网络不可达 / 请求超时 / 自己代码出错）：60 → 120 → … → 600 秒，
+     *     和以前一样。
+     *
+     * 用 `busy_streak` 而不是 `consecutive_fails` 来算 busy 那一档：网络错误
+     * 混在中间不该把限流的退避重置回 120 秒（那等于"刚被限流就又去敲门"）。
      */
-    _note_failure() {
+    _note_failure(kind) {
       this.consecutive_fails += 1;
-      const exp = Math.min(Math.max(this.consecutive_fails - 1, 0), 8);
-      const s = Math.min(rt.MAP_FAIL_COOLDOWN_S * Math.pow(2, exp),
-                         MAP_FAIL_COOLDOWN_MAX_S);
+      const busy = (kind === 'busy');
+      if (busy) this.busy_streak += 1; else this.busy_streak = 0;
+      const exp = Math.min(Math.max((busy ? this.busy_streak : this.consecutive_fails) - 1, 0), 8);
+      const base = busy ? MAP_BUSY_COOLDOWN_S : rt.MAP_FAIL_COOLDOWN_S;
+      const cap = busy ? MAP_BUSY_COOLDOWN_MAX_S : MAP_FAIL_COOLDOWN_MAX_S;
+      const s = Math.min(base * Math.pow(2, exp), cap);
       this.fail_cooldown_used_s = s;
       this.fail_until_t = this.clock_now + s;
     }
 
-    /** 失败收尾：轮换起点镜像、进冷却、并且**在没有数据时**才报 unavailable。 */
-    _finish_failure() {
+    /**
+     * 失败收尾：轮换起点镜像、进冷却、按**失败的性质**定状态。
+     *
+     * 状态的三种去向：
+     *   - 手里一点数据都没有 + 全是"服务太忙" -> `busy`（界面说"公共服务太忙"）
+     *   - 手里一点数据都没有 + 其它           -> `unavailable`（界面说"无响应"）
+     *   - 手里有旧数据                        -> `stale`（继续画，只标"缓存已旧"）
+     *     有数据时**不**切到 busy/unavailable：屏幕上还有路网，"不可用"是错的。
+     */
+    _finish_failure(kind) {
       const n = Math.max(1, this.endpoints.length);
       this._start = (this._start + 1) % n;
       this.last_error = this._reasons_text() || '没有可用的 Overpass 镜像';
-      this._note_failure();
-      // 手上有旧数据（过期缓存）就继续画，只是标"缓存已旧"——
-      // "宁可画一份旧的，也不要让屏幕空着"。
-      this.state = (this.ways && this.ways.length > 0) ? 'stale' : 'unavailable';
+      // 这一轮的性质：只要**所有**试过的镜像都报了 busy，才算"服务太忙"；
+      // 混合失败时不夸大（宁可说"无响应"，也不给用户一个说不准的结论）。
+      const tried = this.errors.filter((e) => !/未尝试/.test(e.reason));
+      const all_busy = tried.length > 0 && tried.every((e) => e.kind === 'busy');
+      this.last_failure_kind = all_busy ? 'busy' : (kind || 'network');
+      this._note_failure(this.last_failure_kind === 'busy' ? 'busy' : this.last_failure_kind);
+      const has_data = !!(this.ways && this.ways.length > 0);
+      if (has_data) {
+        this.state = 'stale';
+      } else if (this.last_failure_kind === 'busy') {
+        // ⭐ 这里分叉：如果**已知**这一带没有瓦片覆盖，用户面对的是
+        //    "两条路都不通"（没有离线瓦片 + Overpass 也满负荷），
+        //    这跟单纯的"公共服务太忙"是两件不同的事，必须分开说 ——
+        //    否则用户会以为"等一会儿就有"，而实际上这一带**永远**不会有瓦片。
+        //    只有 coverage === 'none'（覆盖索引明确说没有）才敢这么说；
+        //    'unknown'（索引没拿到）时仍然说"服务忙"，不编造结论。
+        this.state = (this.coverage === 'none') ? 'gap-busy' : 'busy';
+      } else if (this.last_failure_kind === 'empty') {
+        this.state = 'empty';
+      } else {
+        this.state = 'unavailable';
+      }
     }
 
     /**
@@ -561,10 +966,18 @@
      * await 会把导航循环卡在网络上，那正是 Python 版当初踩过的坑
      * （Overpass 超时 30 秒 -> 整条导航循环停 30 秒 -> 设备显示断链）。
      * 就算调用方 await 了，它也只会在**有界的预算**内返回（见文件头）。
+     *
+     * @param {number} lat @param {number} lon  骑手当前位置
+     * @param {number} now_s                    导航时钟（秒）
+     * @param {Array<number>} ahead             可选：**抓取圆心**（[lat, lon]）。
+     *        调用方（app.js）把圆心沿航线往前提 MAP_FETCH_BIAS_M 米再传进来，
+     *        于是同一个圆盘的前向覆盖从 1500m 变成 2100m —— 骑手是往前骑的，
+     *        多出来的那一截就是"一次成功多骑 1.5 倍距离"。不给就退回"以骑手
+     *        为圆心"（自测和旧调用点都是这样，行为不变）。
      */
-    async refresh(lat, lon, now_s) {
+    async refresh(lat, lon, now_s, ahead) {
       try {
-        return await this._refresh(lat, lon, now_s);
+        return await this._refresh(lat, lon, now_s, ahead);
       } catch (err) {
         // refresh() 永远不抛：底图出任何问题都不该让 10Hz 循环看到异常。
         // 但也**不能**把异常吞掉 —— 这是"代码自己有 bug"和"上游挂了"的分水岭：
@@ -574,15 +987,36 @@
         this.errors.push({
           endpoint: this.current_endpoint || '（本地）',
           reason: `内部错误：${this.last_error}`,
+          kind: 'internal',
           ms: 0,
         });
-        this._note_failure();
+        this.last_failure_kind = 'internal';
+        this._note_failure('internal');
         this.state = (this.ways && this.ways.length > 0) ? 'stale' : 'unavailable';
         return false;
       }
     }
 
-    async _refresh(lat, lon, now_s) {
+    /**
+     * 这一次到底以哪个点做圆心去抓。
+     *
+     * ⚠️ 前向偏置是**调用方**给的（只有它知道航线），但这里要**再验一遍**：
+     *    圆心必须离骑手足够近，保证骑手连同"要画的 260m"都在抓取圈里
+     *    （dist(骑手, 圆心) + 边缘余量 <= 抓取半径）。调用方给了一个离谱的
+     *    点（航线数据坏了 / 单位搞错）时，宁可退回"以骑手为圆心"，也绝不能
+     *    抓一圈盖不住骑手的路网 —— 那症状是"底图又没了"，而且极难查。
+     */
+    _fetch_center(lat, lon, ahead) {
+      if (!ahead || !Number.isFinite(ahead[0]) || !Number.isFinite(ahead[1])) {
+        return [lat, lon];
+      }
+      const d = nm.distance_m(lat, lon, ahead[0], ahead[1]);
+      const max_off = Math.max(0, this.fetch_radius_m - rt.MAP_FETCH_EDGE_KEEP_M);
+      if (!(d <= max_off)) return [lat, lon];
+      return [ahead[0], ahead[1]];
+    }
+
+    async _refresh(lat, lon, now_s, ahead) {
       this.clock_now = now_s;
 
       if (!this.enabled) {
@@ -592,12 +1026,50 @@
       }
       if (this._fetching) return false;
 
+      // ⚠️ 两个阈值都**由抓取半径推出来**，不再是写死的 40 秒 / 80 米：
+      //    抓多大的一圈，就决定了骑手能骑多远、能骑多久才需要再问一次。
+      //    1500m 半径 -> 1100m / ≈231 秒（见 route.js 里那两个派生函数）。
       let need = true;
       if (this.anchor !== null) {
         const moved = nm.distance_m(lat, lon, this.anchor[0], this.anchor[1]);
-        if ((now_s - this.last_fetch_t) < rt.MAP_REFRESH_S && moved < rt.MAP_REFRESH_MOVE_M) {
+        if ((now_s - this.last_fetch_t) < this.refresh_period_s() &&
+            moved < this.fetch_move_m()) {
           need = false;
         }
+      }
+      // 后台刚补好瓦片：**立刻**重建一次，不等下一班"走远/超时"。
+      // 没有这一条时，新下回来的瓦片最坏要等 231 秒才上屏 ——
+      // 那正是"地图感觉不跟手"的来路。
+      if (this.tiles_dirty) need = true;
+
+      // 圆心（可能被前向偏置），以及**存进缓存/锚点的那个点** —— 就是它，
+      // 不是骑手位置。缓存复用和"走远了没有"都按同一个点算，两者永远一致。
+      const center = this._fetch_center(lat, lon, ahead);
+      const clat = center[0];
+      const clon = center[1];
+
+      // ---------------------------------------------------------------------
+      // ⭐ ① 离线瓦片优先（这一层不联网，也不碰 Overpass 的退避/镜像）
+      // ---------------------------------------------------------------------
+      // ⚠️ 这是本方法里**第一处 await**，所以 _fetching 必须在这里置上并复位：
+      //    置晚了，两次 refresh 会同时进来，两次都去写 this.ways / this.anchor。
+      //    this.tiles === null 时（Node 自测 / 没有 location）整段跳过，
+      //    下面的代码路径和上一版**逐字节相同**。
+      if (need && this.tiles) {
+        this._fetching = true;
+        let tr = null;
+        try {
+          tr = await this._refresh_from_tiles(clat, clon, lat, lon, now_s);
+        } catch (err) {
+          // 瓦片层自己已经吞了绝大多数异常，这里是最后一道网：
+          // 它出任何问题都只能表现为"退回 Overpass"。
+          this.tiles_error = String(err && err.message ? err.message : err);
+          tr = null;
+        } finally {
+          this._fetching = false;
+        }
+        // tr === null -> 这一带**确认没有瓦片覆盖**，交给下面 Overpass 兜底
+        if (tr !== null) return tr;
       }
 
       // 缓存优先：**不论新旧**，命中就先画上，界面上立刻有东西。
@@ -605,6 +1077,7 @@
       if (e !== null) {
         this._apply_cache(e);
         this.from_cache = true;
+        this.tiles_used = false;
         this.cache_hits += 1;
         this.cache_t = (typeof e.t === 'number') ? e.t : null;
         this.cache_endpoint = e.ep ? String(e.ep) : '';
@@ -615,6 +1088,7 @@
           this.last_fetch_t = now_s;
           this.last_error = '';
           this.errors = [];
+          this.last_failure_kind = '';
           this.state = 'cached';
           return false;
         }
@@ -625,7 +1099,14 @@
       if (!need) return false;
       if (now_s < this.fail_until_t) {
         // 冷却中：不重试。手里有数据就还是"缓存已旧"，没有就是"不可用"。
-        this.state = (this.ways && this.ways.length > 0) ? 'stale' : 'unavailable';
+        // ⚠️ 冷却是"不重试"，**不是"忘掉上一次为什么失败"**：busy / empty
+        //    这两种性质界面还要继续显示，否则会出现"刚说服务太忙、下一秒变成
+        //    底图不可用"这种前后矛盾的读数。
+        this.state = (this.ways && this.ways.length > 0)
+          ? 'stale'
+          : (this.last_failure_kind === 'busy'
+            ? (this.coverage === 'none' ? 'gap-busy' : 'busy')
+            : (this.last_failure_kind === 'empty' ? 'empty' : 'unavailable'));
         return false;
       }
 
@@ -645,7 +1126,7 @@
           // 预算用完：把还没试的镜像也记上原因 —— 界面上要能看出"是没轮到"，
           // 而不是让用户以为它也被试过了。
           this.errors.push({
-            endpoint: order[i], ms: 0,
+            endpoint: order[i], ms: 0, kind: 'skipped',
             reason: `未尝试（本轮 ${Math.floor(this.budget_ms / 1000)} 秒预算已用完）`,
           });
           break;
@@ -657,36 +1138,44 @@
         this.state = 'trying';
         // 注意这一句**没有** await 之外的副作用：它只发一个 HTTP 请求，
         // 不碰 this.ways / this.anchor，所以正在画的那份数据不会被改坏。
-        const r = await this._try_endpoint(ep, this._build_query(lat, lon, slice), slice);
+        const r = await this._try_endpoint(ep, this._build_query(clat, clon, slice), slice);
         if (r.ok) { json = r.json; used = ep; break; }
         // 记住的那个镜像刚失败了：**立刻**忘掉它，这一轮剩下的部分和下一轮都
         // 退回静态顺序。（不降级到第二顺位是故意的：留着它就得每轮先白等一个
         // 完整的 45 秒切片。它下次成功时还会被重新记住。）
         if (ep === this._preferred) this._forget_preferred();
-        this.errors.push({ endpoint: ep, reason: r.reason, ms: r.ms });
+        this.errors.push({ endpoint: ep, reason: r.reason, kind: r.kind || 'other', ms: r.ms });
       }
 
       this._fetching = false;
 
       if (json === null) {
-        this._finish_failure();
+        this._finish_failure('network');
         return false;
       }
 
       const ways = OsmMapSource._parse_ways(json);
       if (ways.length === 0) {
-        // HTTP 200 但没有一条认识的路：也算失败（remark 那条已经在
-        // _try_endpoint 里拦住了，走到这里就是"真的空"）。
-        this.errors.push({ endpoint: used, reason: '返回 0 条可用道路', ms: 0 });
-        this._finish_failure();
+        // HTTP 200、**没有** remark、一条认识的路都没有：这一带真的没有路。
+        // （有 remark 的那条已经在 _try_endpoint 里被拦成"服务太忙"了。）
+        // 这两种结论必须分得开：kind / 状态 / 文案全都不一样，见 MAP_EMPTY_TEXT。
+        this.errors.push({
+          endpoint: used, kind: 'empty', ms: 0,
+          reason: 'Overpass 正常答复，但这一带没有可用道路（0 条）',
+        });
+        this._finish_failure('empty');
         return false;
       }
 
       this.ways = ways;
-      this.anchor = [lat, lon];
+      // 锚点 = **抓取圆心**（可能被前向偏置）：缓存复用与"走远了没有"都用它。
+      // ⚠️ 它**不参与投影** —— 投影原点是路线原点（build() 的 origin_lat/lon），
+      //    所以"圆心在骑手前方 600m"这件事对下发坐标一个比特的影响都没有。
+      this.anchor = [clat, clon];
       this.last_fetch_t = now_s;
       this.last_error = '';
       this.errors = [];
+      this.last_failure_kind = '';
       this.from_cache = false;
       this.stale = false;
       this.cache_t = null;
@@ -697,6 +1186,7 @@
       // 段时间是错的 —— 这条才是"下次还能连上"的真正保障。
       this._remember_preferred(used);
       this.consecutive_fails = 0;
+      this.busy_streak = 0;
       this.fail_cooldown_used_s = 0;
       this.fail_until_t = -1e9;
       this.last_ok_t = this._now();
@@ -704,15 +1194,119 @@
 
       // 落盘，下次这一带就离线可用。注意缓存里**没有**任何"端点"约束
       // （ep 只是给界面看"当初是谁给的"），所以镜像列表以后怎么改都不影响它。
+      // ⚠️ 存的是**圆心**（可能偏置）：_cache_lookup 就是按"锚点离我多近"判断
+      //    这份数据还盖不盖得住我，所以两者必须用同一个点。
       this.cache.push({
-        lat, lon, t: this._now(), ep: _host_of(used),
+        lat: clat, lon: clon, t: this._now(), ep: _host_of(used),
         ways: ways.map(([r, g]) => [r, g]),
       });
-      if (this.cache.length > rt.MAP_CACHE_MAX * 2) {
-        this.cache = this.cache.slice(-rt.MAP_CACHE_MAX);
-      }
+      // 条数（与 Python 对拍的那条）+ **字节预算**（真正的闸门，见 _trim_cache）
+      this._trim_cache();
       this._save_cache();
       return true;
+    }
+
+    /**
+     * ⭐ 离线瓦片那一条路。返回：
+     *   true   已经用瓦片把 this.ways 换掉了（屏幕上立刻有底图）
+     *   false  这一带**有**瓦片（或正在下），但这会儿还画不出来 —— 别去打扰 Overpass
+     *   null   这一带**确认没有**瓦片覆盖 —— 交给调用方走 Overpass 兜底
+     *
+     * ⚠️ 三种返回值是**语义**上的区别，不是"成功/失败"：
+     *    false 和 null 都会让这一轮不更新底图，但一个说"等等就好"，
+     *    一个说"这里根本没有，去问 Overpass"。混起来的话，界面就没法把
+     *    "正在下载"和"没覆盖"分开说 —— 而那正是用户最烦的"让我猜"。
+     */
+    async _refresh_from_tiles(clat, clon, lat, lon, now_s) {
+      const res = await this.tiles.load_area(clat, clon, this.fetch_radius_m);
+      this.last_tiles = res;
+      this.tiles_have = res.have ? res.have.length : 0;
+      this.tiles_need = res.need ? res.need.length : 0;
+      this.coverage = res.coverage;
+      this.tiles_dirty = false;
+
+      if (res.ways && res.ways.length > 0) {
+        // 有数据就先画上 —— **哪怕还缺几块**。缺的那些在后台下，
+        // 下好会通过 on_change -> tiles_dirty 触发下一轮重建。
+        this.ways = res.ways;
+        // 锚点 = 抓取圆心（和 Overpass 那条路一致）。
+        // ⚠️ 它**不参与投影**：投影原点永远是路线原点（build() 的 origin_lat/lon）。
+        this.anchor = [clat, clon];
+        this.last_fetch_t = now_s;
+        this.last_error = '';
+        this.errors = [];
+        this.last_failure_kind = '';
+        // "完全没有联网"才算 cached：本地 3×3 全齐 = 真的没联网。
+        this.from_cache = (res.coverage === 'have');
+        this.stale = false;
+        this.cache_t = null;
+        this.cache_endpoint = '';
+        this.tiles_used = true;
+        this.consecutive_fails = 0;
+        this.busy_streak = 0;
+        this.fail_cooldown_used_s = 0;
+        this.fail_until_t = -1e9;
+        this.last_ok_t = this._now();
+        // 齐了 -> 'tiles'（正常）；还缺几块在补 -> 'tiles-fetching'（也正常，
+        // 只是界面上要能看出"在补"这件事）；缺但不打算补 -> 'tiles-partial'。
+        this.state = (res.coverage === 'have') ? 'tiles'
+          : (res.downloading > 0 ? 'tiles-fetching' : 'tiles-partial');
+        this._maybe_prefetch(lat, lon, now_s);
+        return true;
+      }
+
+      // 一块瓦片都没有。
+      if (res.coverage === 'none') {
+        // 上游的覆盖索引**明确**说这一带没有瓦片 —— 这才允许落到 Overpass。
+        // （索引没拿到时 coverage 是 'unknown'，那时候也落到 Overpass，
+        //   但界面上的说法不一样：不假装我们知道"这里没有覆盖"。）
+        this.tiles_used = false;
+        return null;
+      }
+      if (res.downloading > 0) {
+        // 正在下：先按住不去打 Overpass。瓦片几十 KB、几秒钟就到，
+        // 这时候去问一个已经满负荷的公共服务是纯浪费。
+        if (!(this.ways && this.ways.length > 0)) this.state = 'tiles-fetching';
+        return false;
+      }
+      // 覆盖未知、又排不出下载（比如每块都在冷却里）—— 退回 Overpass。
+      this.tiles_used = false;
+      return null;
+    }
+
+    /**
+     * 沿航线往前预取瓦片。**"骑到哪都有底图"就是靠它。**
+     *
+     * 节流：位置没怎么动、而且刚算过就不重算 —— route_tiles() 要走一遍航线
+     * （几千个点的话每次几十微秒，但 2Hz × 几小时也是一笔钱）。
+     * 8km 的预取窗口下，每 150m/20 秒重算一次绰绰有余。
+     */
+    _maybe_prefetch(lat, lon, now_s) {
+      if (!this.tiles || !this.route_pts) return 0;
+      const moved = this._prefetch_at
+        ? nm.distance_m(lat, lon, this._prefetch_at[0], this._prefetch_at[1]) : Infinity;
+      if (moved < MAP_TILE_PREFETCH_MIN_MOVE_M &&
+          (now_s - this._prefetch_t) < MAP_TILE_PREFETCH_MIN_PERIOD_S) return 0;
+      this._prefetch_at = [lat, lon];
+      this._prefetch_t = now_s;
+      try {
+        return this.tiles.prefetch_route(this.route_pts, lat, lon);
+      } catch (e) {
+        this.tiles_error = `预取计划出错：${e}`;
+        return 0;
+      }
+    }
+
+    /**
+     * 航线交给底图（app.js 在规划完成 / 换航线时调）。
+     *
+     * ⚠️ 传的是**折线点**（[[lat,lon],...]），不是 Route 对象：
+     *    底图只关心"骑手要经过哪些瓦片"，不需要里程/转向那一套。
+     */
+    set_route(points) {
+      this.route_pts = (points && points.length >= 2) ? points : null;
+      this._prefetch_at = null;
+      this._prefetch_t = -1e9;
     }
 
     /** "42段/330点"（还没 build 过就退回"N条路"）。 */
@@ -726,7 +1320,11 @@
      * 给界面用的一份状态快照。
      *
      * 契约（app.js 的 #map-info / #map-detail 和测试都钉着它）：
-     *   state    idle | trying | ok | cached | stale | unavailable | disabled
+     *   state    idle | trying | ok | cached | stale | unavailable | busy | empty
+     *            | disabled
+     *            ⚠️ `busy`（免费公共服务太忙/被限流）和 `empty`（这一带真的没有路）
+     *            是这一版新加的，和 `unavailable`（说不清的失败）**必须**分开 ——
+     *            三者的短状态、摘要、详情都不一样。
      *   short    很短，塞进状态面板"底图"那一格
      *   summary  一句话（unavailable 时就是固定的那句"不影响导航"）
      *   detail   完整说明：现在在干什么 / 每个镜像为什么失败 / 下一步做什么
@@ -752,6 +1350,7 @@
         reasons: this.errors.map((e) => `${_host_of(e.endpoint)}：${e.reason}`),
         errors: this.errors.map((e) => ({
           endpoint: e.endpoint, host: _host_of(e.endpoint), reason: e.reason,
+          kind: e.kind || '',
         })),
         from_cache: !!this.from_cache,
         stale: !!this.stale,
@@ -763,14 +1362,60 @@
         endpoint_timeout_ms: this.endpoint_timeout_ms,
         budget_ms: this.budget_ms,
         enabled: !!this.enabled,
+        // 抓取半径一族（这一版新增，诊断与自测都要读）：
+        //   fetch_radius_m  一次抓多大一圈
+        //   fetch_move_m    走多远才再问一次（由半径推出来）
+        //   refresh_period_s 最多多久再问一次（由半径推出来）
+        //   kind            这一轮失败的性质（'' | busy | empty | timeout | ...）
+        fetch_radius_m: this.fetch_radius_m,
+        fetch_move_m: this.fetch_move_m(),
+        refresh_period_s: this.refresh_period_s(),
+        kind: this.last_failure_kind,
+
+        // ---- ⭐ 离线瓦片（这一版新增；界面和自测都读它）------------------
+        //   tiles_enabled  这一端有没有瓦片能力（没有 location 就是 false）
+        //   coverage       off | have | partial | none | unknown
+        //   from_tiles     现在屏幕上这份是不是瓦片给的
+        //   tiles_*        下载/缓存计数，详情面板用
+        tiles_enabled: !!this.tiles,
+        tiles_error: this.tiles_error,
+        coverage: this.tiles ? this.coverage : 'off',
+        from_tiles: !!this.tiles_used,
+        tiles_have: this.tiles_have,
+        tiles_need: this.tiles_need,
+        tiles: (this.tiles && this.tiles.stats) ? this.tiles.stats() : null,
       };
       const size = this._size_text();
       const why = out.reasons.length
         ? `各镜像失败原因：${out.reasons.join('；')}。` : '';
+      // ⚠️ 退避上限**按失败性质分档**：被限流那一档更长（见 _note_failure）。
+      //    这里必须写出真实的那一档，否则用户看到"上限 600 秒"而实际等了 30 分钟。
+      const busy_round = (this.last_failure_kind === 'busy');
+      const cap_s = busy_round ? MAP_BUSY_COOLDOWN_MAX_S : MAP_FAIL_COOLDOWN_MAX_S;
       const retry_text = out.retry_in_s > 0
-        ? `已暂停，约 ${out.retry_in_s} 秒后自动重试（退避上限 ` +
-          `${MAP_FAIL_COOLDOWN_MAX_S} 秒）；也可以取消勾选"显示街道路网底图"彻底关掉它。`
+        ? `已暂停，约 ${out.retry_in_s} 秒后自动重试（当前退避上限 ${cap_s} 秒）；` +
+          '也可以取消勾选"显示街道路网底图"彻底关掉它。'
         : '稍后会自动重试；也可以取消勾选"显示街道路网底图"彻底关掉它。';
+      // 被限流时把"为什么退避这么狠"说清楚 —— 不然用户会觉得我们在偷懒。
+      const busy_why = '（被限流时再打只会让对方更忙、把我们的等待时间拉得更长，' +
+        `所以这一档退避比网络错误狠：上限 ${MAP_BUSY_COOLDOWN_MAX_S} 秒。）`;
+      // 瓦片那一层的详情（只有在真的有瓦片能力时才拼）
+      const tstat = out.tiles;
+      const tile_why = tstat
+        ? `离线瓦片：地址 ${tstat.base || '(无)'}，本地内存 ${tstat.mem_tiles} 块，` +
+          `待下载 ${tstat.pending}，本次已下 ${tstat.done} 块（${tstat.bytes} 字节），` +
+          (tstat.index_state === 'ok'
+            ? `覆盖索引 ${tstat.index_tiles} 块`
+            : `覆盖索引不可用（${tstat.index_state}${tstat.last_error ? '：' + tstat.last_error : ''}）`) +
+          '。'
+        : '';
+      const cov_text = {
+        have: '这一带要用的瓦片本地都有（完全离线可用）。',
+        partial: '这一带的瓦片只到齐了一部分。',
+        none: '上游的覆盖索引里**没有**这一带的瓦片（预生成的瓦片只包含主路和次干道）。',
+        unknown: '还不知道上游有没有这一带的瓦片（覆盖索引没拿到）。',
+        off: '这一端没有启用离线瓦片。',
+      }[out.coverage] || '';
 
       switch (this.state) {
         case 'disabled':
@@ -803,7 +1448,49 @@
         case 'ok':
           out.short = size;
           out.summary = `底图正常：${size}。`;
-          out.detail = `底图正常：来自 ${out.endpoint_host}，${size}（本次实时抓取）。`;
+          if (out.from_tiles) {
+            // 不该走到这里（瓦片有自己的状态），但真走到了也要说对话
+            out.detail = `${MAP_TILES_TEXT}${size}。${tile_why}`;
+          } else {
+            out.detail = `底图正常：来自 ${out.endpoint_host}，${size}（本次实时抓取，` +
+              `一次抓 ${Math.trunc(this.fetch_radius_m)} 米，够骑一段）。` +
+              (out.coverage === 'none'
+                ? '⚠️ 这一带没有离线瓦片覆盖，所以走了 Overpass 兜底。' : '');
+          }
+          break;
+
+        // ---- ⭐ 瓦片给出的三个状态 --------------------------------------
+        case 'tiles':
+          // 正常态：瓦片齐了。**别在这里啰嗦** —— 用户要的是"有底图"这件事本身。
+          out.short = `${size}·离线`;
+          out.summary = `底图正常（离线瓦片）：${size}。`;
+          out.detail = `${MAP_TILES_TEXT}${size}，这一带 ${out.tiles_have}/` +
+            `${out.tiles_need} 块已在本地，本次没有联网。${tile_why}`;
+          break;
+
+        case 'tiles-fetching':
+          out.short = `${size}·下载瓦片`;
+          out.summary = MAP_TILES_DOWNLOADING_TEXT;
+          out.detail = `${MAP_TILES_DOWNLOADING_TEXT}当前 ${size}（本地已有 ` +
+            `${out.tiles_have}/${out.tiles_need} 块，待下载 ` +
+            `${tstat ? tstat.pending + tstat.inflight : 0} 块）。${tile_why}`;
+          break;
+
+        case 'tiles-partial':
+          out.short = `${size}·瓦片不全`;
+          out.summary = `底图是离线瓦片，但这一带只到齐了一部分：${size}。`;
+          out.detail = `底图来自离线瓦片，但这一带只到齐了一部分` +
+            `（${out.tiles_have}/${out.tiles_need} 块）：${size}。` +
+            `缺的那几块暂时下不来（网络或者站点的问题），不影响导航；` +
+            `已经画出来的这一份照旧能看。${tile_why}`;
+          break;
+
+        // ---- ⭐ 用户最需要的那一句：没覆盖 + Overpass 也忙 ----------------
+        case 'gap-busy':
+          out.short = out.retry_in_s > 0
+            ? `无瓦片·服务忙 ${out.retry_in_s}s` : '无瓦片·服务忙';
+          out.summary = MAP_GAP_BUSY_TEXT;
+          out.detail = `${MAP_GAP_BUSY_TEXT}${why}${retry_text}${busy_why}${tile_why}`;
           break;
 
         case 'cached':
@@ -819,8 +1506,29 @@
           out.detail = `底图来自本地缓存，但数据已经偏旧（抓取于 ` +
             `${_age_text(this._now() - this.cache_t)}）：${size}。` +
             (out.reasons.length
-              ? `刷新暂时失败，${why}导航不受影响。`
+              ? `刷新暂时失败${busy_round ? '（服务太忙/被限流）' : ''}，${why}` +
+                `导航不受影响，屏幕上这张照旧能看。${busy_round ? busy_why : ''}`
               : '正在后台尝试刷新，导航不受影响。');
+          break;
+
+        case 'busy':
+          // ⭐ 被限流：和"无响应"**分开说**。用户看到"无响应"会以为是我们 app
+          //    的 bug（去重启、去重装）；实际是那个免费公共服务现在满了。
+          out.short = out.retry_in_s > 0
+            ? `服务忙 · ${out.retry_in_s}s后重试` : '服务忙';
+          out.summary = MAP_BUSY_TEXT;
+          out.detail = `${MAP_BUSY_TEXT}${why}${retry_text}${busy_why}` +
+            (out.coverage === 'unknown' || out.coverage === 'partial'
+              ? `（顺带一提：${cov_text}瓦片这一层好了的话，以后这一带就不必再问 Overpass 了。）` : '') +
+            tile_why;
+          break;
+
+        case 'empty':
+          // ⭐ 真的没有路：Overpass 答复正常，就是这一带没有我们认识的道路。
+          //    它和"服务太忙"完全不是一回事，所以绝不能共用一句话。
+          out.short = '这一带没有路';
+          out.summary = MAP_EMPTY_TEXT;
+          out.detail = `${MAP_EMPTY_TEXT}${why}${retry_text}${tile_why}`;
           break;
 
         default: {   // 'unavailable' 以及任何没料到的状态
@@ -828,7 +1536,8 @@
           out.short = out.retry_in_s > 0
             ? `不可用 · ${out.retry_in_s}s后重试` : '底图不可用';
           out.summary = MAP_DOWN_TEXT;
-          out.detail = `${MAP_DOWN_TEXT}${why}${retry_text}`;
+          out.detail = `${MAP_DOWN_TEXT}${why}${retry_text}` +
+            (out.coverage === 'none' ? MAP_NO_TILES_TEXT : '') + tile_why;
           break;
         }
       }
@@ -925,6 +1634,19 @@
       this.cache_endpoint = '';
       if (this.state === 'cached' || this.state === 'stale') this.state = 'idle';
       try { if (this._storage) this._storage.removeItem(MAP_CACHE_KEY); } catch (_e) { /* 忽略 */ }
+      // ⭐ 瓦片也要清 —— "清空底图缓存"在用户眼里就是"把底图数据都清掉"，
+      //    只清 Overpass 那份 JSON、把几十 MB 瓦片留着，是名不副实。
+      //    ⚠️ 但**不动** BASE_KEY（哪个瓦片地址好用）：和 MAP_ENDPOINT_KEY
+      //    同一个理由 —— 那是"路怎么走"，不是"这一带的路网"。
+      if (this.tiles) {
+        try { this.tiles.clear(); } catch (_e) { /* 忽略 */ }
+        this.ways = [];
+        this.anchor = null;
+        this.tiles_used = false;
+        this.coverage = 'off';
+        this.tiles_have = 0;
+        this.tiles_need = 0;
+      }
     }
   }
 
@@ -932,6 +1654,22 @@
     if (!Number.isFinite(v)) return 0;
     v = Math.trunc(v);
     return v < -32767 ? -32767 : (v > 32767 ? 32767 : v);
+  }
+
+  /**
+   * 一份缓存大约占多少 localStorage。
+   *
+   * 用**序列化后的字符数**而不是"条数"来记账：抓取半径 260m→1500m 之后，
+   * 一份从 ~15KB 变成 ~0.57M 字符，条数已经完全说明不了占用了。
+   * （Chrome 的 localStorage 按 UTF-16 计，1 字符 ≈ 2 字节，见 MAP_CACHE_MAX_BYTES。）
+   */
+  function _entry_chars(e) {
+    try {
+      return JSON.stringify(e).length;
+    } catch (_err) {
+      // 循环引用之类：当作很大，让它排在被丢弃的那一头
+      return MAP_CACHE_MAX_BYTES;
+    }
   }
 
   function _defaultStorage() {
@@ -946,8 +1684,17 @@
     // 预算常量：自测和界面文案都要读，所以导出（不是"内部细节"）
     MAP_ENDPOINT_TIMEOUT_MS, MAP_REFRESH_BUDGET_MS, MAP_MIN_ENDPOINT_SLICE_MS,
     MAP_FAIL_COOLDOWN_MAX_S, MAP_QUERY_TIMEOUT_MARGIN_S,
+    // 被限流那一档退避 + 缓存字节预算：自测要钉，界面也要读
+    MAP_BUSY_COOLDOWN_S, MAP_BUSY_COOLDOWN_MAX_S, MAP_CACHE_MAX_BYTES,
     // 固定文案：app.js 在"map.js 都没加载成功"时也要说同一句话
-    MAP_DOWN_TEXT, MAP_DISABLED_TEXT,
+    MAP_DOWN_TEXT, MAP_DISABLED_TEXT, MAP_BUSY_TEXT, MAP_EMPTY_TEXT,
+    // 离线瓦片的文案（app.js 的 map_status 兜底路径也要用同一句）
+    MAP_TILES_TEXT, MAP_TILES_DOWNLOADING_TEXT, MAP_GAP_BUSY_TEXT, MAP_NO_TILES_TEXT,
+    MAP_TILE_PREFETCH_MIN_MOVE_M, MAP_TILE_PREFETCH_MIN_PERIOD_S,
+    // _safe_text 是"HTTP 错误正文读取"的唯一入口，自测直接钉它
+    _safe_text,
+    // 失败分类：纯函数，自测直接喂 HTTP 码 + 正文（不联网）
+    classify_overpass_failure, _plain_text, _entry_chars,
     _host_of, _age_text,
   };
 }));

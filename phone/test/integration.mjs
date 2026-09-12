@@ -1292,13 +1292,41 @@ section('12] 底图（Overpass）永久失败：导航照常，且网络行为�
     ok(MAP.MAP_REFRESH_BUDGET_MS >= 2 * MAP.MAP_ENDPOINT_TIMEOUT_MS,
        `整轮预算 >= 两个完整切片（排头挂了，第二个镜像仍有一整片）`);
 
-    // 4) 查询参数：半径就是 MAP_RADIUS_M，服务端超时严格早于客户端 abort
+    // 4) 查询参数：**抓取**半径是 MAP_FETCH_RADIUS_M，服务端超时严格早于客户端 abort
+    //
+    // ⚠️ 这一条以前断言的是"查询半径 == MAP_RADIUS_M(260)"。那个断言在
+    //    route.js 把两个半径**拆开**之后就不成立了（"抓大、少问"：抓 1500m、
+    //    走 1100m 才再问一次，而下发/显示半径仍然是 view×1.6 ≈ 256m）。
+    //    真正不能破的不变量从来不是"两个数字相等"，而是这两条：
+    //      a) 查询半径 = MAP_FETCH_RADIUS_M（抓取半径只有一个出处）；
+    //      b) **发出去的帧仍然按 view×1.6 裁** —— 抓多大都不影响下发。
+    //    所以下面把 a) 和 b) 分别钉住（b 在 _resize 那几节里也钉着）。
     const qsrc = new MAP.OsmMapSource({ storage: null });
-    eq(qsrc.radius_m, RT.MAP_RADIUS_M, '查询半径就是 MAP_RADIUS_M（260 米，不能动）');
+    eq(qsrc.fetch_radius_m, RT.MAP_FETCH_RADIUS_M,
+       `抓取半径 = MAP_FETCH_RADIUS_M（${RT.MAP_FETCH_RADIUS_M} 米）`);
+    ok(RT.MAP_FETCH_RADIUS_M > RT.MAP_RADIUS_M,
+       `抓取半径(${RT.MAP_FETCH_RADIUS_M}) **大于**下发半径(${RT.MAP_RADIUS_M})` +
+       '—— 这两个数故意不是一个，"抓大、少问"整条策略就建立在这上面');
     const slice_ms = MAP.MAP_ENDPOINT_TIMEOUT_MS;
     const q = qsrc._build_query(30.25, 120.13, slice_ms);
-    ok(q.indexOf('around:260,30.250000,120.130000') >= 0,
-       `查询里就是 around:260（和 app 的 ~260m 底图半径一致）：${q}`);
+    ok(q.indexOf(`around:${RT.MAP_FETCH_RADIUS_M},30.250000,120.130000`) >= 0,
+       `查询里就是 around:${RT.MAP_FETCH_RADIUS_M}（抓取半径，不是下发半径）：${q}`);
+    // b) 下发帧仍然被 view×1.6 裁住：抓取圈再大，帧里的点也不能超出它
+    {
+      const clip_src = new MAP.OsmMapSource({ storage: null });
+      const far = [];
+      for (let i = 0; i < 40; i += 1) {
+        far.push([30.25 + (i - 20) * 0.0004, 120.13 + (i - 20) * 0.0004]);
+      }
+      clip_src.ways = [[6, far]];       // 一条横跨 ±900m 的路
+      const mm = clip_src.build(30.25, 120.13, 30.25, 120.13, RT.ROUTE_FAR_M);
+      const clip = RT.ROUTE_FAR_M * 1.6;
+      let worst = 0;
+      for (const p of mm.pts) worst = Math.max(worst, Math.abs(p[0]), Math.abs(p[1]));
+      ok(worst <= clip + 1.0,
+         `下发半径仍然由 view 决定：抓取半径 ${RT.MAP_FETCH_RADIUS_M}m 的数据，` +
+         `帧里最远的点只有 ${worst.toFixed(0)}m（<= view×1.6 = ${clip}m）`);
+    }
     const m = /\[timeout:(\d+)\]/.exec(q);
     ok(m !== null, `查询里有服务端 [timeout:N]：${q}`);
     const server_s = m ? Number(m[1]) : -1;
@@ -1820,16 +1848,34 @@ section('15] 重锚：底图必须**同一轮**按新原点重建（不联网、
   ok(route.total_m > 40000, `合成路线 ${(route.total_m / 1000).toFixed(1)} km（够走出好几次重锚）`);
   const [la0, lo0] = route.point_at(0);
 
-  // 假 Overpass：只返回**请求点附近**的路（真实行为就是 around:260），
+  // 假 Overpass：只返回**请求点附近**的路（真实行为就是 around:抓取半径），
   // 并数请求次数 —— "重锚那一轮不联网"这条断言全靠它。
+  //
+  // ⚠️ 路网必须铺满**整个抓取圈**，不能只铺在圆心附近一点点。
+  //    抓取半径 260m 那一版：圆心离骑手最多 180m，所以旧的 ±660m 够用。
+  //    拆成"抓取/下发两个半径"之后抓取半径是 1500m，**缓存复用距离 1100m** ——
+  //    骑手完全可能离抓取圆心 1km 远还继续用那份缓存。这时候"只在圆心附近
+  //    有路"的假数据会让 build() 裁出 0 段，于是一整串"底图应该重发"的断言
+  //    全部假失败（真实现场里 OSM 数据本来就铺满整圈）。
+  //    所以这里的铺开范围跟着 MAP_FETCH_RADIUS_M 走，而不是写死一个数。
   let overpass_calls = 0;
   const mk_ways = (lat0, lon0) => {
+    const span_m = RT.MAP_FETCH_RADIUS_M;
+    const dlat = span_m / RT.EARTH_M_PER_DEG_LAT;
+    const dlon = span_m / (RT.EARTH_M_PER_DEG_LON_EQ * Math.cos(lat0 * Math.PI / 180));
+    const n = 24;                       // 24 条**横穿整圈**的横线（南北向铺满 ±1500m）
     const els = [];
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < n; i++) {
+      const lat = lat0 + (i / (n - 1) * 2 - 1) * dlat;
+      // ⚠️ 每条路必须**横穿整个抓取圈**（东西向也要 ±1500m）。
+      //    只铺纬度方向是不够的：合成航线是"往北 400m、往东 300m"的阶梯，
+      //    走 5km 会往东偏 2km 以上 —— 假数据要是在东西向只有几十米宽，
+      //    骑手一往东就出了它的范围，build() 裁出 0 段，
+      //    于是"重锚必须重发底图"这一整串断言会全部假失败。
       const geom = [];
-      for (let k = 0; k < 6; k++) {
-        geom.push({ lat: lat0 + (i - 15) * 0.0004 + k * 0.00005,
-                    lon: lon0 + (k - 3) * 0.00009 });
+      for (let k = 0; k < 11; k++) {
+        geom.push({ lat: lat + (k - 5) * 0.00002,
+                    lon: lon0 + (k / 10 * 2 - 1) * dlon });
       }
       els.push({ tags: { highway: 'residential' }, geometry: geom });
     }

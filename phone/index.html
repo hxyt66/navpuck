@@ -414,11 +414,15 @@
      crashlog.js **必须第一个**：它要抢在 app.js 做任何危险动作之前装好
      onerror / unhandledrejection，并把"上一轮崩在哪"从 localStorage 读出来。
      ble_native.js 必须在 ble.js 之前：ble.js 的 BleLink.make_transport() 会在
-     init() 时去查 root.NavPuckBleNative；它的存在与否决定走原生还是 Web Bluetooth。 -->
+     init() 时去查 root.NavPuckBleNative；它的存在与否决定走原生还是 Web Bluetooth。
+     ⭐ tiles.js 必须在 map.js 之前：map.js 在构造 OsmMapSource 时就要用
+     root.NavPuckTiles 建瓦片层。**它不在也不会崩**（map.js 里 tl 为 undefined
+     时整条离线瓦片路径跳过，退回纯 Overpass）—— 但那就没有离线底图了。 -->
 <script src="crashlog.js"></script>
 <script src="navmath.js"></script>
 <script src="proto.js"></script>
 <script src="route.js"></script>
+<script src="tiles.js"></script>
 <script src="map.js"></script>
 <script src="ble_native.js"></script>
 <script src="ble.js"></script>

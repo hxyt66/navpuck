@@ -90,8 +90,18 @@
  *            （看得见当前值、能设上限、能锁定、能清空学习记录），并写明速度代价。
  *        ⚠️ 第十次同样的坑：不 bump，手机上还是那份"按 MTU-3 分片"的
  *        ble_native.js —— 而它一连接就闪退，用户连日志都看不到。
+ *    v13：⭐ 底图改成**离线优先**（新增 phone/tiles.js；map.js / app.js /
+ *        index.html 都动了）。三件事：
+ *        1) 新增 tiles.js（必须在 map.js 之前加载）并加进预缓存清单；
+ *        2) fetch 处理器**跳过 /tiles/ 下的请求** —— 见下面那段说明；
+ *        3) 只有**导航请求**（mode === 'navigate'）才回退到 index.html。
+ *          以前是"任何请求失败都回 index.html"，瓦片请求一旦失败就会拿到
+ *          一整页 HTML 当作 .npt 去解码 —— 那会变成"本地缓存里存了一堆垃圾"，
+ *          比不缓存糟得多。
+ *        ⚠️ 第十一次同样的坑：不 bump，手机上还是那份"没有任何瓦片逻辑"的
+ *        index.html + map.js —— 而这一版修的正是"底图时有时无"。
  */
-const CACHE = 'navpuck-phone-v12';
+const CACHE = 'navpuck-phone-v13';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [
@@ -103,6 +113,7 @@ const ASSETS = [
   'navmath.js',
   'proto.js',
   'route.js',
+  'tiles.js',
   'map.js',
   // ⚠️ ble_native.js 以前**不在**这个清单里：offline 打开 PWA 时它取不到，
   //    只是"没有原生 BLE 传输"这一条退路而已（PWA 本来就走 Web Bluetooth），
@@ -160,6 +171,18 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
 
+  // ⭐ 离线瓦片（/tiles/...）**刻意不走这里**。
+  //
+  // 为什么：瓦片的持久缓存由 phone/tiles.js 用 IndexedDB 管（二进制、几十 MB、
+  // 要能数块数、要能按需淘汰）。让 SW 再存一份是双份磁盘，而且两边的淘汰
+  // 策略互不知情 —— 只会让"到底有没有这块"变得说不清。
+  //
+  // ⚠️ 更要紧的是**不能**让它们掉进下面那个 index.html 回退：一块瓦片下载
+  //    失败却拿到一整页 HTML，会被当成二进制塞进缓存 —— 之后每次解码都失败，
+  //    而且症状是"这一带的路网莫名其妙没了"。这类"缓存里存了垃圾"的故障
+  //    极难查，所以宁可不碰。
+  if (url.pathname.indexOf('/tiles/') >= 0) return;
+
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
 
@@ -173,8 +196,13 @@ self.addEventListener('fetch', (event) => {
       }
       return res;
     } catch (err) {
-      const fallback = await cache.match('index.html');
-      if (fallback) return fallback;
+      // ⚠️ 只有**导航请求**（地址栏跳转 / 打开 PWA）才回退到 index.html。
+      //    以前是任何请求都回退 —— 于是一个失败的 map.js 请求会拿到一整页
+      //    HTML，浏览器把它当 JS 解析，报的错和真正的原因（网络）毫无关系。
+      if (req.mode === 'navigate') {
+        const fallback = await cache.match('index.html');
+        if (fallback) return fallback;
+      }
       throw err;
     }
   })());
