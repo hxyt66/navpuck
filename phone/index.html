@@ -40,6 +40,11 @@
     ⚠️ 正在使用<b>手动位置</b>（模拟坐标，不是真实 GPS）
   </p>
 
+  <!-- 模拟行驶横幅：同上，而且这个模式车是真的在动 —— 更容易被误当成真实定位 -->
+  <p id="sim-badge" class="sim-banner" data-state="running" hidden>
+    ⚠️ 正在<b>模拟行驶</b>（沿航线自动推进，不是真实定位）
+  </p>
+
   <!-- 状态面板：实时读数 -->
   <section class="panel" aria-label="实时状态">
     <div class="grid">
@@ -175,6 +180,42 @@
       （车不动、地图不滚），只有航向会影响地图旋转 —— 设备没有磁力计，"车头朝上"
       必须由手机提供，所以想验证地图转得对不对，就改这里的航向（0=正北，顺时针）。
       模拟期间顶部会一直显示"手动位置"横幅，避免把测试误当成真实定位。
+    </p>
+  </details>
+
+  <!-- 高级：模拟行驶。位置沿着**规划出来的航线**按配置速度自己走 —— 室内没有
+       GPS 也能看到速度、剩余距离、进度、地图滚动，以及"航向随转弯变化"
+       （设备没有磁力计，"车头朝上"完全靠手机给的航向，过弯最能验证这一条） -->
+  <details class="panel opts">
+    <summary>高级 / 模拟行驶（沿航线自动推进）</summary>
+    <div class="opt">
+      <input id="opt-simdrive" type="checkbox">
+      <label for="opt-simdrive">模拟行驶（沿航线自动走，不用 GPS）</label>
+    </div>
+    <div class="fld">
+      <label for="sim-speed">速度</label>
+      <input id="sim-speed" type="number" step="any" min="0.1" inputmode="decimal" value="42"
+             placeholder="km/h，默认 42" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="sim-start">起点偏移</label>
+      <input id="sim-start" type="number" step="any" min="0" max="1" inputmode="decimal" value="0"
+             placeholder="从航线的百分之几开始（0~1）" autocomplete="off">
+    </div>
+    <div class="btn-row">
+      <button id="sim-apply" type="button" class="ghost">启用 / 从起点重新开始</button>
+    </div>
+    <!-- 实时读数：走到哪了、速度多少、航向多少。这就是"路真的在动"的证据 -->
+    <p id="sim-info" class="hint" hidden></p>
+    <p class="hint">
+      勾选后，位置不再来自 GPS，而是<b>沿着规划出来的航线</b>按上面的速度前进：
+      速度栏、剩余距离、进度、地图滚动和航向都会真的动起来。航向取的是
+      <b>航线在这一点的切线方向</b>，所以过弯时地图会跟着转 —— 设备没有磁力计，
+      那正是这个模式最该验证的一件事。<br>
+      起点偏移是"从航线的百分之几开始"（对应 PC 版的 <code>--start</code>）。没有
+      起点时会自动用内置演示航线的起点，室内不必手输任何坐标。走到终点会
+      <b>停住</b>（不绕回起点）并显示"已到终点"。模拟期间顶部一直挂着"模拟行驶"
+      横幅，绝不会被当成真实定位；这个开关也<b>不会</b>被记住，重新打开页面即回到真实定位。
     </p>
   </details>
 

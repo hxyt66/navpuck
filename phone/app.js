@@ -303,6 +303,177 @@
     }
   }
 
+  // 模拟行驶的最低速度（km/h）。速度填 0 时车永远不动，界面上看着就是
+  // "模拟行驶坏了" —— 与其让人去查，不如夹到一个极小但非零的值。
+  const MIN_SIM_SPEED_KMH = 0.1;
+
+  // -------------------------------------------------------------------------
+  // 位置源：模拟行驶（沿航线自动推进）
+  // -------------------------------------------------------------------------
+  /**
+   * 沿**规划出来的航线**按配置速度前进的模拟位置源（"模拟行驶 / 模拟骑行"）。
+   *
+   * 和上面那个静态 SimSource 的区别只有一件事：**位置会动**。于是速度栏、
+   * 剩余距离、进度、地图滚动，以及最要紧的"航向随转弯变化"全都能在室内验证
+   * —— 这正是这个模式存在的理由（设备没有磁力计，地图是车头朝上的，"航向
+   * 对不对"只能靠手机推给它的那个角来验证，静态坐标永远验证不了）。
+   *
+   * 行为逐条对齐 tools/navigator.py 的 SimSource（PC 版是参考实现）：
+   *   - speed_mps = speed_kmh / 3.6（PC 版 --speed 默认 42 km/h）
+   *   - s 初值 = route.total_m * start_frac（PC 版 --start，0~1，默认 0）
+   *   - advance(dt) 里 s += speed_mps * dt，dt 是**真实流逝时间**（10Hz 循环
+   *     传进来的那一份），不是固定步长 —— 掉帧或后台限流时速度才不会失真
+   *   - fix() 给的是 (lat, lon, tangent_deg(s), speed_mps)：航向取**航线在
+   *     这一点的切线**，所以过弯时它会跟着变（PC 版就是 route.tangent_deg）
+   *
+   * 与接口的约定和 GeoSource / SimSource 完全一样（Navigator 只认这些字段）：
+   *   lat / lon / accuracy_m / speed_mps / heading / heading_source
+   *   fix_count / error / has_fix() / fix(fallback_heading) / onState(kind, msg)
+   *   start() / stop()
+   *
+   * 三处**故意**和 PC 版不一样，都写在下面：
+   *   1. 走到终点**停住**，不像 Python 那样 `s -= total_m` 绕回起点重跑。
+   *      室内测试要看的是"这条航线走完是什么样"；绕回起点会让人以为导航
+   *      自己重置了（进度条从 100% 跳回 0% 最容易被当成 bug）。
+   *   2. heading_source 恒为 'sim'（既不是 'gps' 也不是 'manual'），日志和
+   *      界面上都能一眼看出这个航向是算出来的。
+   *   3. accuracy_m = null（模拟位置没有"精度"可言，界面显示 — 而不是编个数）。
+   */
+  class RouteSimSource {
+    constructor(opts) {
+      const o = opts || {};
+      this.onLog = o.onLog || (() => {});
+      this.onState = o.onState || (() => {});
+
+      // 航线：**必须**有几何才能沿路走，所以由 App 在规划完成时 set_route()
+      this.route = null;
+      this.s = 0.0;                 // 当前弧长（米）
+      this.arrived = false;         // 到终点后恒为 true，s 钉在 total_m 上
+      this.speed_kmh = 42.0;
+      this.speed_mps = 42.0 / 3.6;
+      this.start_frac = 0.0;
+
+      this.lat = null;
+      this.lon = null;
+      this.accuracy_m = null;
+      this.heading = 0.0;
+      this.heading_source = 'sim';
+      this.last_fix_t = 0;
+      this.fix_count = 0;
+      this.error = '';
+      this.active = false;          // 只有 active 时 has_fix() 才为真
+
+      // Navigator 靠这个标记认"弧长源"：先 advance(dt) 再取 fix，而且直接用
+      // 它给的 s 当里程（见 Navigator.cycle）。用标记而不是 instanceof，是为了
+      // 让 app.js 里的类顺序/打包方式变了也不会把这条分支悄悄断掉。
+      this.is_route_sim = true;
+    }
+
+    /** 永远可用：它不依赖任何浏览器权限，也不需要 GPS。 */
+    static supported() { return true; }
+
+    has_route() { return this.route !== null; }
+
+    total_m() { return this.route ? this.route.total_m : 0.0; }
+
+    /** 换一条航线（每次"规划并开始导航"都会调一次），并从头开始。 */
+    set_route(route) {
+      this.route = (route && Number.isFinite(route.total_m) && route.total_m >= 1.0)
+        ? route : null;
+      if (this.route === null) {
+        this.s = 0.0;
+        this.lat = null;
+        this.lon = null;
+        this.error = '模拟行驶：还没有可用的航线';
+        this.onLog(`[sim] ${this.error}`);
+        return false;
+      }
+      this.error = '';
+      this.restart(this.start_frac);
+      return true;
+    }
+
+    /** 把弧长拨回 total_m * frac（0~1），清掉"已到终点"。 */
+    restart(frac) {
+      if (Number.isFinite(frac)) this.start_frac = Math.max(0.0, Math.min(1.0, frac));
+      // ⚠️ 夹住上界：start_frac 允许正好 1.0（就停在终点），但不能越过它
+      this.s = this.has_route() ? this.total_m() * this.start_frac : 0.0;
+      this.arrived = this.has_route() && this.s >= this.total_m();
+      this.fix_count = 0;
+      this.last_fix_t = 0;
+      this._sync();
+      return this.s;
+    }
+
+    set_speed_kmh(v) {
+      const k = Number.isFinite(v) ? Math.max(MIN_SIM_SPEED_KMH, v) : 42.0;
+      this.speed_kmh = k;
+      this.speed_mps = k / 3.6;
+      return this.speed_mps;
+    }
+
+    /**
+     * 前进 dt 秒（dt 是**真实流逝时间**）。
+     *
+     * 到终点就停：s 夹在 total_m 上、arrived 置位，之后再怎么调都不动。
+     * 刻意不做 Python 的取模绕回（见类注释）。
+     */
+    advance(dt_s) {
+      if (!this.has_route() || !(dt_s > 0.0)) return this.s;
+      if (this.arrived) return this.s;
+      if (!(this.speed_mps > 0.0)) return this.s;      // 速度为 0 = 原地不动
+      this.s += this.speed_mps * dt_s;
+      if (!Number.isFinite(this.s) || this.s >= this.total_m()) {
+        this.s = this.total_m();                       // 夹住，绝不让 NaN/越界漏出去
+        this.arrived = true;
+        this._sync();
+        this.onState('simdrive', '模拟行驶已到终点');
+        return this.s;
+      }
+      this._sync();
+      return this.s;
+    }
+
+    /** 按当前弧长刷新 lat/lon/heading（restart / advance 之后各调一次）。 */
+    _sync() {
+      if (!this.has_route()) {
+        this.lat = null;
+        this.lon = null;
+        this.heading = 0.0;
+        return;
+      }
+      const [lat, lon] = this.route.point_at(this.s);
+      this.lat = lat;
+      this.lon = lon;
+      // 航向 = 航线在 s 处的切线（罗盘方位）。这就是"过弯时地图跟着转"的来源。
+      this.heading = this.route.tangent_deg(this.s);
+    }
+
+    /** 与 GeoSource / SimSource 同形状：设置即生效，没有异步等待。 */
+    start() { this.active = true; }
+    stop() { this.active = false; }
+
+    has_fix() {
+      return this.active && this.route !== null && this.lat !== null && this.lon !== null;
+    }
+
+    /**
+     * 与 GeoSource.fix() **完全同形状**：[lat, lon, heading_deg, speed_mps]。
+     *
+     * 到终点后速度报 0（车停了），位置停在终点不动 —— 速度栏、ETA 和设备的
+     * 表现因此是一致的，不会出现"停在终点但速度还写着 42"这种自相矛盾。
+     * 这里**故意不套用** heading_unusable()（"手机放口袋就别用 GPS 航向"那条
+     * 规则）：这个航向是航线切线算出来的，与手机怎么放没有半点关系，丢掉它
+     * 就等于把本模式最该验证的东西丢掉了。
+     */
+    fix(_fallback_heading) {
+      if (!this.has_fix()) return null;
+      this.heading_source = 'sim';
+      this.last_fix_t = Date.now();
+      return [this.lat, this.lon, this.heading, this.arrived ? 0.0 : this.speed_mps];
+    }
+  }
+
   // -------------------------------------------------------------------------
   // 主控 —— Navigator 的移植
   // -------------------------------------------------------------------------
@@ -483,6 +654,16 @@
      */
     cycle(dt_s) {
       this._call_count += 1;
+
+      // 沿航线推进的模拟源：**先按真实流逝时间推进弧长**，再取这一帧的位置。
+      // 和 navigator.py 的 `if isinstance(self.source, SimSource): advance(dt)`
+      // 是同一个位置、同一件事：速度因此与帧率无关（掉帧/后台限流都不会让
+      // 模拟车"偷偷慢下来"）。
+      if (!!this.source && this.source.is_route_sim === true &&
+          typeof this.source.advance === 'function') {
+        this.source.advance(dt_s);
+      }
+
       const fix = this.source.fix(this.route.tangent_deg(this.s_hint));
       if (fix === null) return null;
       const [lat, lon, heading, speed_mps] = fix;
@@ -492,13 +673,24 @@
       // 前 5 帧做全表搜索：idx_hint 初始为 0，如果路线起点离车很远（用户从
       // 中途开始导航），带 hint 的窗口搜索会锁在起点附近一动不动。跑几帧
       // 之后 hint 就准了，再切回窗口搜索省 CPU。
-      if (this._call_count <= 5) {
+      let s;
+      if (!!this.source && this.source.is_route_sim === true && Number.isFinite(this.source.s)) {
+        // 弧长模拟源：s **直接用它自己的里程**（PC 版也是这样）。走最近点匹配
+        // 的话 s 会被量化到折线点距（OSRM 加密后 25m），进度条和剩余距离会
+        // 一跳一跳 —— 而位置本身已经由 fix() 精确给出了，没必要再舍一次。
+        // idx_hint 仍然维护着（诊断/后续换源时用得上），头几帧照旧全表搜索。
+        this.idx_hint = (this._call_count <= 5)
+          ? this.route.nearest_index_full(lat, lon)
+          : this.route.nearest_index(lat, lon, this.idx_hint);
+        s = Math.max(0.0, Math.min(this.source.s, this.route.total_m));
+      } else if (this._call_count <= 5) {
         this.idx_hint = this.route.nearest_index_full(lat, lon);
         this._hinted = true;
+        s = this.route.s_at_index(this.idx_hint);
       } else {
         this.idx_hint = this.route.nearest_index(lat, lon, this.idx_hint);
+        s = this.route.s_at_index(this.idx_hint);
       }
-      const s = this.route.s_at_index(this.idx_hint);
       this.s_hint = s;
 
       // ---- 前视点：箭头瞄它 ----
@@ -741,6 +933,9 @@
       this.geo = null;
       this.sim = null;          // 手动/模拟位置源（室内测试用）
       this.manual = false;      // 当前是否在用手动位置
+      this.routesim = null;     // 模拟行驶位置源（沿航线自动推进）
+      this.simdrive = false;    // 当前是否在模拟行驶
+      this._sim_arrived = false; // "已到终点"只提示一次（每帧都弹会永远关不掉）
       this.nav = null;
       this.route = null;
       this.start_lat = null;
@@ -814,14 +1009,14 @@
      * 现在把**状态 + 最后一次错误 + 收到过几次 fix + 精度**全部摆到面板上，
      * 并且在 denied / unavailable / waiting 时明确给出下一步做什么。
      *
-     * @param {string} kind 'ok' | 'waiting' | 'denied' | 'unavailable' | 'manual'
+     * @param {string} kind 'ok' | 'waiting' | 'denied' | 'unavailable' | 'manual' | 'simdrive'
      * @param {string} msg  错误/说明文本（可空）
      * @param {object} src  产生这次状态的位置源（默认 GPS 源）
      */
     set_gps_state(kind, msg, src) {
       const names = {
         ok: '已定位', waiting: '等待定位', denied: '权限被拒',
-        unavailable: '不可用', manual: '手动定位',
+        unavailable: '不可用', manual: '手动定位', simdrive: '模拟行驶',
       };
       const el = $('gps-state');
       if (el) {
@@ -835,7 +1030,20 @@
       // 最后一次错误 / 当前位置来源
       const err = $('gps-error');
       if (err) {
-        if (kind === 'manual') {
+        if (kind === 'simdrive') {
+          // 模拟行驶：把"走到哪了 + 当前航向"摆出来。它本身就是最有力的
+          // "这是模拟"的证据 —— 真实 GPS 不可能告诉你航线里程。
+          // ⚠️ 认的是 src 自己（is_route_sim），不是靠 kind 猜：万一传进来的是
+          //    GPS 源（比如模拟源还没建起来），下面这些 s / total_m 就不存在，
+          //    直接取会在**报错的那条路上**再抛一个 TypeError。
+          const rs = (s && s.is_route_sim === true) ? s : null;
+          const total = (rs && rs.has_route()) ? rs.route.total_m : 0.0;
+          err.textContent = (rs && rs.has_fix())
+            ? `模拟行驶：沿航线 ${(rs.s / 1000).toFixed(2)} / ${(total / 1000).toFixed(2)} km` +
+              `，航向 ${fmt(rs.heading, 0)}°（不是真实 GPS）` +
+              (rs.arrived ? '，已到终点' : '')
+            : '模拟行驶：还没有可用的航线（先"规划并开始导航"）—— 不是真实 GPS';
+        } else if (kind === 'manual') {
           err.textContent = has_src_fix
             ? `模拟位置 ${s.lat.toFixed(6)}, ${s.lon.toFixed(6)}（不是真实 GPS）`
             : '手动位置未设置';
@@ -873,7 +1081,10 @@
           text = '还在等定位：室内收不到 GPS，请到窗边或室外；' +
                  '也可以展开"高级 / 手动定位"先用手输坐标测试。';
         }
-        if (this.manual) {
+        if (kind === 'simdrive') {
+          text = '正在模拟行驶（沿航线自动推进，不是真实定位）：GPS 已经不影响导航。' +
+                 '取消勾选可切回真实定位。';
+        } else if (this.manual && !this.simdrive) {
           text = '正在使用手动位置（模拟坐标），GPS 已经不影响导航。' +
                  '取消勾选可切回真实定位。';
         }
@@ -915,6 +1126,43 @@
         md.textContent = ms.detail || '';
         md.hidden = !ms.detail;
         md.classList.toggle('warn', ms.state === 'unavailable' || ms.state === 'stale');
+      }
+      // 模拟行驶的实时读数：走到哪了、速度多少、航向多少（过弯时会变）。
+      // 每帧都刷，因为它就是"这条路真的在动"的证据。
+      this.update_sim_readout();
+    }
+
+    /**
+     * 画"模拟行驶"那一行实时读数，并在**刚到终点**时提示一次。
+     *
+     * 光有横幅不够：室内测试时用户要一眼看出"走到哪了、航向是不是跟着路转"，
+     * 这三个数（里程 / 速度 / 航向）就是最直接的证据，也不必去翻默认收起的日志。
+     */
+    update_sim_readout() {
+      const el = $('sim-info');
+      const s = this.routesim;
+      if (!el) return;
+      if (!this.simdrive || !s || !s.has_route()) {
+        el.hidden = true;
+        el.textContent = '';
+        return;
+      }
+      const total = s.total_m();
+      const pct = total > 0 ? Math.max(0, Math.min(100, s.s * 100.0 / total)) : 0;
+      el.hidden = false;
+      el.textContent =
+        `模拟行驶：沿航线 ${(s.s / 1000).toFixed(2)} / ${(total / 1000).toFixed(2)} km` +
+        `（${pct.toFixed(0)}%）· ${fmt(s.speed_kmh, 0)} km/h · 航向 ${fmt(s.heading, 0)}°` +
+        (s.arrived ? ' · 已到终点（已停住，不绕回起点）' : '');
+
+      const badge = $('sim-badge');
+      if (badge) badge.dataset.state = s.arrived ? 'arrived' : 'running';
+
+      // "已到终点"只提示一次。每帧都弹的话那个 toast 会永远关不掉。
+      if (s.arrived && !this._sim_arrived) {
+        this._sim_arrived = true;
+        this.log('[sim] 模拟行驶已到终点：位置停在终点、速度归零（刻意不绕回起点）');
+        this.toast('模拟行驶已到终点', 6000);
       }
     }
 
@@ -1028,16 +1276,182 @@
       return want;
     }
 
-    // -- 位置来源：GPS 或手动 ------------------------------------------------
+    // -- 位置来源：GPS / 手动 / 模拟行驶 --------------------------------------
     /**
-     * 当前生效的位置源：手动位置优先，否则 GPS（浏览器不支持定位时可能是 null）。
+     * 模拟行驶此刻是不是**真的在链路里**。
+     *
+     * 它比"勾了复选框"多一个条件：必须已经有航线。勾选之后、规划之前它拿不到
+     * 几何，active_source() 会退回手动/GPS —— 界面（横幅、状态面板）必须和这个
+     * 事实一致，不能勾上就宣称"正在模拟行驶"。判断只此一份，别处一律调它。
+     */
+    sim_drive_effective() {
+      return !!(this.simdrive && this.routesim && this.routesim.has_route());
+    }
+
+    /**
+     * 当前生效的位置源。
+     *
+     * 优先级：模拟行驶 > 手动位置 > GPS（浏览器不支持定位时可能是 null）。
+     * 模拟行驶排最前面，是因为它自己带着航线、是"整条链路在动"的那个模式；
+     * 它没拿到航线之前（还没规划）自动退回下一个源，所以勾选本身不会让
+     * 导航没数据。
      *
      * Navigator 只依赖 source 的接口，所以"换源"就是换这个返回值 ——
      * 整条流水线（路线匹配、相对方位、10Hz 更新、地图旋转）一行都不用改。
      */
     active_source() {
+      if (this.sim_drive_effective()) return this.routesim;
       if (this.manual && this.sim) return this.sim;
       return this.geo;
+    }
+
+    /**
+     * 读"模拟行驶"的两个输入框。
+     *
+     * 速度默认 42 km/h —— 和 PC 版 `--speed` 的默认值一致；起点偏移默认 0
+     * （= 航线起点），对应 PC 版 `--start`（0~1 的百分比）。
+     *
+     * @returns {{speed_kmh:number, start_frac:number}}
+     */
+    read_sim_drive() {
+      const num = (id, dflt) => {
+        const el = $(id);
+        const v = el ? parseFloat(el.value) : NaN;
+        return Number.isFinite(v) ? v : dflt;
+      };
+      let speed = num('sim-speed', 42.0);
+      if (!(speed >= MIN_SIM_SPEED_KMH)) speed = MIN_SIM_SPEED_KMH;   // 0 会永远不动
+      let frac = num('sim-start', 0.0);
+      frac = Math.max(0.0, Math.min(1.0, frac));
+      return { speed_kmh: speed, start_frac: frac };
+    }
+
+    /**
+     * 把"模拟行驶"的参数应用下去（勾选/按"重新开始"时走这条路）。
+     *
+     * 顺序很重要：先设速度、再换航线（set_route 会按 start_frac 从头开始），
+     * 最后才切 active_source()。已经在导航的话直接把新航线接上即可，不必重启
+     * 10Hz 循环 —— Navigator 只认接口。
+     *
+     * @param {boolean} quiet 静默（输入框改一下就重算时用，不弹 toast）
+     */
+    apply_sim_drive(quiet) {
+      if (!this.routesim) return false;
+      const v = this.read_sim_drive();
+      this.routesim.set_speed_kmh(v.speed_kmh);
+
+      // 已经在导航（且没有新航线）时，把正在跑的那条航线接过来：
+      // "先开始导航、再勾模拟行驶"也能立刻动起来。
+      if (!this.routesim.has_route() && this.nav && this.nav.route) {
+        this.routesim.start_frac = v.start_frac;
+        this.routesim.set_route(this.nav.route);
+        this.log('[sim] 模拟行驶接上当前导航的航线（不必重新规划）');
+      } else if (this.routesim.has_route()) {
+        this.routesim.restart(v.start_frac);
+      } else {
+        // 还没规划过路线：参数先记住，等 do_route() 拿到航线再沿路走
+        this.routesim.start_frac = v.start_frac;
+      }
+
+      this._sim_arrived = false;
+      this.set_sim_drive_active(true);
+
+      // 起点：室内没有 GPS，也不该逼用户先手输一串坐标才肯开始 ——
+      // 没起点时用内置演示航线的起点（界面上写明"模拟起点"）。
+      if (this.start_lat === null || this.start_lon === null) {
+        this.use_demo_start('模拟行驶');
+      }
+
+      this.log(`[sim] 模拟行驶已启用：${v.speed_kmh.toFixed(1)} km/h，` +
+               `起点偏移 ${(v.start_frac * 100).toFixed(0)}%` +
+               (this.routesim.has_route()
+                 ? `（航线 ${(this.routesim.total_m() / 1000).toFixed(2)} km）`
+                 : '（还没有航线，规划后自动沿路推进）'));
+      if (!quiet) this.toast(`模拟行驶：${v.speed_kmh.toFixed(0)} km/h（模拟，不是真实定位）`, 5000);
+      return true;
+    }
+
+    /** 只改速度，**不动**已经走到的位置（跑到一半调速度不该把车拨回起点）。 */
+    apply_sim_speed(quiet) {
+      if (!this.routesim) return false;
+      const v = this.read_sim_drive();
+      this.routesim.set_speed_kmh(v.speed_kmh);
+      this.log(`[sim] 模拟行驶速度改为 ${v.speed_kmh.toFixed(1)} km/h`);
+      if (!quiet) this.toast(`模拟行驶速度：${v.speed_kmh.toFixed(0)} km/h`, 3000);
+      return true;
+    }
+
+    /** 从起点偏移处重新开始（"从起点重新开始模拟"按钮 / 改起点偏移）。 */
+    restart_sim_route(quiet) {
+      if (!this.routesim) return false;
+      const v = this.read_sim_drive();
+      this.routesim.set_speed_kmh(v.speed_kmh);
+      this._sim_arrived = false;
+      if (this.routesim.has_route()) {
+        this.routesim.restart(v.start_frac);
+        this.log(`[sim] 模拟行驶从 ${(this.routesim.s / 1000).toFixed(2)} km 处重新开始` +
+                 `（航线全长 ${(this.routesim.total_m() / 1000).toFixed(2)} km）`);
+        if (!quiet) this.toast(`模拟行驶：从航线 ${(v.start_frac * 100).toFixed(0)}% 处开始`, 4000);
+      } else {
+        this.routesim.start_frac = v.start_frac;
+        if (!quiet) this.toast('还没有航线：先"规划并开始导航"', 4000);
+      }
+      this.update_sim_readout();
+      return true;
+    }
+
+    /**
+     * 用**内置演示航线的起点**当起点。
+     *
+     * 模拟行驶是给"室内、没有 GPS"准备的；如果还要求用户手输一串坐标才能开始，
+     * 这个模式就白加了。演示航线（西湖北山街）是代码里本来就有的常量，拿它当
+     * 默认起点不会误导任何人 —— 界面上会写清"模拟起点"，横幅也一直挂着。
+     */
+    use_demo_start(why) {
+      const p = rt.DEMO_ROUTE[0];
+      this.start_lat = p[0];
+      this.start_lon = p[1];
+      const el = $('start-info');
+      if (el) el.textContent = `${p[0].toFixed(6)}, ${p[1].toFixed(6)}（模拟起点）`;
+      this.log(`[sim] 起点取内置演示航线起点 ${p[0].toFixed(6)}, ${p[1].toFixed(6)}` +
+               `（${why || '模拟行驶'}，不是真实定位）`);
+      return true;
+    }
+
+    /** 开关模拟行驶：同步复选框、横幅、位置源和状态面板。 */
+    set_sim_drive_active(on) {
+      this.simdrive = !!on;
+      if (this.routesim) this.routesim.active = this.simdrive;
+
+      const badge = $('sim-badge');
+      if (badge) {
+        badge.hidden = !this.simdrive;
+        badge.dataset.state = (this.routesim && this.routesim.arrived) ? 'arrived' : 'running';
+      }
+      const cb = $('opt-simdrive');
+      if (cb) cb.checked = this.simdrive;
+
+      // 正在导航时换源：Navigator 只认接口，直接替换即可（不必重建循环）
+      const src = this.active_source();
+      if (this.nav) this.nav.source = src;
+
+      // 横幅/状态面板跟着**真正生效**的那个源走：两个模拟模式同时开着时，
+      // 模拟行驶优先；它还没拿到航线时手动位置才是在链路里的那个。
+      const eff = this.sim_drive_effective();
+      const mb = $('manual-badge');
+      if (mb) mb.hidden = !(this.manual && !eff);
+
+      if (this.simdrive) {
+        this.set_gps_state('simdrive', '', this.routesim);
+      } else if (this.manual) {
+        // 关掉模拟行驶但手动位置还开着：状态面板要回到"手动定位"，
+        // 不能停在一个已经不生效的状态上
+        this.set_gps_state('manual', '', this.sim);
+      } else if (this.geo) {
+        // 切回 GPS：把当前真实状态立刻重画一遍（多半还是"等待定位"）
+        this.set_gps_state(this.geo.has_fix() ? 'ok' : 'waiting', '', this.geo);
+      }
+      this.update_sim_readout();
     }
 
     /** 读手动位置的四个输入框 @returns {[number,number,number,number]|null} */
@@ -1099,7 +1513,8 @@
       if (this.sim) this.sim.active = this.manual;
 
       const badge = $('manual-badge');
-      if (badge) badge.hidden = !this.manual;
+      // 模拟行驶真的在链路里时，"手动位置"横幅不该亮 —— 那是假的
+      if (badge) badge.hidden = !(this.manual && !this.sim_drive_effective());
       const cb = $('opt-manual');
       if (cb) cb.checked = this.manual;
 
@@ -1107,7 +1522,10 @@
       const src = this.active_source();
       if (this.nav) this.nav.source = src;
 
-      if (this.manual) {
+      if (this.sim_drive_effective()) {
+        // 模拟行驶优先（见 active_source()）：状态面板要跟着生效的那个走
+        this.set_gps_state('simdrive', '', this.routesim);
+      } else if (this.manual) {
         this.set_gps_state('manual', '', this.sim);
       } else if (this.geo) {
         // 切回 GPS：把当前真实状态立刻重画一遍（多半还是"等待定位"）
@@ -1160,13 +1578,14 @@
       const use_map = !!this.map_enabled;
       const map_src = use_map ? this.map_source_instance() : null;
       const rate_hz = parseFloat(($('opt-rate') || {}).value) || 10.0;
-      // 全程用**当前生效的**位置源：手动位置时就是 SimSource，和 GPS 走同一段代码
-      const src = this.active_source();
+      // 全程用**当前生效的**位置源：手动位置时就是 SimSource，和 GPS 走同一段代码。
+      // ⚠️ 模拟行驶这一刻还拿不到（它必须先有航线），所以下面规划完会再取一次。
+      let src = this.active_source();
 
       this.toast('正在规划路线…', 10000);
       this.log(`[osrm] 起点 ${this.start_lat.toFixed(6)},${this.start_lon.toFixed(6)} ` +
                `-> 终点 ${dest[0].toFixed(6)},${dest[1].toFixed(6)}（${profile}）` +
-               `${this.manual ? ' [手动位置]' : ''}`);
+               `${this.simdrive ? ' [模拟行驶]' : (this.manual ? ' [手动位置]' : '')}`);
 
       let route;
       let raw = null;
@@ -1179,9 +1598,21 @@
                  `${(raw.duration_s / 60).toFixed(1)} min, ${raw.point_count} 个折线点`);
       } catch (e) {
         // OSRM 不可用时退回直线航点，至少让链路和箭头有东西可跑
-        this.log(`[osrm] 不可用（${e}），退回直线航点`);
-        this.toast('路线服务不可用，已退回直线连接', 5000);
-        route = rt.straight_route([[this.start_lat, this.start_lon, '起点'], [dest[0], dest[1], '终点']]);
+        this.log(`[osrm] 不可用（${e}）`);
+        if (this.simdrive) {
+          // ⚠️ 模拟行驶**不能**退回直线：一条直线没有转弯，而这个模式最该验证
+          //    的恰恰是"航向随转弯变化"（设备没有磁力计，地图车头朝上全靠手机
+          //    给的航向）。室内往往也没网，正好会走到这条分支上。所以改用**内置
+          //    演示航线**（西湖北山街环线，10km / 7 个转向点）—— 它是一条真正的
+          //    Route，窗口/底图/10Hz/转向提示全都照常，和规划出来的航线没有区别。
+          route = new rt.Route(rt.DEMO_ROUTE.map((p) => [p[0], p[1], p[2]]), true);
+          this.toast('路线服务不可用：模拟行驶改用内置演示航线（有转弯）', 6000);
+          this.log('[sim] 模拟行驶改用内置演示航线（环线，含 7 个转向点）');
+        } else {
+          this.toast('路线服务不可用，已退回直线连接', 5000);
+          route = rt.straight_route([[this.start_lat, this.start_lon, '起点'],
+                                     [dest[0], dest[1], '终点']]);
+        }
       }
 
       this.log(`[route] ${(route.total_m / 1000).toFixed(2)} km, ` +
@@ -1202,6 +1633,22 @@
           `${(route.total_m / 1000).toFixed(2)} km · ` +
           `${raw ? (raw.duration_s / 60).toFixed(0) + ' min · ' : ''}` +
           `${route.points.length} 点 · ${route.maneuvers.length} 个转向点`;
+      }
+
+      // 模拟行驶：把刚规划出来的航线交给模拟源 —— 它**必须**先有航线才能沿路
+      // 推进，所以 active_source() 要在这之后再取一次（在这之前它只能返回
+      // GPS/手动源）。起点偏移也在这里重新应用一次：用户可能先规划、后勾选。
+      if (this.simdrive && this.routesim) {
+        const v = this.read_sim_drive();
+        this.routesim.set_speed_kmh(v.speed_kmh);
+        this.routesim.start_frac = v.start_frac;
+        this.routesim.set_route(route);
+        this.routesim.active = true;
+        this._sim_arrived = false;
+        src = this.active_source();
+        this.log(`[sim] 模拟行驶已挂上本次航线：${(route.total_m / 1000).toFixed(2)} km，` +
+                 `${v.speed_kmh.toFixed(1)} km/h，从 ${(v.start_frac * 100).toFixed(0)}% 处开始` +
+                 `（航向取航线切线）`);
       }
 
       // 停掉旧循环，用新路线重建
@@ -1301,6 +1748,13 @@
         onState: (k, m) => { if (this.manual) this.set_gps_state(k, m, this.sim); },
       });
 
+      // 模拟行驶位置源：与 GPS / 手动源**并列**存在，谁生效由 active_source()
+      // 决定。它比其他两个多一个"航线"依赖，所以航线由 do_route() 喂进来。
+      this.routesim = new RouteSimSource({
+        onLog: (l) => this.log(l),
+        onState: (k, m) => { if (this.simdrive) this.set_gps_state(k, m, this.routesim); },
+      });
+
       // ---- 按钮 ----
       const on = (id, ev, fn) => {
         const el = $(id);
@@ -1315,6 +1769,13 @@
       });
 
       on('use-gps-btn', 'click', () => {
+        // 模拟行驶：起点不需要任何定位。没有起点时直接用内置演示航线的起点，
+        // 室内（无 GPS、也不手输坐标）就能两步跑起来。
+        if (this.simdrive && (this.start_lat === null || this.start_lon === null)) {
+          this.use_demo_start('模拟行驶');
+          this.toast('起点已设为模拟起点（内置演示航线）', 5000);
+          return;
+        }
         // 手动位置生效时，"当前位置"就是那个手输坐标（同一条取起点的代码路径）
         const src = this.active_source();
         if (!src) {
@@ -1337,9 +1798,10 @@
         const el = $('start-info');
         if (el) {
           el.textContent = `${this.start_lat.toFixed(6)}, ${this.start_lon.toFixed(6)}` +
-                           (this.manual ? '（手动位置）' : '');
+                           (this.manual ? '（手动位置）' : (this.simdrive ? '（模拟行驶）' : ''));
         }
-        this.toast(this.manual ? '起点已设为手动位置' : '起点已设为当前位置');
+        this.toast(this.manual ? '起点已设为手动位置'
+                              : (this.simdrive ? '起点已设为当前模拟位置' : '起点已设为当前位置'));
       });
 
       on('route-btn', 'click', () => this.do_route());
@@ -1376,6 +1838,34 @@
       on('man-lon', 'change', () => { if (this.manual) this.apply_manual(true); });
       on('man-heading', 'change', () => { if (this.manual) this.apply_manual(true); });
       on('man-speed', 'change', () => { if (this.manual) this.apply_manual(true); });
+
+      // ---- 模拟行驶 ----
+      //
+      // 和手动位置同一套规矩：界面说在模拟就**必须真在模拟**（set_sim_drive_active
+      // 会同时切换位置源），勾选后横幅立刻挂上，绝不会被当成真实定位。
+      // ⚠️ 这个选择**刻意不持久化**：重新打开页面就回到真实定位。模拟行驶是
+      //    测试模式，让它悄悄自己恢复，正是"把模拟当成真实"最危险的来源。
+      on('opt-simdrive', 'change', () => {
+        const want = !!($('opt-simdrive') || {}).checked;
+        if (want) {
+          this.apply_sim_drive(this.simdrive);
+        } else if (this.simdrive) {
+          this.set_sim_drive_active(false);
+          this.log('[sim] 模拟行驶已关闭，切回真实定位');
+          this.toast('已关闭模拟行驶');
+        }
+      });
+      on('sim-apply', 'click', () => {
+        const cb = $('opt-simdrive');
+        if (cb) cb.checked = true;
+        // 按"重新开始"时如果还没启用，就连启用一起做掉（少一步操作）
+        if (!this.simdrive) this.apply_sim_drive(false);
+        else this.restart_sim_route(false);
+      });
+      // 改速度**不**重置已经走到的位置（跑到一半调速度不该把车拨回起点）
+      on('sim-speed', 'change', () => { if (this.simdrive) this.apply_sim_speed(true); });
+      // 改起点偏移 = 重新开始（这个参数只在新一轮模拟时有意义）
+      on('sim-start', 'change', () => { if (this.simdrive) this.restart_sim_route(true); });
 
       // 预设改变时同步到两个坐标框，用户能看到实际用了什么
       on('dest-preset', 'change', () => {
@@ -1451,12 +1941,17 @@
       // "现在用的不是它"；预填一个看起来很像真实定位的坐标反而容易被误读。
       this.set_manual_active(false);
 
+      // 模拟行驶同样默认不启用，而且**不从存储里恢复**（见事件绑定处的说明）。
+      // 速度框的默认值写在 index.html 里（42 km/h，与 PC 版 --speed 一致）。
+      this.set_sim_drive_active(false);
+
       // 定位面板的初始读数：还没有任何 fix（GPS 可能还在等，室内永远等不到）
       this.set_gps_state(GeoSource.supported() ? 'waiting' : 'unavailable',
                          GeoSource.supported() ? '' : '这个浏览器不支持 navigator.geolocation');
 
       this.log('NavPuck 手机端已就绪。步骤：1) 连接设备 2) 获取定位 3) 规划并开始导航' +
-               '。室内收不到 GPS 时，展开"高级 / 手动定位"直接手输坐标');
+               '。室内收不到 GPS 时，展开"高级 / 手动定位"直接手输坐标，' +
+               '或者用"高级 / 模拟行驶"让车沿航线自己走（速度/进度/航向都会动）');
     }
   }
 
@@ -1473,7 +1968,7 @@
     }
   }
 
-  root.NavPuckApp = { App, Navigator, GeoSource, SimSource, heading_unusable, app };
+  root.NavPuckApp = { App, Navigator, GeoSource, SimSource, RouteSimSource, heading_unusable, app };
 
   // CommonJS 导出：只在 phone/test/ 的 Node 自测里用到。
   //

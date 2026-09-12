@@ -194,6 +194,23 @@ section('2] 黄金向量逐字节比对');
   });
   eq(P._hex(P.encode_puck_status(st)), VEC.puck_status.frame_hex, 'PUCK_STATUS frame_hex');
 
+  // ---- NAV_CLOCK（正好 6 字节）----
+  // 黄金向量用的是 **+5:30**（330 分钟）而不是整点时区：整点时区用"小时"
+  // 也能表达，半点时区不能 —— 拿它钉死"偏移是分钟而不是小时"。
+  const ck = new P.NavClock({ epoch_s: VEC.nav_clock.epoch_s,
+                              tz_offset_min: VEC.nav_clock.tz_offset_min });
+  eq(P._hex(P.encode_nav_clock(ck)), VEC.nav_clock.frame_hex, 'NAV_CLOCK frame_hex');
+  eq(ck.pack().length, P.NAV_CLOCK_LEN, 'NavClock.pack() 恰好 6 字节');
+  eq(P.NAV_CLOCK_LEN, 6, 'NAV_CLOCK_LEN = 6');
+  eq(ck.local_epoch_s, VEC.nav_clock.local_epoch_s, 'local_epoch_s = UTC + 偏移*60');
+  const ckBack = P.NavClock.unpack(
+    P.encode_nav_clock(ck).slice(P.HEADER_LEN, P.HEADER_LEN + P.NAV_CLOCK_LEN));
+  eq([ckBack.epoch_s, ckBack.tz_offset_min], [VEC.nav_clock.epoch_s, VEC.nav_clock.tz_offset_min],
+     'NAV_CLOCK 往返后两个字段原样');
+  eq(P.MsgType.NAV_CLOCK, 0x06, 'MsgType.NAV_CLOCK = 0x06（0x06 原本空着）');
+  eq(P._hex(P.encode_nav_clock(ck)).slice(6, 8), '06', 'NAV_CLOCK 帧头 type 字节 = 0x06');
+  eq(P._hex(P.encode_nav_clock(ck)).slice(8, 12), '0600', 'NAV_CLOCK len 字段 = 6（小端）');
+
   // ---- 交叉：Python selftest 里硬编码的那几个字段偏移 ----
   const payload = updFrame.slice(P.HEADER_LEN, P.HEADER_LEN + P.NAV_UPDATE_LEN);
   eq(P._hex(payload.slice(20, 22)), '7f3e', 'payload[20:22] = heading_cdeg');
@@ -272,6 +289,54 @@ section('3] 各消息类型 encode -> decode 往返');
   eq(got6.length, 1, 'PUCK_STATUS 解出 1 帧');
   const sBack = P.PuckStatus.unpack(got6[0].payload);
   eq([sBack.vbat_mv, sBack.battery_pct, sBack.flags], [3960, 78, 0], 'PUCK_STATUS 字段');
+
+  // NAV_CLOCK：往返 + **边界值**。
+  // 这个载荷只有 6 个字节、两个字段，长度一旦算错不会有任何提示 ——
+  // 只是时间偏掉，而屏幕上照样显示一个"看起来正常"的时间。所以把 u32/i16
+  // 的上下界、负偏移、以及半点时区全跑一遍。
+  {
+    const cases = [
+      [0, 0], [0xFFFFFFFF, -32768], [0xFFFFFFFF, 32767],
+      [1757500000, 480], [1757500000, 330], [1757500000, -300],
+      [1757500000, 345], [1, -1],
+    ];
+    let bad = [];
+    for (const [ep, tz] of cases) {
+      const raw = new P.NavClock({ epoch_s: ep, tz_offset_min: tz }).pack();
+      if (raw.length !== 6) { bad.push(`${ep}/${tz}: 长度 ${raw.length}`); continue; }
+      const back = P.NavClock.unpack(raw);
+      if (back.epoch_s !== ep || back.tz_offset_min !== tz) {
+        bad.push(`${ep}/${tz}: 回读 ${back.epoch_s}/${back.tz_offset_min}`);
+      }
+    }
+    eq(bad, [], `NAV_CLOCK ${cases.length} 组边界值原样往返（u32/i16 上下界、负偏移、半点时区）`);
+
+    // 整帧走一遍解析器：8 字节开销 + 6 字节载荷 = 14
+    const cf = P.encode_nav_clock(new P.NavClock({ epoch_s: 1757500000, tz_offset_min: 330 }));
+    eq(cf.length, P.OVERHEAD + P.NAV_CLOCK_LEN, 'NAV_CLOCK 整帧长度 = 8 + 6 = 14');
+    const p6b = new P.FrameParser();
+    const got6b = p6b.feed(cf);
+    eq(got6b.length, 1, 'NAV_CLOCK 解出 1 帧');
+    eq(got6b[0].type, P.MsgType.NAV_CLOCK, 'type = NAV_CLOCK');
+    // 1 字节一次喂入（BLE 上一次写只有一个 ATT PDU）
+    const p6c = new P.FrameParser();
+    let n6c = 0;
+    for (let i = 0; i < cf.length; i++) n6c += p6c.feed(cf.subarray(i, i + 1)).length;
+    eq(n6c, 1, 'NAV_CLOCK 一次一个字节喂入也能解出 1 帧');
+
+    // 长度不对必须被拒：多一字节少一字节都算错版本，不是"兼容"
+    const rej = [];
+    for (const n of [0, 5, 7]) {
+      try { P.NavClock.unpack(new Uint8Array(n)); rej.push(n); } catch (_e) { /* 期望抛错 */ }
+    }
+    eq(rej, [], 'NAV_CLOCK 长度 != 6 一律拒绝（5 / 7 / 0 都抛错）');
+
+    // now_clock()：符号必须与 Python 的 -time.timezone 一致（见 proto.js 的说明）
+    const nc = P.now_clock(Date.UTC(2025, 8, 10, 10, 26, 40));
+    eq(nc.epoch_s, 1757500000, 'now_clock(ms) 的 epoch_s = 1757500000');
+    eq(nc.tz_offset_min, -new Date(1757500000 * 1000).getTimezoneOffset(),
+       `now_clock() 的偏移 = -getTimezoneOffset()（本机 ${-new Date().getTimezoneOffset()} 分钟）`);
+  }
 
   // PING / PONG：0 长度载荷，解析器必须走 state 4 分支而不是把它当 payload
   const p7 = new P.FrameParser();
@@ -679,9 +744,8 @@ section('6] 边界值往返');
      '_truncate_utf8 短于 limit 时原样返回');
 
   // 常量自检：这些数字错了，两端所有偏移量一起错
-  eq(P.NAV_UPDATE_LEN, 32, 'NAV_UPDATE_LEN = 32');
-  eq(P.NAV_META_LEN, 9, 'NAV_META_LEN = 9');
-  eq(P.PUCK_STATUS_LEN, 4, 'PUCK_STATUS_LEN = 4');
+  eq([P.NAV_UPDATE_LEN, P.NAV_META_LEN, P.PUCK_STATUS_LEN, P.NAV_CLOCK_LEN],
+     [32, 9, 4, 6], 'NAV_UPDATE_LEN = 32 / NAV_META_LEN = 9 / PUCK_STATUS_LEN = 4 / NAV_CLOCK_LEN = 6');
   eq(P.NAV_ROUTE_HEADER_LEN, 6, 'NAV_ROUTE_HEADER_LEN = 6');
   eq(P.NAV_MAP_HEADER_LEN, 4, 'NAV_MAP_HEADER_LEN = 4');
   eq(P.MAX_PAYLOAD, 1536, 'MAX_PAYLOAD = 1536');
@@ -694,9 +758,9 @@ section('6] 边界值往返');
   eq([P.MAGIC0, P.MAGIC1, P.VERSION], [0xA5, 0x5A, 1], 'magic / version');
   eq(P.TURN_NAMES.length, 16, 'Turn 表 16 个值');
   eq([P.MsgType.NAV_UPDATE, P.MsgType.NAV_TEXT, P.MsgType.NAV_META, P.MsgType.NAV_ROUTE,
-      P.MsgType.NAV_MAP, P.MsgType.PUCK_STATUS, P.MsgType.PUCK_EVENT, P.MsgType.PING,
-      P.MsgType.PONG],
-     [1, 2, 3, 4, 5, 0x10, 0x11, 0x20, 0x21], 'MsgType 全部取值');
+      P.MsgType.NAV_MAP, P.MsgType.NAV_CLOCK, P.MsgType.PUCK_STATUS, P.MsgType.PUCK_EVENT,
+      P.MsgType.PING, P.MsgType.PONG],
+     [1, 2, 3, 4, 5, 6, 0x10, 0x11, 0x20, 0x21], 'MsgType 全部取值（NAV_CLOCK = 0x06）');
   eq([P.Turn.NONE, P.Turn.STRAIGHT, P.Turn.LEFT, P.Turn.ARRIVE, P.Turn.OFF_ROUTE],
      [0, 1, 3, 14, 15], 'Turn 关键取值');
   eq([P.NavFlags.GPS_FIX, P.NavFlags.OFF_ROUTE, P.NavFlags.ARRIVED, P.NavFlags.LOW_BATTERY,

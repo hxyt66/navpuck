@@ -637,7 +637,190 @@ section('7] 手动位置（模拟定位）：室内没有 GPS 也能跑通整条
 }
 
 // ---------------------------------------------------------------------------
-section('8] 街道路网底图：状态说得清楚、关掉就真的不发请求');
+section('8] 模拟行驶（沿航线自动推进）：室内没有 GPS 也能看到车真的在动');
+// ---------------------------------------------------------------------------
+// 这一节对着 tools/navigator.py 的 SimSource（PC 版是参考实现）：
+// 勾选 -> 位置沿**规划出来的航线**按 km/h 前进 -> 航向取航线切线（所以过弯会转）
+// -> 到终点停住。手动位置横幅之外再加一条"模拟行驶"横幅，是因为这个模式车
+// 是真的在动，比静态坐标更容易被误读成真实定位。
+{
+  const app = APP.app;
+  ok(typeof APP.RouteSimSource === 'function', 'app.js 导出了 RouteSimSource');
+  ok(APP.RouteSimSource !== APP.SimSource, 'RouteSimSource 与静态 SimSource 是两个类');
+
+  // --- 1) 界面元素：开关 + 速度(km/h) + 起点偏移 + 实时读数 + 横幅 ---
+  const cb = BY_ID.get('opt-simdrive');
+  const cb_attrs = (ELEMENTS.find((e) => e.id === 'opt-simdrive') || {}).attrs || '';
+  ok(cb && cb.tagName === 'INPUT' && /type="checkbox"/.test(cb_attrs),
+     '#opt-simdrive 是 <input type="checkbox">（模拟行驶开关）');
+  const sp = BY_ID.get('sim-speed');
+  const sp_attrs = (ELEMENTS.find((e) => e.id === 'sim-speed') || {}).attrs || '';
+  ok(sp && sp.tagName === 'INPUT' && /type="number"/.test(sp_attrs) &&
+     /step="any"/.test(sp_attrs) && /inputmode="decimal"/.test(sp_attrs),
+     '#sim-speed 是 <input type="number" step="any" inputmode="decimal">（速度，km/h）');
+  eq(String(sp.value), '42', '速度默认 42 km/h（与 PC 版 --speed 的默认值一致）');
+  const st = BY_ID.get('sim-start');
+  const st_attrs = (ELEMENTS.find((e) => e.id === 'sim-start') || {}).attrs || '';
+  ok(st && st.tagName === 'INPUT' && /type="number"/.test(st_attrs) &&
+     /step="any"/.test(st_attrs),
+     '#sim-start 是 <input type="number" step="any">（起点偏移，对应 PC 版 --start）');
+  eq(String(st.value), '0', '起点偏移默认 0（= 从航线起点开始）');
+  ok(BY_ID.get('sim-apply').hasListener('click'), '#sim-apply 绑上了 click');
+  ok(cb.hasListener('change') && sp.hasListener('change') && st.hasListener('change'),
+     '开关/速度/起点偏移都绑上了 change');
+  ok(HTML_IDS.has('sim-info'), 'index.html 里有 sim-info（模拟行驶的实时读数）');
+  ok(HTML_IDS.has('sim-badge'), 'index.html 里有 sim-badge（模拟行驶横幅）');
+  ok(/模拟行驶/.test(HTML), 'index.html 的文案里写明"模拟行驶"');
+  ok(BY_ID.get('sim-badge').hidden === true, '初始不显示"模拟行驶"横幅');
+  ok(BY_ID.get('sim-info').hidden === true, '初始不显示模拟读数');
+  ok(cb.checked === false && app.simdrive === false,
+     '初始不模拟行驶（这是测试模式，刻意不持久化、不自动恢复）');
+
+  // --- 2) 勾选：不需要任何 GPS，起点自动取内置演示航线起点 ---
+  app.start_lat = null;
+  app.start_lon = null;
+  // 先造出"**完全没有 GPS fix**"的状态（室内就是这样的），再开模拟行驶 ——
+  // 整条链路必须一个定位都不需要。
+  app.geo.lat = null;
+  app.geo.lon = null;
+  eq(app.geo.has_fix(), false, '先把 GPS 源清成"没有任何 fix"（模拟室内）');
+  sp.value = '36';                              // 10 m/s，好算
+  st.value = '0';
+  cb.checked = true;
+  cb.fire('change');
+
+  ok(app.simdrive === true, '勾选后 app.simdrive = true');
+  eq(app.geo.has_fix(), false, '此时 GPS 仍然没有任何 fix（不靠它）');
+  eq(BY_ID.get('sim-badge').hidden, false, '"模拟行驶"横幅显示出来（模拟运行一眼可辨）');
+  eq(BY_ID.get('sim-badge').dataset.state, 'running', '横幅 data-state = running');
+  eq(BY_ID.get('gps-state').dataset.state, 'simdrive', '定位状态 = simdrive');
+  eq(BY_ID.get('gps-state').textContent, '模拟行驶', '定位状态文字 = 模拟行驶');
+  ok(/不是真实 GPS/.test(BY_ID.get('gps-error').textContent),
+     `详情写明不是真实 GPS：${BY_ID.get('gps-error').textContent}`);
+  eq([app.start_lat, app.start_lon], [RT.DEMO_ROUTE[0][0], RT.DEMO_ROUTE[0][1]],
+     '没有起点时自动取内置演示航线的起点（室内不必手输坐标）');
+  ok(/模拟起点/.test(BY_ID.get('start-info').textContent),
+     `界面上写明是模拟起点：${BY_ID.get('start-info').textContent}`);
+  ok(/\[sim\]/.test(BY_ID.get('log').textContent), '日志里有 [sim] 行');
+
+  // --- 3) 规划并开始导航：位置源换成 RouteSimSource，而且**真的在推进** ---
+  BY_ID.get('route-btn').fire('click');
+  await sleep(1200);                            // OSRM 失败后回退直线航点
+  ok(app.nav !== null, '模拟行驶下"规划并开始导航"起得来（一个 GPS fix 都不需要）');
+  if (app.nav) {
+    eq(app.nav.source, app.routesim, 'Navigator 拿到的就是 RouteSimSource');
+    eq(app.active_source(), app.routesim, 'active_source() = 模拟行驶源');
+    ok(app.routesim.has_route(), '模拟源已经拿到本次航线');
+    ok(app.routesim.route.maneuvers.length >= 5,
+       `无网（测试环境 fetch 必失败）时模拟行驶退回**内置演示航线**：` +
+       `${(app.routesim.route.total_m / 1000).toFixed(2)} km / ` +
+       `${app.routesim.route.maneuvers.length} 个转向点 —— 过弯一定测得到（直线就没有转弯了）`);
+
+    const s1 = app.routesim.s;
+    await sleep(300);                           // 10Hz 跑几帧：36km/h = 10m/s
+    const s2 = app.routesim.s;
+    const walked = s2 - s1;
+    ok(s2 > s1, `位置沿航线在推进：${s1.toFixed(2)} -> ${s2.toFixed(2)} m`);
+    ok(walked > 1.2 && walked < 6.0,
+       `0.3 秒走了 ${walked.toFixed(2)} m（36km/h=10m/s，用的是真实流逝时间，不是固定步长）`);
+    ok(Math.abs(app.nav.last_update.speed_kmh - 36) < 0.2,
+       `速度栏 = 配置的 36 km/h（实得 ${app.nav.last_update.speed_kmh}）`);
+    eq(BY_ID.get('speed').textContent, '36.0', '状态面板"速度"格被写进去');
+    ok(/^\d+%$/.test(BY_ID.get('progress').textContent),
+       `进度格被写进去：${BY_ID.get('progress').textContent}`);
+    ok(BY_ID.get('sim-info').hidden === false &&
+       /模拟行驶：沿航线/.test(BY_ID.get('sim-info').textContent) &&
+       /km\/h/.test(BY_ID.get('sim-info').textContent) &&
+       /航向 /.test(BY_ID.get('sim-info').textContent),
+       `实时读数写出里程/速度/航向：${BY_ID.get('sim-info').textContent}`);
+
+    // --- 3b) 两个模拟模式同时开着：生效的必须是"模拟行驶"，界面不许撒谎 ---
+    app.set_manual_active(true);
+    eq(app.active_source(), app.routesim, '两个都开着时 active_source() 仍然是模拟行驶源');
+    eq(BY_ID.get('manual-badge').hidden, true,
+       '模拟行驶真的在链路里时，"手动位置"横幅不亮（手动源不在链路里，亮着就是假的）');
+    eq(BY_ID.get('sim-badge').hidden, false, '"模拟行驶"横幅仍然亮着');
+    eq(BY_ID.get('gps-state').dataset.state, 'simdrive',
+       '状态面板跟着真正生效的那个源走');
+    app.set_manual_active(false);
+    eq(BY_ID.get('sim-badge').hidden, false, '关掉手动位置不影响模拟行驶');
+    eq(app.active_source(), app.routesim, '位置源还是模拟行驶');
+  }
+
+  // --- 4) 接上闭环演示航线（7 个转向点）：航向必须跟着路转弯 ---
+  app.stop_nav();
+  const demo = new RT.Route(RT.DEMO_ROUTE.map((p) => [p[0], p[1], p[2]]), true);
+  const M1_IDX = demo.maneuvers[0][0];
+  const M1_DELTA = demo.maneuvers[0][1];
+  const M1_S = demo.points[M1_IDX].cum_m;
+  app.routesim.set_speed_kmh(36.0);             // 10 m/s
+  app.routesim.set_route(demo);
+  app.routesim.restart((M1_S - 40.0) / demo.total_m);   // 放到第一个转弯前 40m
+  app.routesim.active = true;
+  app.nav = new APP.Navigator(demo, app.routesim, {
+    send: () => true,
+    onLog: (l) => app.log(l),
+    onUi: (d) => app.on_ui(d),
+    config: { rate_hz: 10, no_map: true },
+  });
+  let unwrapped = 0;
+  let prev_h = app.routesim.heading;
+  let s_prev = app.routesim.s;
+  let ok_frames = true;
+  for (let i = 0; i < 100; i++) {
+    const u = app.nav.cycle(0.1);
+    if (u === null) { ok_frames = false; break; }
+    if (!(app.routesim.s >= s_prev)) ok_frames = false;
+    if (Math.abs(NM.shortest_delta(u.heading_deg, demo.tangent_deg(app.routesim.s))) > 0.02) {
+      ok_frames = false;
+    }
+    if (!Number.isFinite(u.heading_deg) || !Number.isFinite(u.pos_east_m) ||
+        !Number.isFinite(u.pos_north_m)) ok_frames = false;
+    unwrapped += NM.shortest_delta(prev_h, u.heading_deg);
+    prev_h = u.heading_deg;
+    s_prev = app.routesim.s;
+  }
+  ok(ok_frames, '100 帧：位置单调前进、航向每帧都等于航线切线、帧里没有 NaN');
+  ok(unwrapped > M1_DELTA * 0.8,
+     `过弯时航向真的转了（累计 ${unwrapped.toFixed(1)}°，转弯点标称 +${M1_DELTA.toFixed(1)}°）`);
+  ok(/航向 \d+°/.test(BY_ID.get('sim-info').textContent),
+     `实时读数里带着当前航向：${BY_ID.get('sim-info').textContent}`);
+
+  // --- 5) 到终点：停住 + 明确写"已到终点"，不绕回起点 ---
+  app.routesim.restart(1.0);
+  app.nav.cycle(0.1);
+  eq(app.routesim.s, demo.total_m, 's 正好停在终点');
+  eq(BY_ID.get('progress').textContent, '100%', '进度格 = 100%');
+  eq(BY_ID.get('speed').textContent, '0.0', '速度格归零（车停了，不是还写着 36）');
+  ok(/已到终点/.test(BY_ID.get('sim-info').textContent),
+     `实时读数写明已到终点：${BY_ID.get('sim-info').textContent}`);
+  eq(BY_ID.get('sim-badge').dataset.state, 'arrived', '横幅换成"已到终点"的样式');
+  ok(/模拟行驶已到终点/.test(BY_ID.get('toast').textContent),
+     '到终点时弹一次提示');
+  for (let i = 0; i < 20; i++) app.nav.cycle(0.1);
+  eq(app.routesim.s, demo.total_m, '再跑 20 帧仍然停在终点（刻意不绕回起点重跑）');
+  ok(/已到终点/.test(BY_ID.get('sim-info').textContent),
+     '读数保持"已到终点"（不会自己变回"在跑"）');
+
+  // --- 6) 收尾：关掉模拟行驶，界面回到真实定位 ---
+  app.stop_nav();
+  // 先让 GPS 重新拿到一个 fix（等价于"走到窗边定位上了"），再看切回来的样子
+  geo_success({
+    coords: { latitude: 30.2546, longitude: 120.1351, accuracy: 8, speed: 0, heading: null },
+    timestamp: Date.now(),
+  });
+  cb.checked = false;
+  cb.fire('change');
+  eq(app.simdrive, false, '取消勾选后 app.simdrive = false');
+  eq(BY_ID.get('sim-badge').hidden, true, '"模拟行驶"横幅收起');
+  eq(BY_ID.get('sim-info').hidden, true, '模拟读数收起');
+  eq(BY_ID.get('gps-state').dataset.state, 'ok',
+     '切回真实定位（横幅收起后不会再被误当成模拟）');
+  ok(app.active_source() !== app.routesim, '位置源不再是模拟行驶');
+}
+
+// ---------------------------------------------------------------------------
+section('9] 街道路网底图：状态说得清楚、关掉就真的不发请求');
 // ---------------------------------------------------------------------------
 {
   const app = APP.app;
@@ -734,12 +917,12 @@ section('8] 街道路网底图：状态说得清楚、关掉就真的不发请�
 }
 
 // ---------------------------------------------------------------------------
-section('9] "不支持 Web Bluetooth" 的提示路径');
+section('10] "不支持 Web Bluetooth" 的提示路径');
 // ---------------------------------------------------------------------------
 // ⚠️ 这一节必须放在最后：它会再新建一个 App 实例，而 DOM 桩是共享的 ——
 //    新实例 init() 会把**它自己的**监听器绑到同一批元素上，之后任何一次
 //    点击/输入都会同时走到两个实例的处理函数（它没有 fix，会把状态面板改回
-//    waiting）。第 8 节已经建过第二个实例了，所以这里更得排在最后 ——
+//    waiting）。第 9 节已经建过第二个实例了，所以这里更得排在最后 ——
 //    与其掩盖这个"多实例 + 共享 DOM"的真实坑，不如把用例都排在它前面。
 {
   // document 里没有 'bluetooth' in navigator 时，init() 应该显出 #unsupported

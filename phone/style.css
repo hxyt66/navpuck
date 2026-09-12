@@ -318,6 +318,20 @@ button.ghost {
 
 .sim-banner b { font-weight: 800; }
 
+/* 模拟行驶横幅：底色和"手动位置"同一套警示色，但用虚线边框区分 ——
+   这个模式车是真的在动，比静态手动位置更容易被误读成真实定位。
+   真跑到终点后转成绿色，表示"跑完了、停住了"，而不是还在走。 */
+#sim-badge { border-style: dashed; }
+
+#sim-badge[data-state="arrived"] {
+  color: #04240f;
+  background: var(--ok);
+  border-color: #5ce796;
+}
+
+/* 模拟行驶也是一种"模拟定位"，配色跟手动定位一致（黄 = 不是真实 GPS） */
+#gps-state[data-state="simdrive"] { color: var(--warn); }
+
 /* ---------- 选项 ---------- */
 
 .opts summary {

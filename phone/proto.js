@@ -44,6 +44,24 @@
   const NAV_META_LEN = 9;
   const PUCK_STATUS_LEN = 4;
 
+  // ---- NAV_CLOCK：对端把"现在几点"推给设备 ----
+  //
+  // 载荷**恰好 6 字节**：
+  //     +0  epoch_s        u32   Unix 秒，**UTC**
+  //     +4  tz_offset_min  i16   本地时区相对 UTC 的**分钟**数（UTC+8 = 480）
+  //
+  // 本地时间 = epoch_s + tz_offset_min * 60。
+  //
+  // 为什么时间要从手机推：设备是 ESP32-S3，**没有电池 RTC**，断电就不知道
+  // 几点了；也不能开 WiFi 走 NTP —— 它跑 BLE 跟手机连，WiFi 和 BLE 抢同一个
+  // 射频，同时开会把 BLE 连接质量拖垮，还得让用户填 WiFi 凭据。
+  // 所以时间只能走**已经建好的这条链路**推过去。
+  //
+  // 为什么偏移是**分钟**而不是小时：印度 +5:30、尼泊尔 +5:45 这些"半点时区"
+  // 是真实存在的，用小时只能表达整点时区，那些地方会整整差半天 ——
+  // 而且差的是**日期**，比差几十分钟难发现得多。
+  const NAV_CLOCK_LEN = 6;
+
   // ---- NAV_ROUTE：**前方窗口**的一个分片 ----
   //
   // 头 6 字节：total_points(u16) chunk_start(u16) n_pts(u8) flags(u8)，
@@ -113,6 +131,9 @@
     NAV_META: 0x03,
     NAV_ROUTE: 0x04,
     NAV_MAP: 0x05,
+    // 0x06 是 0x01..0x05 之外唯一空着的小号类型：设备->大脑是 0x10/0x11，
+    // 控制帧是 0x20/0x21。取它就不必动任何已有类型的编号（wire 是冻结的）。
+    NAV_CLOCK: 0x06,
     PUCK_STATUS: 0x10,
     PUCK_EVENT: 0x11,
     PING: 0x20,
@@ -397,6 +418,46 @@
   }
 
   /**
+   * "现在几点" —— 手机推给设备的一帧。
+   *
+   * 设备端**不保存这一帧本身**，只保存 (epoch_s, 收到那一刻的 millis())，
+   * 之后靠毫秒计数器自己往下走：链路断了完全不影响走时。
+   * 所以这一帧是"对表"，不是"流"（连接时一次 + 每 30 秒一次纠正漂移）。
+   *
+   * ⚠️ 字段一旦发布就不能改（wire 冻结）：插一个字段进去会让后面所有字段
+   * 整体平移，而 CRC 两边各算各的都是对的 —— 症状是设备屏幕上显示一个
+   * **看起来很正常**的错时间，没有任何东西会报警。
+   */
+  class NavClock {
+    constructor(fields) {
+      const f = fields || {};
+      this.epoch_s = f.epoch_s || 0;
+      this.tz_offset_min = f.tz_offset_min || 0;
+    }
+
+    /** 本地时间戳 = UTC + 偏移（秒）。 */
+    get local_epoch_s() { return this.epoch_s + this.tz_offset_min * 60; }
+
+    pack() {
+      return new ByteWriter()
+        .u32(_u32(this.epoch_s))
+        .i16(_i16(this.tz_offset_min))
+        .toUint8();
+    }
+
+    static unpack(payload) {
+      // 长度必须**正好** 6 字节：这一帧没有变长部分，长度不对就只能是两端
+      // 协议版本不一样。放宽成"至少 6 字节"的话，将来给这一帧追加字段时，
+      // 旧固件会把新字段的低位当成 epoch —— 时间看着正常，只是错了几个小时。
+      if (payload.length !== NAV_CLOCK_LEN) {
+        throw new Error(`NAV_CLOCK 长度应为 ${NAV_CLOCK_LEN}，实得 ${payload.length}`);
+      }
+      const r = new ByteReader(payload, 0);
+      return new NavClock({ epoch_s: r.u32(), tz_offset_min: r.i16() });
+    }
+  }
+
+  /**
    * **前方窗口的一个分片**（滑动窗口：一窗发一遍）。
    *
    * 坐标系是**正北朝上的局部平面**：x 东为正，y 北为正，单位**米**，
@@ -610,6 +671,35 @@
 
   function encode_nav_map(m) { return encode_frame(MsgType.NAV_MAP, m.pack()); }
   function encode_puck_status(s) { return encode_frame(MsgType.PUCK_STATUS, s.pack()); }
+
+  /**
+   * NAV_CLOCK -> 完整帧（8 字节开销 + 6 字节载荷 = 14 字节）。
+   *
+   * ⚠️ 这里**不做**范围校验（比如"时区必须在 ±14 小时以内"）：设备端只做加法，
+   * 越界的偏移只会让时间偏掉，不会越界读写；而在编码侧悄悄夹断，
+   * 对端就再也看不出"发的人算错了"。该管住的是发送端。
+   */
+  function encode_nav_clock(c) { return encode_frame(MsgType.NAV_CLOCK, c.pack()); }
+
+  /**
+   * 取**本机**当前时间 + 本机**真实时区**，装成一帧 NAV_CLOCK。
+   *
+   * ⚠️ 符号：`new Date().getTimezoneOffset()` 是 "UTC 减本地" 的分钟数，
+   *    北京是 **-480**；而协议里要的是"本地相对 UTC 多了多少"，
+   *    所以要取负：`-new Date().getTimezoneOffset()` -> +480。
+   *    忘了这个负号，设备上的钟会往反方向偏一整个时区
+   *    （北京显示成 UTC，差 8 小时），而且看起来完全正常。
+   */
+  function now_clock(ms) {
+    // ms 可注入（自测用）；正常调用不传，取本机当前时间。
+    const d = (ms === undefined || ms === null) ? new Date() : new Date(ms);
+    return new NavClock({
+      // Math.floor 而不是 |0：epoch 秒现在还没到 2^31，但 2038 年之后就超了，
+      // 而 JS 的位运算是 32 位有符号 —— 那之后会静默变成负数。
+      epoch_s: Math.floor(d.getTime() / 1000),
+      tz_offset_min: -d.getTimezoneOffset(),
+    });
+  }
   function encode_puck_event(ev) {
     return encode_frame(MsgType.PUCK_EVENT, new Uint8Array([ev]));
   }
@@ -738,7 +828,7 @@
 
   const API = {
     MAGIC0, MAGIC1, VERSION, HEADER_LEN, CRC_LEN, OVERHEAD, MAX_PAYLOAD,
-    NAV_UPDATE_LEN, NAV_META_LEN, PUCK_STATUS_LEN,
+    NAV_UPDATE_LEN, NAV_META_LEN, PUCK_STATUS_LEN, NAV_CLOCK_LEN,
     NAV_ROUTE_HEADER_LEN, MAX_ROUTE_POINTS, MAX_ROUTE_CHUNK_POINTS_BY_PAYLOAD,
     MAX_ROUTE_CHUNK_POINTS, ROUTE_MAX_RANGE_M, ROUTE_CHUNK_LAST,
     NO_TURN, NO_TURN_INDEX,
@@ -747,9 +837,10 @@
     MsgType, TextKind, Turn, TURN_NAMES, turn_name, NavFlags, PuckEventId,
     crc16, _clamp_i, _truncate_utf8, _hex,
     NavUpdate, NavMeta, PuckStatus, NavRoute, NavMap, Frame, FrameParser,
+    NavClock, now_clock,
     route_chunks, encode_frame, encode_nav_update, encode_nav_text,
     encode_nav_meta, encode_nav_route, encode_nav_route_full, encode_nav_map,
-    encode_puck_status, encode_puck_event, encode_ping, encode_pong, decode_text,
+    encode_puck_status, encode_nav_clock, encode_puck_event, encode_ping, encode_pong, decode_text,
   };
 
   // 把 Turn 表回填给 navmath.js。

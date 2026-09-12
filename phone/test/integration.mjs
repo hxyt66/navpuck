@@ -1269,6 +1269,226 @@ section('12] 底图（Overpass）永久失败：导航照常，且网络行为�
 }
 
 // ---------------------------------------------------------------------------
+section('13] 模拟行驶：沿航线按真实流逝时间推进、航向随转弯变化、到终点干净停住');
+// ---------------------------------------------------------------------------
+// 这一节对应 tools/navigator.py 的 SimSource（PC 版是参考实现）：
+//   - s += speed_mps * dt，dt 是**真实流逝时间**
+//   - fix() = (point_at(s).lat/lon, tangent_deg(s), speed_mps)
+// 唯一**故意**不同的地方在最后一小节：走到终点停住，不像 Python 那样
+// `s -= total_m` 绕回起点。
+{
+  const route = demo_route();                  // 闭环演示航线：10.03km / 7 个转向点
+  const total = route.total_m;
+  // 第一个转向点：[下标, 转角, 动作]。1391.5m 处 +30.1°
+  const M1_IDX = route.maneuvers[0][0];
+  const M1_DELTA = route.maneuvers[0][1];
+  const M1_S = route.points[M1_IDX].cum_m;
+
+  // --- 1) 位置源本身 ------------------------------------------------------
+  ok(APP.RouteSimSource !== APP.SimSource,
+     'RouteSimSource 是独立的类（沿航线推进，不是那个静态的手动位置源）');
+
+  const s0 = new APP.RouteSimSource({});
+  eq(s0.has_route(), false, '还没 set_route() 时没有航线');
+  eq(s0.has_fix(), false, '没有航线时 has_fix() = false');
+  eq(s0.fix(0), null, '没有航线时 fix() 返回 null（Navigator 会安全跳过这一帧，不崩）');
+  eq(s0.set_route(null), false, 'set_route(null) 被拒绝（返回 false，不会留下半条航线）');
+  eq(s0.set_route(route), true, 'set_route(合法航线) 返回 true');
+  eq(s0.has_route(), true, 'set_route() 之后 has_route() = true');
+  eq(s0.s, 0, '默认从航线起点开始（对应 PC 版 --start 默认 0）');
+  eq(s0.is_route_sim, true, '带 is_route_sim 标记（Navigator 靠它走"弧长源"那条分支）');
+
+  s0.active = true;
+  const f0 = s0.fix(999);
+  eq(f0.length, 4, 'fix() 与 GeoSource 同形状：[lat, lon, heading, speed_mps]');
+  const p0 = route.point_at(0);
+  ok(Math.abs(f0[0] - p0[0]) < 1e-12 && Math.abs(f0[1] - p0[1]) < 1e-12,
+     's=0 的 lat/lon 就是航线起点');
+  ok(Math.abs(f0[2] - route.tangent_deg(0)) < 1e-12,
+     `航向 = 航线在 s 处的切线（${f0[2].toFixed(1)}°），不是传进来的兜底值`);
+  eq(f0[3], 42 / 3.6, '默认速度 = 42 km/h ÷ 3.6 = 11.667 m/s（PC 版 --speed 的默认值）');
+  eq(s0.heading_source, 'sim', "heading_source = 'sim'（一眼能看出这个航向是算出来的）");
+  eq(s0.accuracy_m, null, 'accuracy_m = null（模拟位置没有精度，界面显示 —）');
+  eq(s0.total_m(), total, 'total_m() = 航线全长');
+
+  // --- 2) 速度 = 真实流逝时间 × 速度，而且与帧率无关 ------------------------
+  const sv = new APP.RouteSimSource({});
+  sv.set_route(route);
+  sv.active = true;
+  sv.set_speed_kmh(36.0);
+  eq(sv.speed_mps, 10.0, '36 km/h = 10 m/s');
+  sv.advance(1.0);
+  ok(Math.abs(sv.s - 10.0) < 1e-9, `advance(1.0) 走了 10 m（实得 ${sv.s}）`);
+  sv.advance(0.5);
+  ok(Math.abs(sv.s - 15.0) < 1e-9, `再 advance(0.5) 累计 15 m（实得 ${sv.s}）`);
+
+  const dense = new APP.RouteSimSource({});
+  const sparse = new APP.RouteSimSource({});
+  dense.set_route(route); sparse.set_route(route);
+  dense.set_speed_kmh(36.0); sparse.set_speed_kmh(36.0);
+  for (let i = 0; i < 10; i++) dense.advance(0.1);   // 10Hz × 1 秒
+  sparse.advance(1.0);                               // 一帧 1 秒
+  ok(Math.abs(dense.s - sparse.s) < 1e-9 && dense.s > 0,
+     `10 帧 × 0.1s 与 1 帧 × 1.0s 走出的距离相同（${dense.s.toFixed(6)} m）—— 速度与帧率无关`);
+
+  eq(sv.advance(0), sv.s, 'advance(0) 不动（不产生 NaN）');
+  sv.set_speed_kmh(0);
+  const s_zero = sv.s;
+  sv.advance(1.0);
+  ok(sv.speed_mps > 0 && sv.s > s_zero && Number.isFinite(sv.s),
+     '速度填 0 被夹到极小正值：车还会动一点点，不会看起来像"模拟行驶坏了"');
+
+  // 起点偏移（对应 PC 版 --start）
+  sv.set_speed_kmh(36.0);
+  sv.restart(0.5);
+  ok(Math.abs(sv.s - total * 0.5) < 1e-9, `restart(0.5) 从航线一半开始（${(sv.s / 1000).toFixed(2)} km）`);
+  sv.restart(0);
+  eq(sv.s, 0, 'restart(0) 回到起点');
+  sv.restart(1.0);
+  eq([sv.s, sv.arrived], [total, true], 'restart(1.0) 直接落在终点，并且已经算"已到终点"');
+
+  // --- 3) 接进 Navigator：10Hz 每一帧都推进，航向跟着路转弯 ----------------
+  const dev = new FakeDevice();
+  const { link } = await make_link(dev);
+  await link.connect();
+
+  const sim = new APP.RouteSimSource({});
+  sim.set_route(route);
+  sim.set_speed_kmh(36.0);                     // 10 m/s
+  sim.active = true;
+  // 放到第一个转弯前 40 m 处（转弯在 1391.5m），只跑这一小段
+  sim.restart((M1_S - 40.0) / total);
+
+  const sent = [];
+  const nav = new APP.Navigator(route, sim, {
+    send: (frame, kind, prio) => { sent.push(kind); return link.send(frame, kind, prio); },
+    onLog: () => {}, onUi: () => {},
+    config: { rate_hz: 10, no_map: true },
+  });
+  nav.set_ble(link);
+  // 室内没有 GPS 这件事在这里是**事实**：integration.mjs 里没有 geolocation，
+  // document 也是 undefined；整条链路只用到 RouteSimSource。
+  eq(nav.source, sim, 'Navigator 拿到的就是模拟行驶源（一个 GPS fix 都不需要）');
+
+  const changes = [];
+  let unwrapped = 0;
+  let prev_h = route.tangent_deg(sim.s);
+  let s_prev = sim.s;
+  let s_first = null;
+  let progress_prev = -1;
+  let dist_prev = Infinity;
+  let monotonic = true;
+  let used_in_seconds = 0;
+  for (let i = 0; i < 100; i++) {
+    const u = nav.cycle(0.1);
+    used_in_seconds += 0.1;
+    if (u === null) { monotonic = false; break; }
+    // s 单调不减 / 进度不减 / 剩余不增 / 航向每一帧都等于航线切线
+    if (!(sim.s >= s_prev)) monotonic = false;
+    if (!(u.progress_pct >= progress_prev)) monotonic = false;
+    if (!(u.dist_dest_m <= dist_prev)) monotonic = false;
+    if (Math.abs(NM.shortest_delta(u.heading_deg, route.tangent_deg(sim.s))) > 0.02) monotonic = false;
+    if (s_first === null) s_first = sim.s;
+    unwrapped += NM.shortest_delta(prev_h, u.heading_deg);
+    prev_h = u.heading_deg;
+    s_prev = sim.s;
+    progress_prev = u.progress_pct;
+    dist_prev = u.dist_dest_m;
+    changes.push(u.heading_deg);
+  }
+  const s_last = sim.s;
+  const expected_m = 10.0 * used_in_seconds;
+  ok(Math.abs((s_last - (M1_S - 40.0)) - expected_m) < 1e-6,
+     `10 秒 × 10 m/s 正好走了 ${expected_m.toFixed(0)} m（实得 ${(s_last - (M1_S - 40.0)).toFixed(3)} m，dt 用的是真实流逝时间）`);
+  ok(monotonic,
+     '每一帧：s 单调不减 / progress_pct 不减 / dist_dest_m 不增 / 航向与切线一致（误差 < 0.01°）');
+  ok(unwrapped > M1_DELTA * 0.8,
+     `过弯时航向真的转了（累计 ${unwrapped.toFixed(1)}°，转弯点标称 +${M1_DELTA.toFixed(1)}°）`);
+  ok(changes.length === 100, `100 个周期每个都算出了一帧 NAV_UPDATE（实得 ${changes.length}）`);
+  ok(Math.abs(NM.shortest_delta(changes[0], route.tangent_deg(s_first))) < 0.02 &&
+     Math.abs(NM.shortest_delta(changes[99], route.tangent_deg(s_last))) < 0.02,
+     `首尾航向分别等于起止点的航线切线（${changes[0].toFixed(1)}° -> ${changes[99].toFixed(1)}°）`);
+  eq(sent.filter((k) => k === 'update').length, 100, '100 个周期各下发了一帧 update');
+
+  // --- 4) 帧本身必须是良构的：设备侧解析器能原样解出来 --------------------
+  const drain_t0 = Date.now();
+  while (link._queue.length > 0 && Date.now() - drain_t0 < 8000) await sleep(20);
+  eq(link._queue.length, 0, `发送队列排空（耗时 ${Date.now() - drain_t0}ms）`);
+  eq(dev.parser.crc_errors, 0, '设备侧 CRC 零错误');
+  eq(dev.frames_of_type(P.MsgType.NAV_UPDATE).length, 100,
+     '设备侧恰好收到 100 帧 NAV_UPDATE（一帧不多、一帧不少）');
+  const last_parsed = P.NavUpdate.unpack(
+    dev.frames_of_type(P.MsgType.NAV_UPDATE)[99].payload);
+  eq([last_parsed.heading_cdeg, last_parsed.speed_kmh_x10, last_parsed.progress_pct],
+     [nav.last_update.heading_cdeg, nav.last_update.speed_kmh_x10, nav.last_update.progress_pct],
+     '解出来的帧与最后一帧 NAV_UPDATE 逐字段相同');
+  ok(last_parsed.speed_kmh_x10 === 360,
+     `速度栏就是配置的 36 km/h（speed_kmh_x10 = ${last_parsed.speed_kmh_x10}）`);
+  ok(Number.isFinite(last_parsed.heading_deg) && Number.isFinite(last_parsed.pos_east_m) &&
+     Number.isFinite(last_parsed.pos_north_m) && Number.isFinite(last_parsed.dist_dest_m),
+     '帧里没有任何 NaN 字段');
+  ok(last_parsed.flags & P.NavFlags.GPS_FIX && last_parsed.flags & P.NavFlags.LINK_UP,
+     '模拟行驶的帧照样带 GPS_FIX | LINK_UP（设备不会因为"没有真实定位"而拒画）');
+
+  // --- 5) 到终点：停住，不绕回起点、不产生 NaN ------------------------------
+  sim.restart(1.0);                             // 直接放到终点
+  const end0 = nav.cycle(0.1);
+  eq(sim.s, total, 's 正好停在 total_m 上（不越界）');
+  eq(sim.arrived, true, 'arrived = true');
+  eq(sim.fix(0)[3], 0, '到终点后速度报 0（车停了，速度栏和 ETA 不会自相矛盾）');
+  eq(end0.progress_pct, 100, 'progress_pct = 100');
+  eq(end0.dist_dest_m, 0, 'dist_dest_m = 0');
+  eq(end0.turn, P.Turn.ARRIVE, 'turn = ARRIVE');
+  ok(Number.isFinite(end0.heading_deg) && Number.isFinite(end0.dist_next_m) &&
+     Number.isFinite(end0.eta_min),
+     `终点这一帧没有 NaN（航向 ${end0.heading_deg}° / 距路口 ${end0.dist_next_m}m）`);
+
+  // 再跑 20 帧：位置一动不动，也**不会**绕回起点重来
+  let end_ok = true;
+  for (let i = 0; i < 20; i++) {
+    const u = nav.cycle(0.1);
+    if (u === null) { end_ok = false; break; }
+    if (!Number.isFinite(u.heading_deg) || !Number.isFinite(u.speed_kmh) ||
+        !Number.isFinite(u.dist_next_m)) end_ok = false;
+    if (u.speed_kmh !== 0 || u.dist_dest_m !== 0 || u.progress_pct !== 100) end_ok = false;
+  }
+  ok(end_ok, '到终点后再跑 20 帧：位置/速度/进度全部保持"停在终点"，没有 NaN');
+  eq([sim.s, sim.arrived], [total, true],
+     `20 帧之后 s 仍然恰好是 total_m（${sim.s}）—— 刻意不像 PC 版那样 s -= total_m 绕回起点`);
+  ok(!(sim.s > total), 's 从不越过终点（不会越界到第二圈）');
+
+  // 终点之后仍然每帧发 NAV_UPDATE：设备不会因为"没有新位置"而黑屏或断流
+  const before_frames = nav.frames_sent;
+  nav.cycle(0.1);
+  eq(nav.frames_sent, before_frames + 1, '停在终点时仍然每帧照发（设备端不黑屏）');
+
+  // --- 6) 真的挂上 10Hz 循环（setInterval）：速度按**真实流逝时间**算 ---------
+  // 前面几节都是手工喂 dt，这里验证"驱动它的是现有那条 ~10Hz 循环"这件事，
+  // 顺便钉住"不是固定每拍走一步"—— 那样掉帧时速度就会失真。
+  const sim3 = new APP.RouteSimSource({});
+  sim3.set_route(route);
+  sim3.set_speed_kmh(36.0);                     // 10 m/s
+  sim3.active = true;
+  const nav3 = new APP.Navigator(route, sim3, {
+    send: () => true, onLog: () => {}, onUi: () => {},
+    config: { rate_hz: 10, no_map: true },
+  });
+  const t_wall0 = Date.now();
+  const s_wall0 = sim3.s;
+  nav3.start();
+  await sleep(500);
+  nav3.stop();
+  const wall_s = (Date.now() - t_wall0) / 1000.0;
+  const walked = sim3.s - s_wall0;
+  ok(walked > 10.0 * wall_s * 0.5 && walked <= 10.0 * wall_s * 1.15,
+     `挂上真实 10Hz 循环：${wall_s.toFixed(2)} 秒走了 ${walked.toFixed(2)} m` +
+     `（= 10 m/s × 真正跑掉的 ${nav3.frames_sent} 拍；定时器采样粒度 0.1 秒，` +
+     `所以这是个量级校验 —— "与帧率无关"由上面那条确定性的用例钉住）`);
+  ok(nav3.frames_sent > 0, `循环期间照常发帧（${nav3.frames_sent} 帧）`);
+  eq(nav3.running, false, 'stop() 之后循环真的停了');
+}
+
+// ---------------------------------------------------------------------------
 console.log('\n' + '='.repeat(62));
 if (failures.length === 0) {
   console.log(`  手机端集成自测通过：${passed} 项全部通过`);
