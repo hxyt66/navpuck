@@ -249,9 +249,9 @@ section('1] index.html 自身的完整性');
   //    新增的独立模块，顺序上必须在 ble.js / app.js 之前。
   //    —— 改这里不是因为代码错了，而是因为这条契约本身就是"当前文件清单"。
   eq(SCRIPT_SRCS,
-     ['navmath.js', 'proto.js', 'route.js', 'map.js',
+     ['crashlog.js', 'navmath.js', 'proto.js', 'route.js', 'map.js',
       'ble_native.js', 'ble.js', 'fgs.js', 'fgs_ui.js', 'app.js'],
-     'script 加载顺序与依赖顺序一致（navmath -> proto -> route -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
+     'script 加载顺序与依赖顺序一致（crashlog -> navmath -> proto -> route -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
 
   // 重复 id 会让 getElementById 静默取到第一个，是"界面上有个元素永远不更新"的经典原因
   const seen = new Map();
@@ -1575,6 +1575,271 @@ section('11.7] 原生扫描失败：三类失败在界面上必须分得开（+�
     delete globalThis.NavPuckBleNative;
     delete globalThis.Capacitor;
   }
+}
+
+// ---------------------------------------------------------------------------
+section('11.9] 崩溃捕获：闪退之后"上一轮走到哪一步"必须留得下、读得回、看得见');
+// ---------------------------------------------------------------------------
+//
+// 这一节钉的是 phone/crashlog.js —— 现场反馈只有一句"连接板子后规划导航直接会
+// 闪退"，而闪退 = 进程没了：页面上那块 #log 一个字都留不下。所以唯一的线索就是
+// **危险操作之前同步写进 localStorage 的那几十行**。
+//
+// 这里能测的（不需要真机）：
+//   1. 关键操作前 marker() 是**同步落盘**的（崩在下一行也已经写下去了）；
+//   2. 上一轮没正常结束 => 报告里必须含崩前那几行；渲染到 #crash-block；
+//   3. 上一轮正常结束 => **不报**（否则每次打开都喊"上次异常"，用户会当噪声）；
+//   4. onerror / unhandledrejection 被记录（且**不吞**：不该返回值/不
+//      preventDefault，错误照旧冒到控制台）；
+//   5. 环形缓冲有上限（不让 localStorage 无限长）；
+//   6. App.log() 真的把日志喂进来了（否则报告里只有 crashlog 自己的两行）；
+//   7. PWA 里 fgs.note()/crash_report() 返回中性值，一个异常都不抛。
+{
+  const CL = require(path.join(PHONE_DIR, 'crashlog.js'));
+
+  function mk_store() {
+    const m = new Map();
+    return {
+      _m: m,
+      getItem: (k) => (m.has(k) ? m.get(k) : null),
+      setItem: (k, v) => { m.set(k, String(v)); },
+      removeItem: (k) => { m.delete(k); },
+    };
+  }
+  /** 造一个"够 crashlog 用"的 window（不碰全局，避免污染其它节）。 */
+  function mk_win(store) {
+    const added = {};
+    return {
+      _added: added,
+      localStorage: store,
+      navigator: { userAgent: 'ui.mjs-test' },
+      onerror: null,
+      onunhandledrejection: null,
+      addEventListener(ev, cb) { added[ev] = cb; },
+      document: {
+        readyState: 'complete',
+        visibilityState: 'visible',
+        getElementById: (id) => BY_ID.get(id) || null,
+        addEventListener() {},
+      },
+    };
+  }
+
+  const store = mk_store();
+  const w1 = mk_win(store);
+  const c1 = CL.create({ window: w1, storage: store });
+  c1.install();
+
+  ok(!!store.getItem(CL.KEY), '开新会话时立刻落盘（进程随时可能死，不能等退出才写）');
+  eq(c1.status().prev_abnormal, false, '第一次启动：没有上一轮 => 不报异常');
+  eq(c1.report_text(), null, '第一次启动：report_text() 是 null（不编造报告）');
+  eq(BY_ID.get('crash-block').hidden !== false, true, '第一块崩溃报告面板是收起的');
+
+  // 崩前的那几笔：一行普通日志 + 两笔关键操作前的 marker
+  c1.note('app', '普通日志一行');
+  c1.marker('nav_start_begin', 'window_pts=1001 mtu=517 chunk=514');
+  c1.marker('first_write', 'frame=1034B 片=514B hex=1028字符');
+  const persisted = store.getItem(CL.KEY);
+  ok(/nav_start_begin/.test(persisted), 'marker() 里的字**当场**就在 localStorage 里（同步落盘）');
+  ok(/first_write/.test(persisted), '第二笔 marker 也在（不是攒着等定时器）');
+
+  // ── 模拟"进程被杀"：不调 end_clean，直接用同一份 storage 再开一轮 ────────
+  const w2 = mk_win(store);
+  const c2 = CL.create({ window: w2, storage: store });
+  c2.install();
+  const rep = c2.report_text();
+  ok(!!rep, '上一轮没有正常结束 => 生成"上次异常结束"报告');
+  ok(/没有\*\*正常结束|没有正常结束/.test(rep), '报告里明说"上一轮没有正常结束"');
+  ok(/first_write/.test(rep) && /window_pts=1001/.test(rep),
+     '报告里带着崩前最后那几行（含第一次写入的尺寸）');
+  ok(/frame=1034B/.test(rep), '报告里的行是**原样**的日志，不是转述');
+  ok(!/普通日志一行/.test(rep) === false || /普通日志一行/.test(rep),
+     '普通日志行也在报告里（App.log 的被喂进来了）');
+
+  await c2.render();
+  eq(BY_ID.get('crash-block').hidden, false, '报告真的被显示出来（#crash-block 取消隐藏）');
+  ok(/first_write/.test(BY_ID.get('crash-report').textContent),
+     '#crash-report 里就是那份报告原文（用户截图/复制用的就是它）');
+  ok(/截图|复制|发/.test(BY_ID.get('crash-hint').textContent), '#crash-hint 告诉用户"把它发出来"');
+
+  // 用户按"我已记录，清掉这块"
+  c2.clear();
+  eq(c2.report_text(), null, 'clear() 之后不再报同一场崩溃');
+  eq(BY_ID.get('crash-block').hidden, true, 'clear() 把面板也收起来');
+
+  // ── 环形缓冲上限：不让 localStorage 无限长 ─────────────────────────────
+  const store_big = mk_store();
+  const cbig = CL.create({ window: mk_win(store_big), storage: store_big });
+  cbig.install();
+  for (let i = 0; i < CL.MAX_LINES + 50; i++) cbig.note('app', `第 ${i} 行`);
+  eq(cbig.snapshot().lines.length, CL.MAX_LINES,
+     `行数被夹在 ${CL.MAX_LINES} 行（滚动缓冲，不是无限增长）`);
+  ok(/第 \d+ 行/.test(cbig.snapshot().lines[CL.MAX_LINES - 1][1]),
+     '保留的是**最后**那些行（崩前最近的现场）');
+  // ⚠️ note() 是**节流**落盘的（最多 1 秒一次，localStorage 是同步 IO）：
+  //    所以上面那一串 note 之后，盘上那份还不是最新的 —— 这正是设计。
+  cbig.flush_now();
+  ok(JSON.parse(store_big.getItem(CL.KEY)).lines.length === CL.MAX_LINES,
+     '显式落盘之后，盘上那份也同样是夹住的');
+
+  // ── 正常结束 => 不报异常 ───────────────────────────────────────────────
+  const store_clean = mk_store();
+  const cc1 = CL.create({ window: mk_win(store_clean), storage: store_clean });
+  cc1.install();
+  cc1.note('app', '一切正常');
+  cc1.end_clean('pagehide');
+  ok(JSON.parse(store_clean.getItem(CL.KEY)).ended_clean === true,
+     'end_clean() 把"正常结束"写进落盘状态');
+  const cc2 = CL.create({ window: mk_win(store_clean), storage: store_clean });
+  cc2.install();
+  eq(cc2.report_text(), null, '上一轮正常结束 => **不报**异常（避免每次都喊狼来了）');
+
+  // ── 未捕获错误：记录，但**不吞** ───────────────────────────────────────
+  const store_err = mk_store();
+  const w_err = mk_win(store_err);
+  const c_err = CL.create({ window: w_err, storage: store_err });
+  c_err.install();
+  ok(typeof w_err.onerror === 'function', 'window.onerror 被装上（不再让错误无声无息）');
+  ok(typeof w_err.onunhandledrejection === 'function', 'window.onunhandledrejection 被装上');
+  const ret = w_err.onerror('TypeError: x is not a function', 'app.js', 123, 4,
+                            new Error('TypeError: x is not a function'));
+  ok(ret === false || ret === undefined,
+     'onerror 的返回值**不是 true**（记录，但不 preventDefault —— 错误该冒还冒）');
+  ok(/TypeError/.test(store_err.getItem(CL.KEY)), '错误内容立刻落盘（下一次可能没机会）');
+  ok(/app\.js:123:4/.test(store_err.getItem(CL.KEY)), '错误位置（文件:行:列）也在里面');
+  w_err.onunhandledrejection({ reason: new Error('未处理的拒绝') });
+  ok(/未处理的拒绝/.test(store_err.getItem(CL.KEY)), 'unhandledrejection 也被记下来');
+
+  // ── 没有 localStorage 也不能炸（file:// / 隐私模式）────────────────────
+  const w_nostore = {
+    navigator: {}, onerror: null,
+    document: { readyState: 'complete', getElementById: () => null, addEventListener() {} },
+  };
+  Object.defineProperty(w_nostore, 'localStorage', {
+    get() { throw new Error('SecurityError: 访问被拒'); },
+  });
+  let threw = false;
+  try {
+    const c_ns = CL.create({ window: w_nostore });
+    c_ns.install();
+    c_ns.note('app', '一行');
+    c_ns.marker('x', 'y');
+  } catch (e) { threw = true; }
+  eq(threw, false, '拿不到 localStorage 时退化成内存缓冲，**一个异常都不抛**');
+
+  // ── App.log() 真的喂进来了（否则报告里只有 crashlog 自己的两行）───────
+  {
+    const store_app = mk_store();
+    const C = CL.create({ window: mk_win(store_app), storage: store_app });
+    C.install();
+    const saved = globalThis.NavPuckCrash;
+    globalThis.NavPuckCrash = C;
+    try {
+      const A = new APP.App();
+      A.log('这一行必须进崩溃黑匣子');
+      C.flush_now();   // 普通日志是节流落盘的（见上面那条），这里显式刷一次
+      ok(/这一行必须进崩溃黑匣子/.test(store_app.getItem(CL.KEY)),
+         'App.log() 的每一行都进了崩溃黑匣子（闪退时 #log 里的东西不会白丢）');
+      A.crash_marker('unit_test', 'marker-from-app');
+      ok(/marker-from-app/.test(store_app.getItem(CL.KEY)),
+         'App.crash_marker() 同步落盘（危险操作前的最后一句话）');
+    } finally {
+      if (saved === undefined) delete globalThis.NavPuckCrash;
+      else globalThis.NavPuckCrash = saved;
+    }
+  }
+
+  // ── PWA 里 fgs 的崩溃接口必须是中性的（不抛错、不假装有原生）────────────
+  {
+    const FGS = require(path.join(PHONE_DIR, 'fgs.js'));
+    const f = new FGS.ForegroundService({ window: { Capacitor: null } });
+    eq(f.note('x', 'y'), false, 'PWA 里 fgs.note() 返回 false（没有原生可写）');
+    const r = await f.crash_report();
+    eq(r.available, false, 'PWA 里 fgs.crash_report() 返回 {available:false}');
+    const rc = await f.clear_crash_report();
+    eq(rc.available, false, 'PWA 里 fgs.clear_crash_report() 同样');
+  }
+
+  // ── index.html 里那三个 id 必须真的存在（否则报告无处可显示）──────────
+  for (const id of ['crash-block', 'crash-report', 'crash-hint', 'crash-clear']) {
+    ok(HTML_IDS.has(id), `index.html 里有 #${id}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 11.95] ⭐ BLE 分片面板：真机闪退修复后的那个旋钮（必须真的能拧、且记得住）
+// ---------------------------------------------------------------------------
+//
+// 现场：Redmi / Android 16，getMtu() 报 517，旧代码按 MTU-3 发 **514** 字节，
+// 进程当场死掉（BluetoothGatt.writeCharacteristic 里 value.length > 512 就抛，
+// 异常同步抛在插件线程上，JS 接不住）。所以：
+//   · 界面上必须**看得见**当前分片（不然用户没有任何判断依据）；
+//   · 必须能**调**（上限 / 锁定 / 清空学习记录），因为"多大才安全"最后只有
+//     真机能回答；
+//   · 面板里必须写清楚**代价**（20 字节/片时一条路线窗口要几百次写），
+//     否则用户会把"慢"当成新 bug。
+{
+  // ⚠️ 这一套自测（ui.mjs）跑的是 **PWA 形状**的环境：它从来不注册
+  //    NavPuckBleNative（原生传输在 PWA 里就是不存在）。但分片面板在 PWA 里
+  //    也要能显示/能存，所以这里按 index.html 的真实顺序把它挂上再测。
+  globalThis.NavPuckBleNative = require(path.join(PHONE_DIR, 'ble_native.js'));
+
+  // 面板与控件必须真的在 index.html 里（否则 bind 不到、读数无处显示）
+  for (const id of ['chunk-block', 'chunk-info', 'chunk-detail', 'opt-chunk-auto',
+                    'opt-chunk-ceiling', 'chunk-reset']) {
+    ok(HTML_IDS.has(id), `index.html 里有 #${id}`);
+  }
+  const sel = ELEMENTS.find((e) => e.id === 'opt-chunk-ceiling') || {};
+  eq(sel.tag, 'select', '#opt-chunk-ceiling 是 <select>（上限只能从阶梯里挑）');
+  const opts = [...HTML.matchAll(/<select id="opt-chunk-ceiling">([\s\S]*?)<\/select>/g)][0][1];
+  const vals = [...opts.matchAll(/value="(\d+)"/g)].map((m) => m[1]);
+  eq(vals, ['20', '64', '128', '185', '244', '512'],
+     '上限选项就是升档阶梯（含 512 = 框架硬上限、20 = 规范默认）');
+  ok(/value="512" selected/.test(opts), '默认选中 512（= 可证明的硬上限，不是 514）');
+
+  // 面板正文必须把"代价"和"为什么默认是 20"说清楚（这是 UI 的一部分，不是文档）
+  ok(/512/.test(HTML) && /BluetoothGatt\.writeCharacteristic|框架/.test(HTML),
+     '面板里写明 512 是框架硬常量（用户能自己对照）');
+  ok(/70 片/.test(HTML) && /285 片/.test(HTML),
+     '面板里写明了 20 字节/片的代价（多少片：底图 70 片、整轮 285 片）');
+  ok(/无法被 JS 接住|接不住/.test(HTML), '面板里写明"分片太大会闪退、且 JS 接不住"');
+
+  // 真的拧一下：新造一个 App（共享 DOM），走 init()，然后动控件
+  const A3 = new APP.App();
+  A3.init();
+  ok(!!A3.chunk_policy, 'App.init() 建好了分片策略（NavPuckBleNative 已加载）');
+  const st0 = A3.chunk_policy.snapshot();
+  eq(st0.learned, 20, 'PWA/新装：起步就是 20 字节');
+  eq(st0.auto, true, '默认自动升档（推荐路径）');
+
+  const ceiling_el = BY_ID.get('opt-chunk-ceiling');
+  const auto_el = BY_ID.get('opt-chunk-auto');
+  ceiling_el.value = '244';
+  ceiling_el.fire('change');
+  eq(A3.chunk_policy.snapshot().ceiling, 244, '把上限拧到 244 => 策略上限 = 244');
+  const stored = globalThis.localStorage.getItem('navpuck.ble.chunk.v1');
+  ok(/"ceiling":244/.test(stored), '上限**当场落盘**（下次打开还是它）');
+  ok(/244/.test(BY_ID.get('chunk-detail').textContent),
+     `详情那一行跟着更新：${BY_ID.get('chunk-detail').textContent.slice(0, 60)}…`);
+
+  auto_el.checked = false;
+  auto_el.fire('change');
+  eq(A3.chunk_policy.snapshot().auto, false, '关掉"自动升档" => 锁在所选上限内');
+  eq(A3.chunk_policy.size(null), 20, '锁定也照样被 MTU 未知这条夹到 20（不会拿去乱写）');
+  eq(A3.chunk_policy.size(517), 244, '锁定 + MTU 517 => 就用 244（用户自己选的那一档）');
+
+  BY_ID.get('chunk-reset').fire('click');
+  const st2 = A3.chunk_policy.snapshot();
+  eq(st2.learned, 20, '"清空分片学习记录" => 回到 20 起步');
+  eq(st2.ceiling, 512, '清空也会把上限复位（否则用户以为清了其实没清）');
+
+  // 当前分片必须能一眼看到（状态面板那一格）
+  A3.update_chunk_ui();
+  ok(/B$/.test(BY_ID.get('chunk-info').textContent.trim()),
+     `状态面板"分片"那一格显示当前值：${BY_ID.get('chunk-info').textContent}`);
+
+  // PWA 里不会崩：没有 transport 也要画得出来（这一格不能是空白）
+  eq(BY_ID.get('chunk-detail').textContent.length > 0, true, '详情行永远有内容（PWA 里说明走哪条路）');
 }
 
 // ---------------------------------------------------------------------------

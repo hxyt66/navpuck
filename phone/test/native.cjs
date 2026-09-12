@@ -134,7 +134,9 @@ class FakePlugin {
     this.calls = [];              // 方法调用流水（含参数）
     this.writes = [];             // 每次写出去的字节（按序拼接就是设备看到的流）
     this.write_sizes = [];        // 每个分片的长度
-    this.notify_cb = null;        // 上行通知回调
+    this.listeners = {};          // 事件名 -> 回调（按名字存，见 addListener）
+    this.listener_names = [];     // 订阅过的事件名（顺序）
+    this.notify_cb = null;        // 上行通知回调（兼容旧用例）
     this.scan_cb = null;          // onScanResult 回调
     this.disc_cb = null;          // 断开回调
     this.notifications_started = false;
@@ -213,10 +215,17 @@ class FakePlugin {
 
   async addListener(event, cb) {
     this._rec('addListener', event);
+    // ⚠️ 事件名按**真插件**的方式存：真插件推事件时用的名字是拼出来的 key
+    //    （notification|<deviceId>|<service>|<characteristic>），不是固定名。
+    //    桩以前"任何名字都塞进同一个槽"，于是"订阅错了名字"这件事在自测里
+    //    永远看不出来 —— 而那正是真机上"手机写进去了、设备却像哑巴"的根因。
+    //    现在按名字存，emit() 也按 key 推（见 emit / emit_hex）。
+    this.listeners[event] = cb;
     if (event === 'onDisconnected') this.disc_cb = cb;
     else if (event === 'onScanResult') this.scan_cb = cb;
     else this.notify_cb = cb;
-    return { remove: async () => { this._rec('removeListener', event); } };
+    this.listener_names.push(event);
+    return { remove: async () => { this._rec('removeListener', event); delete this.listeners[event]; } };
   }
 
   async connect(args) {
@@ -306,11 +315,45 @@ class FakePlugin {
     return out;
   }
 
-  /** 把一段上行字节推给页面（等价于设备的 TX 通知）。 */
+  /**
+   * 真插件推通知时用的事件名（BluetoothLe.kt:768 拼出来的那个 key）。
+   *
+   * ⚠️ 这不是"随便挑一个名字"：它必须和 ble_native.js 订阅的名字逐字相同，
+   *    否则这条用例测的就不是真机行为。
+   */
+  get notify_key() {
+    return `notification|AA:BB:CC:DD:EE:FF|${NUS_SERVICE}|${NUS_TX}`;
+  }
+
+  /**
+   * 把一段上行字节推给页面（等价于设备的 TX 通知）。
+   *
+   * ⚠️ 默认走**真事件名**（notify_key）：订阅错名字时这条会推给 null，
+   *    用例立刻红 —— 这正是要钉住的契约。
+   * 值的形式是 **DataView**（老传法）；真插件 8.3.0 发的是大写十六进制
+   * 字符串，见 emit_hex。
+   */
   emit(bytes) {
     const u8 = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
-    if (!this.notify_cb) throw new Error('测试自己写错了：还没订阅通知');
-    this.notify_cb({ value: new DataView(u8.buffer, u8.byteOffset, u8.byteLength) });
+    const cb = this.listeners[this.notify_key] || this.notify_cb;
+    if (!cb) throw new Error('测试自己写错了：还没订阅通知');
+    cb({ value: new DataView(u8.buffer, u8.byteOffset, u8.byteLength) });
+  }
+
+  /**
+   * 按**真插件 8.3.0 的真实编码**推一条通知：值是**大写十六进制字符串**
+   * （Device.kt 的 onCharacteristicChanged -> bytesToString -> Conversion.kt:4-22
+   * 的 HEX_LOOKUP_TABLE）。
+   *
+   * 用这个而不是 emit()，才测得到"字符串怎么解码"这一步（老代码在这里把
+   * "A55A…" 当成字符数组，字节全错 —— 设备上行整条链路静默失效）。
+   */
+  emit_hex(bytes, name) {
+    const u8 = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+    const hex = Buffer.from(u8).toString('hex').toUpperCase();
+    const cb = this.listeners[name || this.notify_key] || this.notify_cb;
+    if (!cb) throw new Error('测试自己写错了：还没订阅通知');
+    cb({ value: hex });
   }
 
   /** 设备侧主动断开。 */
@@ -345,6 +388,46 @@ function mk_transport(plugin, extra) {
   return new NATIVE.NativeTransport(Object.assign({
     window: fake_window(plugin), onLog: () => {}, scan_window_ms: 0,
   }, extra || {}));
+}
+
+/**
+ * 只在内存里的 localStorage 桩。分片策略（和它跨启动的记忆）都要过它。
+ */
+function fake_storage(seed) {
+  const m = Object.assign({}, seed || {});
+  return {
+    getItem: (k) => (Object.prototype.hasOwnProperty.call(m, k) ? m[k] : null),
+    setItem: (k, v) => { m[k] = String(v); },
+    removeItem: (k) => { delete m[k]; },
+    _dump: () => Object.assign({}, m),
+  };
+}
+
+/**
+ * 造一个"已经学到 size 字节"的策略（跳过升档过程，用来测稳态/降档）。
+ * ⚠️ 只用于测试：生产里这个值是靠一帧一帧的成功攒出来的。
+ */
+function policy_at(size, extra) {
+  const store = fake_storage();
+  store.setItem(NATIVE.CHUNK_STORE_KEY, JSON.stringify(Object.assign({
+    v: 1, auto: true, ceiling: 512, learned: size, trial: null, ok: 0, armed: null, bad: [],
+  }, extra || {})));
+  return { policy: NATIVE.create_chunk_policy({ storage: store, window: null }), store };
+}
+
+/**
+ * 按 app.js 的接法把"分片大小变化"同步给 ble.js。
+ *
+ * ⚠️ 这一步是**必须**的（app.js 的 on_chunk_size_changed 就是它）：ble.js 只在
+ *    connect 时读一次 transport.chunk_size_hint，之后自己维护 chunk_size；
+ *    不把新值同步回去，自适应升档就永远不会被用上（原生只会写
+ *    min(ble 认为的大小, 策略允许的大小)）。
+ */
+function wire_chunk_sync(t, link) {
+  t.onChunkSize = (size) => {
+    if (link.chunk_size !== size) { link.chunk_size = size; link._chunk_known = false; }
+  };
+  return t;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,9 +471,9 @@ section('1] 环境探测：什么时候算"有原生 BLE"');
 }
 
 // ---------------------------------------------------------------------------
-// 2] 连接顺序 + MTU 决定分片
+// 2] 连接顺序 + 分片上界
 // ---------------------------------------------------------------------------
-section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth 那套试 512');
+section('2] 连接流程与分片：上界 = min(MTU-3, 512)，起步还要更保守（20）');
 {
   const plugin = new FakePlugin({ mtu: 247 });
   const win = fake_window(plugin);
@@ -400,7 +483,11 @@ section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth
   ok(t.connected, '连接后 connected = true');
   eq(t.device_name, 'NavPuck-A1B2', '设备名从插件读出来');
   eq(t.transport_mtu, 247, 'MTU 读到了 247');
-  eq(t.chunk_size_hint, 244, '分片大小 = MTU - 3 = 244（不是 512）');
+  // ⚠️ 旧版这里断言的是 244（= MTU-3），而真机（MTU 517）上 MTU-3 = 514 > 512
+  //    直接把进程写死。现在上限是 min(MTU-3, 512)，且**起步**从规范默认载荷
+  //    20 字节开始，只在一档被连续成功确认之后才往上走（见第 14 节）。
+  eq(t.chunk_size_hint, 20, '起步分片 = 20 字节（规范默认载荷），不是 244');
+  eq(NATIVE.safe_chunk_max(247), 244, 'safe_chunk_max(247) = MTU-3 = 244');
   ok(plugin.notifications_started, 'TX 通知已订阅');
 
   // 调用顺序：initialize 必须最先，startNotifications 最后
@@ -435,10 +522,11 @@ section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth
 // ---------------------------------------------------------------------------
 // 3] 分片写：1.4KB 底图在 MTU 247 下应该是 6 片而不是 78 片
 // ---------------------------------------------------------------------------
-section('3] 分片写：按 MTU 分片，字节序与设备看到的完全一致');
+section('3] 分片写：按已确认的分片切，字节序与设备看到的完全一致');
 {
   const plugin = new FakePlugin({ mtu: 247 });
-  const t = mk_transport(plugin);
+  // 稳态：这一档已经被确认过（生产里是自适应升档爬上去的，见第 14 节）
+  const t = mk_transport(plugin, { chunk_policy: policy_at(244).policy });
   await t.connect();
 
   // 造一个 1400 字节的载荷（真实 NAV_MAP 的量级）
@@ -474,14 +562,17 @@ section('3] 分片写：按 MTU 分片，字节序与设备看到的完全一致
 // ---------------------------------------------------------------------------
 // 4] MTU 拿不到时的退路
 // ---------------------------------------------------------------------------
-section('4] MTU 协商失败：不能因此连不上，要退到试探分片');
+section('4] MTU 协商失败：不能因此连不上，但要退到**规范默认**分片（不是猜大）');
 {
   const plugin = new FakePlugin({ mtu_throws: true });
   const t = mk_transport(plugin);
   await t.connect();
   ok(t.connected, 'MTU 拿不到也照样连上（正确性不依赖 MTU）');
   eq(t.transport_mtu, null, 'MTU 记为 null');
-  eq(t.chunk_size_hint, 512, '分片维持乐观值 512，交给 ble.js 的降档逻辑兜底');
+  // 拿不到 MTU 就没有任何证据说明链路承载得了长写；而"猜大了"的代价是进程
+  // 死亡（异常同步抛在插件线程上，JS 接不住）。所以只认 ATT 默认载荷 20。
+  eq(t.chunk_size_hint, 20, 'MTU 未知 ⇒ 分片退回规范默认 20 字节（不猜 512）');
+  eq(NATIVE.safe_chunk_max(null), 20, 'safe_chunk_max(null) = 20');
 }
 
 // ---------------------------------------------------------------------------
@@ -536,15 +627,16 @@ section('5] 上行：原生通知与 Web Bluetooth 走同一个 FrameParser');
 // ---------------------------------------------------------------------------
 section('6] 写失败：整帧作废 + 降档重试（与 Web 路径同一策略）');
 {
-  // 设备单次最多接受 64 字节 —— 244 的分片会被拒
+  // 设备单次最多接受 64 字节 —— 244 的分片会被拒（降档阶梯因此有意义）
   const plugin = new FakePlugin({ mtu: 247, fail_writes_above: 64 });
-  const t = mk_transport(plugin);
+  const t = mk_transport(plugin, { chunk_policy: policy_at(244).policy });
   const logs = [];
   t.log = (l) => logs.push(l);
   const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
+  wire_chunk_sync(t, link);
   await link.connect();
 
-  eq(link.chunk_size, 244, '起步用 MTU-3 = 244');
+  eq(link.chunk_size, 244, '起步用已确认的分片 244（= MTU-3）');
 
   const payload = new Uint8Array(300);
   // 直接用内部写路径：send() 要排队 + 异步 drain，这里要看的是降档过程本身
@@ -922,9 +1014,11 @@ section('11b] 写载荷契约：整帧 NAV_UPDATE 必须以十六进制字符串
 {
   // ── 11b-1) 整帧 NAV_UPDATE（现场那条"到不了设备"的帧）────────────────
   const plugin = new FakePlugin({ mtu: 247 });
-  const t = mk_transport(plugin);
+  // 稳态（244 已被确认）：这样这个小帧就是**一片**写完，断言才看得到完整的十六进制串
+  const t = mk_transport(plugin, { chunk_policy: policy_at(244).policy });
   const logs = [];
   const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
+  wire_chunk_sync(t, link);
   await link.connect();
 
   const update = new proto.NavUpdate({
@@ -971,64 +1065,553 @@ section('11b] 写载荷契约：整帧 NAV_UPDATE 必须以十六进制字符串
   eq(NATIVE._u8_to_hex_string(Uint8Array.from([0x00, 0x05, 0xab, 0xff])), '0005ABFF',
      '每字节固定两位（0x05 -> "05"）：少一位会让 native 侧整串错位且不报错');
 
-  // ── 11b-2) 分片必须按 MTU-3 走，而且第一片就成 ──────────────────────────
-  // 现场那台设备谈成的是 MTU 517 -> 514 字节/片。1.4KB 底图应该 3 片，
-  // 而不是 20 字节的 70 片（那正是"降档阶梯一路走到黑"的样子）。
+  // ── 11b-2) 真机那台（MTU 517）的稳态：每片 <= min(MTU-3, 512) = 512 ──────
+  // ⚠️⚠️ 旧版这里断言的是 **514**（= MTU-3）。那正是**闪退的长度**：
+  //    Android 框架 BluetoothGatt.writeCharacteristic() 里写死了
+  //    `if (value.length > 512) throw new IllegalArgumentException(
+  //        "value should not be longer than max length of an attribute value")`
+  //    （证据 = 这台手机 framework-bluetooth.jar 的字节码，见 ble_native.js 的
+  //    MAX_ATTR_VALUE 注释），而且异常是**同步抛在插件线程上**，Capacitor 不把它
+  //    变成 rejected promise ⇒ JS 接不住 ⇒ 进程消失。
+  //    现在上界是 min(MTU-3, 512)，514 这个值**永远发不出去**。
   const plugin2 = new FakePlugin({ mtu: 517 });
-  const t2 = mk_transport(plugin2);
+  const t2 = mk_transport(plugin2, { chunk_policy: policy_at(512).policy });
   const logs2 = [];
   const link2 = new BLE.BleLink({ transport: t2, onLog: (l) => logs2.push(l), onFrame: () => {} });
+  wire_chunk_sync(t2, link2);
   await link2.connect();
 
   eq(t2.transport_mtu, 517, 'MTU 路径仍然被使用：协商到 517');
-  eq(link2.chunk_size, 514, 'ble.js 起步分片 = MTU-3 = 514（不是 PWA 那个 512）');
+  eq(link2.chunk_size, 512, 'ble.js 起步分片 = min(MTU-3=514, 512) = 512（**不是** 514）');
 
   const map = new Uint8Array(1400);
   for (let i = 0; i < map.length; i++) map[i] = (i * 7) & 0xff;
   ok(await link2._write_frame(map), '1400 字节的帧一次写成功');
-  eq(plugin2.write_sizes, [514, 514, 372],
-     '1400 = 514 + 514 + 372（3 个写操作；旧代码在这里会降到 20 字节 = 70 片）');
+  eq(plugin2.write_sizes, [512, 512, 376],
+     '1400 = 512 + 512 + 376（3 个写操作；旧代码在这里发的是 514 = 崩）');
   eq(link2.downgrades, 0, '**一次都没降档**（第一片就成 —— 这才是 MTU 路径的意义）');
   eq(link2.write_failures, 0, '写失败次数 = 0');
-  eq(link2.chunk_size, 514, '分片大小保持 514');
+  eq(link2.chunk_size, 512, '分片大小保持 512');
   let same2 = true;
   for (let i = 0; i < map.length; i++) if (plugin2.writes[i] !== map[i]) same2 = false;
   eq(plugin2.writes.length, 1400, '写出去的字节总数 = 帧长度');
   ok(same2, '3 片拼起来的字节流与原始帧逐字节相同');
-  ok(!logs2.some((l) => /写失败|降到|程序错误/.test(l)),
-     '日志里没有"写失败/降到/程序错误"（真机上不该再刷那条误导性的降档阶梯）');
+  ok(!logs2.some((l) => /写失败|降到/.test(l)),
+     '日志里没有"写失败/降到"（真机上不该再刷那条误导性的降档阶梯）');
 
-  // 有些平台/老插件没有 writeWithoutResponse：退路必须是 write()，且载荷同一套契约
+  // ⭐ 回归钉：上游就算**点名要 514**（旧代码算出来的那个数），也只会发 512。
+  //    这一条是"再也不能因为分片太大而闪退"的最小充分条件。
+  const before = plugin2.write_sizes.length;
+  await t2.write_frame(map, 514);
+  const forced = plugin2.write_sizes.slice(before);
+  eq(Math.max.apply(null, forced), 512,
+     '上游要求 514 字节时，实际发出去的最大一片仍然是 512（框架硬上限）');
+  ok(forced.every((n) => n <= NATIVE.MAX_ATTR_VALUE),
+     '所有分片 <= MAX_ATTR_VALUE(512)：这一条一旦破，真机就是**不可捕获的闪退**');
+
+  // 有的平台/老插件没有 writeWithoutResponse：退路必须是 write()，且载荷同一套契约
   const plugin3 = new FakePlugin({ mtu: 247 });
   plugin3.writeWithoutResponse = undefined;      // 遮住原型上的，模拟老插件
-  const t3 = mk_transport(plugin3);
+  const t3 = mk_transport(plugin3, { chunk_policy: policy_at(244).policy });
   const link3 = new BLE.BleLink({ transport: t3, onLog: () => {}, onFrame: () => {} });
+  wire_chunk_sync(t3, link3);
   await link3.connect();
   ok(await link3._write_frame(frame), '没有 writeWithoutResponse 时退回 write() 也能写成');
   eq(plugin3.at('write') >= 0, true, 'write() 真的被调用了');
   eq(Buffer.from(plugin3.writes).toString('hex'), Buffer.from(frame).toString('hex'),
      '退路下字节一样完整（两条路共用同一个编码契约）');
 
-  // ── 11b-3) 首片就失败 = 程序错误，日志必须这么说 ─────────────────────────
-  // 降档阶梯本身要保留（小分片也可能因为外设接收环满而失败），但不能让它
-  // 读起来像"每个 MTU 都连不通"。首片（= 协商 MTU-3）第一次就被拒，
-  // 物理上说不通，那是代码/契约问题，必须被点名。
+  // ── 11b-3) 首片失败：日志要说清**是哪一类**失败，别把人引错方向 ──────────
+  // 旧版一口咬定"首片被拒 = 程序错误（字段名/编码不对）"——那是在超长写**同步
+  // 抛异常杀进程**的年代（根本走不到 catch）。现在长度被 min(MTU-3, 512) 夹住了，
+  // 能走到 catch 的失败在长度上是合法的，更像链路/外设侧的问题。
   const plugin4 = new FakePlugin({ mtu: 247, fail_writes_above: 16 });
-  const t4 = mk_transport(plugin4);
+  const t4 = mk_transport(plugin4, { chunk_policy: policy_at(244).policy });
   const logs4 = [];
   t4.log = (l) => logs4.push(l);
   const link4 = new BLE.BleLink({ transport: t4, onLog: (l) => logs4.push(l), onFrame: () => {} });
+  wire_chunk_sync(t4, link4);
   await link4.connect();
   const ok4 = await link4._write_frame(new Uint8Array(300));
   ok(!ok4, '一直失败到底时 _write_frame 返回 false（行为与降档前一模一样）');
-  ok(logs4.some((l) => /程序错误/.test(l)),
-     '首片（244 = MTU-3）失败被明确说成**程序错误**，不是链路问题');
-  eq(logs4.filter((l) => /程序错误/.test(l)).length, 1,
-     '"程序错误"只解释一次（APK 里每秒发帧，不能刷屏把现场信息挤掉）');
+  ok(logs4.some((l) => /外设侧/.test(l)),
+     '首片失败被说成"长度合法，更像链路/外设侧的问题"（不再误报成程序错误）');
+  eq(logs4.filter((l) => /外设侧/.test(l)).length, 1,
+     '这条解释只说一次（APK 里每秒发帧，不能刷屏把现场信息挤掉）');
   ok(logs4.some((l) => /降到 185/.test(l)), '降档阶梯仍然保留（兜底逻辑没被删掉）');
-  const i_bug = logs4.findIndex((l) => /程序错误/.test(l));
+  const i_bug = logs4.findIndex((l) => /外设侧/.test(l));
   const i_ladder = logs4.findIndex((l) => /降到/.test(l));
-  ok(i_bug >= 0 && i_ladder > i_bug, '先把"这是程序错误"说清楚，再说降档（不会让人以为阶梯在修问题）');
+  ok(i_bug >= 0 && i_ladder > i_bug, '先把失败性质说清楚，再说降档（不会让人以为阶梯在修问题）');
+}
+
+// ---------------------------------------------------------------------------
+// 12] 设备 -> 手机：通知的**事件名**和**编码**（真机上"手机写进去了、设备却像哑巴"的根因）
+// ---------------------------------------------------------------------------
+//
+// 现场是"连接板子后规划导航直接会闪退"，排查时另一个必须排除的方向是**上行**：
+// 旧代码订阅的是 'onNotification' / 'onCharacteristicChanged'，而插件 8.3.0 真正
+// 推事件用的名字是拼出来的 key：
+//     BluetoothLe.kt:768  notifyListeners("notification|$deviceId|$service|$char", ret)
+// （它自己的高层封装 bleClient.js:293 就是这么订阅的）。名字不对 = 一个字节都收不到。
+//
+// 就算名字对了，**值的编码**还错着：native 侧 Device.kt 的 onCharacteristicChanged
+// 把字节转成 **大写十六进制字符串**（Conversion.kt:4-22 的 HEX_LOOKUP_TABLE），
+// 而"字符串 -> 字节"这一步是**调用方**的责任（bleClient.js 末尾的 convertValue
+// 才做它）。ble_native.js 用的是底层代理，所以必须自己做 —— 老代码没做：字符串
+// 落到 `Uint8Array.from("A55A…")` 那一支，十六进制**字母**变 0、数字位被当十进制，
+// 得到了既不是原字节、也永远匹配不上帧头 0xA5 的垃圾。
+//
+// 这一节把两件事都钉死，并且**走完整条链**（假插件按真插件的编码推 -> transport
+// 解码 -> ble.js 的 FrameParser 解出帧 -> onFrame 回调），不是分段测。
+section('12] 上行：通知事件名必须是真 key，十六进制字符串必须解成原字节');
+{
+  // ── 12-1) 事件名逐字对齐 ──────────────────────────────────────────────
+  const plugin = new FakePlugin({ mtu: 247 });
+  const t = mk_transport(plugin);
+  await t.connect();
+  const key = `notification|AA:BB:CC:DD:EE:FF|${NUS_SERVICE}|${NUS_TX}`;
+  ok(plugin.listener_names.indexOf(key) >= 0,
+     '订阅了 native 真正会推的那个事件名 notification|<deviceId>|<service>|<char>');
+  ok(plugin.listener_names.indexOf('onNotification') >= 0,
+     '老的 onNotification 也留着（别的插件版本/退路）');
+  ok(plugin.listener_names.indexOf('onCharacteristicChanged') >= 0,
+     'onCharacteristicChanged 也留着（退路）');
+
+  // ── 12-2) 编码：大写十六进制字符串 -> 原字节（走完整条链）────────────
+  const got = [];
+  const logs = [];
+  const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: (fr) => got.push(fr) });
+  link.onNotifyTransport = true;
+  // BleLink.connect() 会把 transport 的 onNotify 接上；这里已经连过 transport，
+  // 所以直接按 ble.js 的接法接一次（等价于它的 _connect_native）。
+  t.onNotify = (bytes) => link._on_notify_bytes(bytes);
+
+  const clock = proto.encode_nav_clock(new proto.NavClock({ epoch_s: 1757500000, tz_offset_min: 330 }));
+  eq(clock.length, proto.HEADER_LEN + proto.NAV_CLOCK_LEN + proto.CRC_LEN, 'NAV_CLOCK 帧长固定');
+  plugin.emit_hex(clock);          // ← 真插件的形式：value 是**大写十六进制字符串**
+  eq(got.length, 1, '设备发来的一帧被解出来了（老代码在这一步一帧都解不出）');
+  if (got.length === 1) {
+    eq(got[0].type, proto.MsgType.NAV_CLOCK, '帧类型 = NAV_CLOCK（0x06）');
+    const ck = proto.NavClock.unpack(got[0].payload);
+    eq(ck.epoch_s, 1757500000, '时间原样到达（这一条通了，设备主页的时间才不会再是 --:--）');
+    eq(ck.tz_offset_min, 330, '时区偏移原样到达');
+  }
+  ok(!logs.some((l) => /解析失败/.test(l)), '日志里没有"通知解析失败"');
+
+  // ── 12-3) _data_view_to_u8 的各种输入形式都要认（收的那一侧）──────────
+  eq([...NATIVE._data_view_to_u8('A55A0104')], [0xa5, 0x5a, 0x01, 0x04],
+     '大写十六进制字符串 -> 原字节（真插件 8.3.0 的传法）');
+  eq([...NATIVE._data_view_to_u8('a55a0104')], [0xa5, 0x5a, 0x01, 0x04],
+     '小写十六进制也认（不同版本/参考实现）');
+  eq([...NATIVE._data_view_to_u8('AAECAwQ=')], [0x00, 0x01, 0x02, 0x03, 0x04],
+     '不是 hex 的字符串退回 base64（老插件的传法，不能被这条改动弄坏）');
+  const dv = new DataView(Uint8Array.from([1, 2, 3]).buffer);
+  eq([...NATIVE._data_view_to_u8(dv)], [1, 2, 3], 'DataView 仍然照旧（Web Bluetooth 侧的老路）');
+  eq([...NATIVE._data_view_to_u8([9, 8, 7])], [9, 8, 7], '普通数组仍然照旧');
+  eq([...NATIVE._data_view_to_u8(new Uint8Array([5, 6]))], [5, 6], 'Uint8Array 原样返回');
+  eq(NATIVE._data_view_to_u8('A55A0104').length, 4,
+     '⚠️ 长度是**字节数的一半**，不是字符数（老代码返回 8 个错字节就是这里）');
+
+  // ── 12-4) 两个来源都推时不能重复投递（去重）──────────────────────────
+  const plugin2 = new FakePlugin({ mtu: 247 });
+  const t2 = mk_transport(plugin2);
+  await t2.connect();
+  const got2 = [];
+  const link2 = new BLE.BleLink({ transport: t2, onLog: () => {}, onFrame: (fr) => got2.push(fr) });
+  t2.onNotify = (bytes) => link2._on_notify_bytes(bytes);
+  plugin2.emit_hex(clock, plugin2.notify_key);          // 真名字
+  plugin2.emit_hex(clock, 'onNotification');            // 同一个字节流又从退路来一次
+  eq(got2.length, 1,
+     '两个事件名都推同一条通知时只算一次（去重按"第一个真的送来数据的来源"）');
+
+  // ── 12-5) 断开时三个 handle 都要摘掉 ───────────────────────────────────
+  await t2.disconnect();
+  eq(plugin2.listener_names.length >= 3, true, '（前置）确实挂了 3 个名字');
+  eq(plugin2.notify_cb === null || plugin2.listeners['onNotification'] === undefined, true,
+     '断开后通知监听被摘掉（否则重连会把同一条通知处理两遍）');
+}
+
+// ---------------------------------------------------------------------------
+// 13] 第一次"大写入"：整条路线 + 最大帧在 MTU 517 下的尺寸上界（父任务的那个假设）
+// ---------------------------------------------------------------------------
+//
+// 假设是"闪退发生在第一次大写入上：JS 字符串 / JSON 桥 / native 侧被巨量载荷撑爆"。
+// 这一节用**真路线**（1001 点的窗口 = 满窗）走完整的 send() 路径把它量出来：
+// 每一次真正过桥的载荷都被夹在"协商 MTU - 3"这一片里，和整帧多大**无关**。
+//
+// 数字（本机实测，见报告）：
+//     窗口 1001 点 -> NAV_ROUTE 4 片（255/255/255/236 点）
+//     最大帧 1544B（NAV_MAP 的协议上限）-> 512 字节/片 -> hex 1024 字符
+//     过桥 JSON 最长约 1.2KB，总共约 29 次写
+// 所以"1001 点 = 4KB 字符串"这条路**量不出来**：分片发生在编码之后、过桥之前。
+section('13] 第一次大写入的尺寸上界：每片 <= min(MTU-3, 512)，与整帧大小无关');
+{
+  const RT = require(path.join(PHONE_DIR, 'route.js'));
+  const LAT = 30.2741, LON = 120.1551;
+  const route = RT.straight_route([[LAT, LON, 'A'], [LAT + 0.35, LON + 0.35, 'B']]);
+  const win = RT.build_route_window(route, 0, LAT, LON);
+  eq(win.pts.length, 1001, '满窗口就是 1001 点（WINDOW_M/STEP_M + 1）');
+
+  const chunks = proto.route_chunks(win.pts);
+  eq(chunks.length, 4, '1001 点按每片 255 点切成 4 片（这正是现场那"4 片 ~1KB"）');
+  const frames = chunks.map((c) => proto.encode_nav_route(c));
+  eq(frames.map((f) => f.length), [1034, 1034, 1034, 958],
+     '每片帧长 1034/1034/1034/958 字节（最大的一帧 1034B）');
+  // 协议允许的最大帧（NAV_MAP 的上限：1544 字节）也一起量 —— 这是"最大载荷"的上界
+  const max_frame = new Uint8Array(proto.HEADER_LEN + proto.MAX_PAYLOAD + proto.CRC_LEN);
+
+  const plugin = new FakePlugin({ mtu: 517 });
+  // 稳态：512 已经被自适应升档确认过（生产里是爬上去的，见第 15 节）
+  const t = mk_transport(plugin, { chunk_policy: policy_at(512).policy });
+  const logs = [];
+  t.log = (l) => logs.push(l);
+  const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
+  wire_chunk_sync(t, link);
+  await link.connect();
+  eq(link.chunk_size, 512, '分片 = min(MTU-3=514, 512) = 512（真机谈成的 MTU 是 517）');
+
+  // 现场那一串：空片清窗口 + 4 片路线 + 一张满底图 + 一帧 10Hz 更新 + 最大帧
+  const all = [proto.encode_nav_route(proto.route_chunks([])[0])]
+    .concat(frames).concat([max_frame, proto.encode_nav_update(new proto.NavUpdate({}))]);
+  const expect_bytes = all.reduce((a, f) => a + f.length, 0);
+  for (const f of all) link.send(f, 'route', 0);
+  for (let i = 0; i < 600 && link.stats.queue_length > 0; i++) await sleep(5);
+  await sleep(20);
+
+  eq(plugin.writes.length, expect_bytes,
+     `设备侧收到的字节数 == 所有帧长之和（${plugin.writes.length}/${expect_bytes}，一片不丢不多）`);
+  // 写次数与分片大小直接相关，所以也钉一下（UI/文档里的"代价"就是照这个算的）
+  const at = (n) => all.reduce((a, f) => a + Math.ceil(f.length / n), 0);
+  eq(plugin.write_sizes.length, at(512),
+     `这一整轮 = ${plugin.write_sizes.length} 次写（512 字节/片）；` +
+     `同样这一轮 244 字节/片是 ${at(244)} 次、20 字节/片是 ${at(20)} 次`);
+  eq(Math.max.apply(null, plugin.write_sizes), 512,
+     '**单次过桥的写载荷最大就是 512 字节**（min(MTU-3, 512)），与整帧多大无关');
+  eq(link.downgrades, 0, '一次都没降档（首片就成功）');
+  eq(link.write_failures, 0, '写失败次数 = 0');
+  eq(link.frames_sent, all.length, `${all.length} 帧全部发出`);
+  eq(link.frames_dropped, 0, '没有丢帧');
+
+  // 把整条字节流喂回设备侧解析器：4 片 NAV_ROUTE + 1 帧 NAV_UPDATE 必须都能解出来
+  const dev = new proto.FrameParser();
+  const parsed = dev.feed(Uint8Array.from(plugin.writes));
+  const routes = parsed.filter((f) => f.type === proto.MsgType.NAV_ROUTE);
+  eq(routes.length, 5, '设备侧从这条流里解出 5 帧 NAV_ROUTE（1 空片 + 4 片真窗口）');
+  if (routes.length === 5) {
+    const r0 = proto.NavRoute.unpack(routes[1].payload);
+    eq(r0.total_points, 1001, '第一片自报 total_points = 1001（设备靠它拼整窗）');
+    eq(r0.chunk_start, 0, '第一片 chunk_start = 0');
+    eq(r0.pts.length, 255, '第一片 255 个点');
+    const r3 = proto.NavRoute.unpack(routes[4].payload);
+    eq(r3.last, true, '最后一片带 ROUTE_CHUNK_LAST（设备靠它知道窗口拼完了）');
+    eq(r3.chunk_start, 765, '最后一片从第 765 点开始');
+  }
+  ok(parsed.some((f) => f.type === proto.MsgType.NAV_UPDATE), 'NAV_UPDATE 也在里面');
+
+  // hex 字符串与"过桥 JSON"的尺寸上界：这就是父任务要量的那个数
+  const max_hex = Math.max.apply(null, plugin.calls
+    .filter((c) => c.method === 'writeWithoutResponse' || c.method === 'write')
+    .map((c) => String(c.args.value).length));
+  eq(max_hex, 1024,
+     '单次过桥的十六进制字符串最长 1024 字符（= 512 字节 × 2），**不是** 4KB 级别');
+  // 整个参数对象的 JSON（Capacitor 就是这个字符串过桥的）
+  const max_json = Math.max.apply(null, plugin.calls
+    .filter((c) => c.method === 'writeWithoutResponse' || c.method === 'write')
+    .map((c) => JSON.stringify(c.args).length));
+  ok(max_json < 1400,
+     `过桥 JSON 最长 ${max_json} 字符（<1400，任何"消息大小上限"都够不着）`);
+  ok(!logs.some((l) => /写失败|降到|程序错误/.test(l)),
+     '这一整轮里没有"写失败/降到/程序错误"（尺寸不是失败原因）');
+}
+
+// ---------------------------------------------------------------------------
+// 14] Java 侧那三条"能把整个进程带走"的路：源码层钉住（这台机器上没有设备/模拟器）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 为什么这里是"读源码"的断言而不是行为测试：本机没有 Android 设备，也没有
+//    模拟器（docs/android.md 第 7 节写得很清楚：所有设备行为都未验证）。而这几条
+//    恰恰是**闪退**（进程直接没了）最可能的三个来源，退无可退：
+//
+//   1. 异常从 Service.onStartCommand（主线程）抛出去 —— 系统立刻杀进程。
+//      旧代码在 catch 里 `throw e`，这就是"点一下，App 没了"的一种死法。
+//   2. WebView 渲染进程死亡而宿主不接（Capacitor 默认返回 false）——
+//      系统把宿主 App 一起杀掉。手机内存吃紧时渲染器 OOM 非常常见。
+//   3. 跨语言契约：页面调的插件方法名 / 字段名必须和 Java 侧逐字一致。
+//      写错了不会报错，只会"静默没有报告"（这正是这一版要消灭的失败模式）。
+//
+// 读源码不能证明真机行为，但它能保证**这三条具体的死法不会被改回去**。
+section('14] Java 侧的进程杀手：闪退的三条路必须在源码层被钉住');
+{
+  const fs = require('node:fs');
+  const JAVA_DIR = path.resolve(PHONE_DIR, '..', 'android', 'android', 'app', 'src', 'main',
+                                'java', 'dev', 'navpuck', 'app');
+  /**
+   * ⚠️ 负向断言（"不许出现 throw e;"）必须打在**代码**上，不能打在注释上 ——
+   *    这几个文件的注释里**故意**引用了旧代码那一行（写清楚"这里以前是什么、
+   *    为什么不能改回去"），不剥注释的话测试会因为自己的文档而失败。
+   */
+  const strip_java = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const read_java = (name) => strip_java(fs.readFileSync(path.join(JAVA_DIR, name), 'utf8'));
+
+  // ── 14-1) 前台服务：startForeground 失败**不能**再抛出去 ──────────────
+  const fgs = read_java('NavPuckForegroundService.java');
+  ok(!/throw\s+e\s*;/.test(fgs),
+     'NavPuckForegroundService 里没有 `throw e;`（旧代码那一行 = 主线程异常 = 整个 App 闪退）');
+  ok(/sLastStartError/.test(fgs) && /stopSelf\(\)/.test(fgs),
+     'startForeground 失败改成"记下来 + 停自己"（服务起不来不该升级成进程死亡）');
+  ok(/NavPuckCrashLog\.note/.test(fgs), '失败原因也进崩溃日志（下次启动用户能看到）');
+  ok(/public static String lastStartError\(\)/.test(fgs),
+     '页面能通过 lastStartError() 读到失败原因（不是只写进 logcat）');
+
+  // ── 14-2) 渲染进程死亡必须被接住（否则 Capacitor 默认让宿主一起死）──
+  const main = read_java('MainActivity.java');
+  ok(/NavPuckCrashLog\.install/.test(main),
+     'MainActivity 装了未捕获异常钩子（Java 崩溃第一条：先落盘再死）');
+  ok(/addWebViewListener/.test(main), 'MainActivity 挂了 WebView 监听器');
+  ok(/Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.O/.test(main),
+     '监听器只在 API 26+ 实例化（RenderProcessGoneDetail 本身是 API 26 才有的类型）');
+  const wvl = read_java('NavPuckWebViewListener.java');
+  ok(/class NavPuckWebViewListener extends WebViewListener/.test(wvl), '监听器继承 Capacitor 的 WebViewListener');
+  ok(/onRenderProcessGone/.test(wvl) && /return true;/.test(wvl),
+     'onRenderProcessGone 返回 true（Capacitor 默认 false = 宿主 App 被一起杀掉）');
+  ok(/NavPuckCrashLog\.noteRendererGone/.test(wvl), '渲染进程死亡也落盘（"没有 Java 异常却闪退"的唯一解释）');
+  ok(/MAX_RESTARTS/.test(wvl), '重建次数有上限（否则会变成无限重启循环）');
+
+  // ── 14-3) 跨语言契约：页面调的插件方法必须真的存在（逐字）────────────
+  const plugin_java = read_java('NavPuckFgsPlugin.java');
+  for (const m of ['getCrashReport', 'clearCrashReport', 'note']) {
+    ok(new RegExp('@PluginMethod[\\s\\S]{0,80}public void ' + m + '\\(').test(plugin_java),
+       `NavPuckFgsPlugin 里有 @PluginMethod ${m}()`);
+  }
+  ok(/"rendererDeaths"/.test(plugin_java) && /"startError"/.test(plugin_java),
+     'getState() 带回 rendererDeaths / startError（页面能区分"渲染器死了"和"服务没起来"）');
+
+  // phone/fgs.js 另一侧的名字必须逐字对得上 —— 写错了只会"静默没有报告"
+  const fgs_js = fs.readFileSync(path.join(PHONE_DIR, 'fgs.js'), 'utf8');
+  for (const m of ['getCrashReport', 'clearCrashReport', 'note']) {
+    ok(new RegExp('plugin\\.' + m + '\\(').test(fgs_js),
+       `phone/fgs.js 调的是 plugin.${m}()（与 Java 侧同名）`);
+  }
+  const crash_js = fs.readFileSync(path.join(PHONE_DIR, 'crashlog.js'), 'utf8');
+  ok(/NavPuckFgs/.test(crash_js) && /marker/.test(crash_js),
+     '页面侧把 marker 递给原生（渲染进程死时 JS 那份可能来不及落盘）');
+  const app_js = fs.readFileSync(path.join(PHONE_DIR, 'app.js'), 'utf8');
+  ok(/nav_start_begin/.test(app_js) && /first_send/.test(app_js),
+     'app.js 在"起导航/第一次发帧"之前写了同步 marker（崩了也知道走到哪）');
+  const ble_native_js = fs.readFileSync(path.join(PHONE_DIR, 'ble_native.js'), 'utf8');
+  ok(/first_write/.test(ble_native_js),
+     'ble_native.js 在"第一次真的要写出去"之前也写了 marker');
+}
+
+// ---------------------------------------------------------------------------
+// 15] ⭐ 分片安全界 + 自适应升档（这一版修"规划并开始导航必闪退"的核心）
+// ---------------------------------------------------------------------------
+//
+// 现场：Redmi / Android 16，getMtu() 报 517，旧代码按 MTU-3 发 **514** 字节，
+// 进程当场死掉：
+//     java.lang.IllegalArgumentException:
+//         value should not be longer than max length of an attribute value
+//       at android.bluetooth.BluetoothGatt.writeCharacteristic(BluetoothGatt.java:1731)
+//       at ...bluetoothle.Device.write(Device.kt:590)
+//       at ...bluetoothle.BluetoothLe.writeWithoutResponse(BluetoothLe.kt:705)
+// 异常是**同步抛在插件线程上**的，Capacitor 不把它变成 rejected promise ⇒ JS 接不住
+// ⇒ 既不能 catch、也不能降档（进程已经没了）。所以：
+//   · 长度上界必须是**可证明**的：min(MTU-3, 512)，其中 512 是 Android 框架里
+//     写死的常量（证据 = 设备上 framework-bluetooth.jar 的字节码，见 ble_native.js）；
+//   · 探测方向必须是 小 → 大，且**只在成功之后**才往上走（第 15-2 条）；
+//   · 致命失败只能靠**下一次启动**从落盘的"正在试"记录里推断（第 15-4 条）。
+section('15] 分片：硬上限 min(MTU-3,512)，从 20 起步，只在成功之后升档');
+{
+  // ── 15-1) 上界表：可证明安全的最大分片 ─────────────────────────────────
+  eq(NATIVE.MAX_ATTR_VALUE, 512, '框架硬上限常量就是 512（不是 MTU-3、不是 517）');
+  eq(NATIVE.safe_chunk_max(517), 512, 'MTU 517 ⇒ min(514, 512) = 512（真机谈成的就是 517）');
+  eq(NATIVE.safe_chunk_max(1000), 512, '再大的 MTU 也不会超过 512');
+  eq(NATIVE.safe_chunk_max(247), 244, 'MTU 247 ⇒ 244');
+  eq(NATIVE.safe_chunk_max(23), 20, 'MTU 23 ⇒ 20（规范默认载荷）');
+  eq(NATIVE.safe_chunk_max(20), 20, '荒谬的小 MTU 也不会低于 20');
+  eq(NATIVE.safe_chunk_max(null), 20, 'MTU 未知 ⇒ 只认 20（不猜）');
+  eq(NATIVE.safe_chunk_max(undefined), 20, 'MTU undefined ⇒ 20');
+
+  // ── 15-2) 新装策略：从 20 起步，**只在连续成功之后**才升一档 ────────────
+  const storeA = fake_storage();
+  const pA = NATIVE.create_chunk_policy({ storage: storeA, window: null, onLog: () => {} });
+  eq(pA.size(517), 20, '全新安装：第一帧就是 20 字节（保守起步，不赌）');
+  eq(pA.snapshot().learned, 20, '学到值 = 20（还没有任何一档被确认）');
+  eq(pA.snapshot().ceiling, 512, '用户上限默认 512');
+
+  const used = [];
+  const drive = (p, mtu, n) => {
+    for (let i = 0; i < n; i++) { const s = p.size(mtu); used.push(s); p.note_success(s, mtu); }
+  };
+  drive(pA, 517, 1);
+  eq(used.slice(0, 1), [20], '第 1 帧用 20');
+  eq(pA.snapshot().trial, 64, '成功一帧之后才开始试 64（升档的**唯一**触发条件就是成功）');
+  eq(pA.snapshot().armed && pA.snapshot().armed.size, 64,
+     '试 64 之前先把"正在试 64"落盘（致命失败只能靠它在下一次启动被推断出来）');
+  drive(pA, 517, 2);
+  eq(used.slice(1, 3), [64, 64], '接下来两帧用 64');
+  eq(pA.snapshot().learned, 20, `64 还没被确认（要连续 ${NATIVE.PROBE_OK_FRAMES} 帧）`);
+  eq(pA.snapshot().trial, 64, '试探仍然在进行中');
+  drive(pA, 517, 1);
+  eq(pA.snapshot().learned, 64, `第 ${NATIVE.PROBE_OK_FRAMES + 1} 帧之后 64 才算确认`);
+  eq(pA.snapshot().trial, null, '确认之后试探结束');
+  eq(pA.snapshot().armed, null, '确认之后"正在试"的记录被清掉（不再算它可疑）');
+
+  // 一路爬到顶：不能超过 min(MTU-3, 512)
+  drive(pA, 517, 200);
+  const sA = pA.snapshot();
+  eq(sA.learned, 512, '一直成功就一路升到 512（= min(MTU-3,512)）');
+  eq(Math.max.apply(null, used), 512, '整段过程里用过的最大分片就是 512');
+  ok(used.every((n) => n <= NATIVE.MAX_ATTR_VALUE), '**从来没有**超过 512（超过 = 不可捕获的闪退）');
+  drive(pA, 517, 10);
+  eq(pA.size(517), 512, '到顶之后稳定在 512（不会再去试 513/514）');
+
+  // 升档的顺序必须是阶梯，不能跳跃
+  const storeB = fake_storage();
+  const pB = NATIVE.create_chunk_policy({ storage: storeB, window: null, onLog: () => {} });
+  const seenB = [];
+  for (let i = 0; i < 200; i++) { const s = pB.size(517); if (seenB[seenB.length - 1] !== s) seenB.push(s); pB.note_success(s, 517); }
+  eq(seenB, NATIVE.CHUNK_LADDER_UP.slice(),
+     '升档顺序逐个走完阶梯（20 -> 64 -> 128 -> 185 -> 244 -> 512），没有跳档');
+
+  // ── 15-3) 学到的值跨启动（同一个 localStorage）──────────────────────────
+  const pA2 = NATIVE.create_chunk_policy({ storage: storeA, window: null, onLog: () => {} });
+  eq(pA2.size(517), 512, '重新打开（同一次安装、同一台设备）：直接就是学到的 512，不用重爬');
+  const storeC = fake_storage();
+  const pC = NATIVE.create_chunk_policy({ storage: storeC, window: null, onLog: () => {} });
+  drive(pC, 247, 40);
+  eq(pC.snapshot().learned, 244, '换一台 MTU 247 的设备：爬到 244 就停（不越 MTU-3）');
+  const pC2 = NATIVE.create_chunk_policy({ storage: storeC, window: null, onLog: () => {} });
+  eq(pC2.size(247), 244, '学到的值跨启动保留');
+  eq(pC2.size(23), 20, '同一份学习记录遇到 MTU 23 的链路时仍然夹到 20（记忆不会绕过上界）');
+
+  // ── 15-4) 致命失败（进程死亡）的推断：靠落盘的 armed + 上一轮没正常结束 ──
+  const mk_crash = (abnormal) => ({ status: () => ({ prev_abnormal: abnormal }), marker: () => {} });
+  const armed_state = {
+    v: 1, auto: true, ceiling: 512, learned: 64, trial: 128, ok: 1,
+    armed: { size: 128, mtu: 517, at: '2026-01-01T00:00:00.000Z' }, bad: [],
+  };
+  const storeD = fake_storage();
+  storeD.setItem(NATIVE.CHUNK_STORE_KEY, JSON.stringify(armed_state));
+  const logsD = [];
+  const pD = NATIVE.create_chunk_policy({
+    storage: storeD, window: null, crash: mk_crash(true), onLog: (l) => logsD.push(l),
+  });
+  const sD = pD.snapshot();
+  eq(sD.ceiling, 64, '上次在 128 字节上崩了（上一轮没正常结束）⇒ 上限压到它下面一档（64）');
+  eq(sD.learned, 64, '已确认值也跟着压下来');
+  eq(sD.bad.indexOf(128) >= 0, true, '128 被记进"判过致死"的名单');
+  eq(sD.armed, null, 'armed 被清掉（不能一直背着它）');
+  eq(sD.crash_verdict && sD.crash_verdict.size, 128, '推断结论留在快照里（界面/日志要显示）');
+  ok(logsD.some((l) => /黑匣子/.test(l) && /128/.test(l)), '日志里明说"上次崩在 128 字节分片上"');
+  const usedD = [];
+  for (let i = 0; i < 60; i++) { const s = pD.size(517); usedD.push(s); pD.note_success(s, 517); }
+  ok(Math.max.apply(null, usedD) <= 64, '这一轮再也不会去试 128（不会反复崩在同一条上）');
+
+  // 上一轮**正常结束**：同样的 armed 不作判决（那一档没把进程弄死）
+  const storeE = fake_storage();
+  storeE.setItem(NATIVE.CHUNK_STORE_KEY, JSON.stringify(armed_state));
+  const pE = NATIVE.create_chunk_policy({
+    storage: storeE, window: null, crash: mk_crash(false), onLog: () => {},
+  });
+  eq(pE.snapshot().ceiling, 512, '上一轮正常结束 ⇒ 不降上限（只有"异常结束"才算数）');
+  eq(pE.snapshot().armed, null, 'armed 仍然被清掉（避免下次误判）');
+
+  // 拿不到判据（PWA / crashlog 没加载）：**按最保守处理**
+  const storeF = fake_storage();
+  storeF.setItem(NATIVE.CHUNK_STORE_KEY, JSON.stringify(armed_state));
+  const pF = NATIVE.create_chunk_policy({ storage: storeF, window: null, crash: null, onLog: () => {} });
+  eq(pF.snapshot().ceiling, 64, '判据拿不到时也按"就是它"处理（判错只损失速度，判反会再崩一次）');
+
+  // ── 15-5) 可捕获的失败（promise 被拒）：本会话不再往上试 ────────────────
+  const storeG = fake_storage();
+  const pG = NATIVE.create_chunk_policy({ storage: storeG, window: null, onLog: () => {} });
+  drive(pG, 517, 1);                       // 20 成功 -> 开始试 64
+  eq(pG.size(517), 64, '正在试 64');
+  pG.note_failure(64, 517);                 // 64 被拒（非致命）
+  eq(pG.size(517), 20, '被拒之后立刻退回已确认的 20');
+  const usedG = [];
+  for (let i = 0; i < 60; i++) { const s = pG.size(517); usedG.push(s); pG.note_success(s, 517); }
+  ok(Math.max.apply(null, usedG) <= 20, '本次会话不再往上试（避免同一档反复失败刷日志）');
+  eq(pG.snapshot().learned, 20, '被拒的档位不会被记成"确认可用"');
+
+  // ── 15-6) 上游不跟随新尺寸时，绝不偷偷写更大 ────────────────────────────
+  const storeH = fake_storage();
+  const pH = NATIVE.create_chunk_policy({ storage: storeH, window: null, onLog: () => {} });
+  pH.note_success(20, 517);                 // 策略开始试 64
+  eq(pH.size(517), 64, '策略想试 64');
+  pH.note_success(20, 517);                 // 但调用方仍然只用 20
+  eq(pH.snapshot().trial, null, '调用方没跟上的试探被放弃（不能写超过调用方要求的长度）');
+  eq(pH.size(517), 20, '回到 20');
+
+  // ── 15-7) 用户可调：上限 / 锁定 / 清空 ─────────────────────────────────
+  const storeI = fake_storage();
+  const pI = NATIVE.create_chunk_policy({ storage: storeI, window: null, onLog: () => {} });
+  eq(pI.set_ceiling(244), 244, 'UI 把上限设成 244');
+  eq(pI.snapshot().learned, 20, '改上限不会伪造"已确认"（学习值仍是 20）');
+  const usedI = [];
+  for (let i = 0; i < 60; i++) { const s = pI.size(517); usedI.push(s); pI.note_success(s, 517); }
+  eq(Math.max.apply(null, usedI), 244, '自动升档最多到用户上限 244（不越 512 硬上限）');
+  eq(pI.set_ceiling(9999), 512, '荒谬的上限被夹到 512');
+  eq(pI.set_ceiling(1), 20, '太小的上限被夹到 20（规范默认，再低没有意义）');
+  eq(pI.set_ceiling(512), 512, '把上限调回 512（下面的锁定模式要用它）');
+  pI.set_auto(false);
+  // 锁定的语义：**用户选的那个上限就是分片大小**（仍被 min(MTU-3,512) 夹住）。
+  // 这是"我已经知道该用多少，别替我试"那条路 —— 所以它不再看 learned。
+  eq(pI.size(517), 512, '锁定（auto=false）时用用户上限 512，而不是已确认的 20');
+  eq(pI.size(23), 20, '锁定也照样被 MTU 夹住（MTU 23 ⇒ 20）');
+  eq(pI.snapshot().auto, false, 'auto=false 也落盘（用户的选择要记住）');
+  eq(pI.set_ceiling(185), 185, '锁定状态下把上限调到 185');
+  eq(pI.size(517), 185, '锁定 ⇒ 就用 185（用户自己承担这个选择）');
+  eq(pI.snapshot().learned, 20, '锁定不会凭空改写"已确认"的值');
+  // 锁定模式也必须"先落盘再写"：万一这一档是致命的，下次启动要能推断出来。
+  eq(pI.before_write(185, 517), true, '锁定档第一次写之前先落盘 armed（致命失败也留得下线索）');
+  eq(pI.snapshot().armed && pI.snapshot().armed.size, 185, 'armed 记的就是 185');
+  eq(pI.before_write(185, 517), false, '同一档不会反复写盘');
+  pI.note_success(185, 517);
+  eq(pI.snapshot().learned, 185, '锁定档写成功一次就记为已确认');
+  eq(pI.snapshot().armed, null, '确认之后 armed 收掉');
+  // 锁定档被**非致命**拒绝：本次会话也要往下退一档（否则每帧都撞同一堵墙）
+  pI.set_ceiling(244);
+  pI.before_write(244, 517);
+  pI.note_failure(244, 517);
+  eq(pI.size(517), 185, '锁定档被拒 ⇒ 本会话退到它下面一档（244 -> 185）');
+  pI.reset();
+  eq(pI.snapshot().learned, 20, '清空学习记录 ⇒ 回到 20 起步');
+  eq(pI.snapshot().ceiling, 512, '清空学习记录也会把上限复位（否则用户以为清了其实没清）');
+
+  // ── 15-8) 没有 localStorage（隐私模式 / 测试环境）：退化成内存态，不抛 ──
+  const pJ = NATIVE.create_chunk_policy({ window: null, onLog: () => {} });
+  eq(pJ.snapshot().has_storage, false, '拿不到 localStorage 时标记 has_storage=false');
+  eq(pJ.size(517), 20, '没有存储也一样从 20 起步（绝不因为存不了就猜大）');
+  pJ.note_success(20, 517);
+  eq(pJ.size(517), 64, '没有存储也能升档（只是下次打开会重新学）');
+
+  // ── 15-9) 模糊测试：无论请求多大 / MTU 多怪，发出去的每片都 <= 上界 ─────
+  // 用**锁定在 512**（最激进的一档）跑：这样每一条都真的顶到上界，
+  // 夹取逻辑有没有生效一眼可见（30 个组合里只要漏一个，真机就是闪退）。
+  const hostile = [0, 1, 19, 20, 21, 23, 64, 512, 514, 517, 1024, 99999, -5, NaN];
+  const mtus = [null, 23, 247, 517, 1024, undefined];
+  let worst = 0;
+  for (const mtu of mtus) {
+    for (const req of hostile) {
+      const plugin = new FakePlugin({ mtu: mtu || 23 });
+      const p = NATIVE.create_chunk_policy({ window: null, onLog: () => {} });
+      p.set_auto(false);
+      p.set_ceiling(512);                    // 锁定 512：请求什么都不会超过安全界
+      const t = mk_transport(plugin);        // 真的按 mtu 连一次，拿到 transport_mtu
+      await t.connect();
+      if (mtu === null || mtu === undefined) t.transport_mtu = null;
+      t.chunk_policy = p;
+      await t.write_frame(new Uint8Array(1500), req);
+      const mx = Math.max.apply(null, plugin.write_sizes);
+      if (mx > worst) worst = mx;
+      const cap = NATIVE.safe_chunk_max(t.transport_mtu);
+      if (!(mx <= cap)) ok(false, `模糊：mtu=${mtu} 请求 ${req} 时发了 ${mx} 字节 > 上界 ${cap}`);
+    }
+  }
+  ok(worst <= 512, `模糊测试跑完：整轮里最大的单片 = ${worst} 字节（<= 512 硬上限）`);
+  eq(worst, 512, '锁定 512 + MTU 517 时确实发到了 512（说明夹取没有把安全界也一起夹小）');
 }
 
 // ---------------------------------------------------------------------------

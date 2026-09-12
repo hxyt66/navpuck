@@ -54,6 +54,19 @@
     ⚠️ 正在<b>模拟行驶</b>（沿航线自动推进，不是真实定位）
   </p>
 
+  <!-- 崩溃/异常捕获（crashlog.js）：上一轮如果**没有正常结束**，这里会显示
+       崩溃前写入 localStorage 的最后几十行日志 + 原生侧记录（Java 异常栈 /
+       WebView 渲染进程死亡）。闪退时进程没了，页面上那块 #log 一个字都不会留下，
+       所以这块"上一次的黑匣子"是唯一能把现场带回来的东西。 -->
+  <details id="crash-block" class="panel crash" hidden>
+    <summary>⚠️ 上次运行异常结束 —— 点开看崩溃前的日志</summary>
+    <p id="crash-hint" class="hint warn"></p>
+    <pre id="crash-report" class="hint"></pre>
+    <div class="btn-row">
+      <button id="crash-clear" type="button" class="ghost">我已记录，清掉这块</button>
+    </div>
+  </details>
+
   <!-- 状态面板：实时读数 -->
   <section class="panel" aria-label="实时状态">
     <div class="grid">
@@ -96,6 +109,10 @@
       <div class="cell">
         <span class="cap">底图</span>
         <span id="map-info" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">分片</span>
+        <span id="chunk-info" class="val">—</span>
       </div>
       <div class="cell">
         <span class="cap">循环</span>
@@ -277,6 +294,54 @@
     </div>
   </details>
 
+  <!-- BLE 分片（⭐ 这一版修"规划并开始导航必闪退"的那个旋钮）：
+       真机（Redmi / Android 16）上 getMtu() 报 517，旧代码按 MTU-3 = 514 字节分片，
+       而 Android 框架在 BluetoothGatt.writeCharacteristic() 里写死了
+       "value.length > 512 就抛 IllegalArgumentException"。那条异常是**同步抛**在
+       插件的回调线程上，Capacitor 的桥不会把它变成 rejected promise —— JS 侧接不到，
+       进程直接消失。所以分片大小**不能超过 512**，而且宁可比 512 更小。
+       这个面板就是那个"宁可比 512 更小"的旋钮：默认从 20 字节起步，每确认一档
+       往上走一格（学到的值会记在手机上），万一某一档把进程写死了，下次启动会从
+       黑匣子推断出来并把上限压到它下面一档。 -->
+  <details class="panel opts" id="chunk-block">
+    <summary>高级 / BLE 分片（闪退修复后的调节口）</summary>
+    <div class="opt">
+      <input id="opt-chunk-auto" type="checkbox" checked>
+      <label for="opt-chunk-auto">自动升档（推荐）</label>
+    </div>
+    <div class="opt">
+      <label for="opt-chunk-ceiling">分片上限</label>
+      <select id="opt-chunk-ceiling">
+        <option value="20">20 字节（规范默认，最保守）</option>
+        <option value="64">64 字节</option>
+        <option value="128">128 字节</option>
+        <option value="185">185 字节</option>
+        <option value="244">244 字节（MTU 247 的载荷）</option>
+        <option value="512" selected>512 字节（Android 框架硬上限）</option>
+      </select>
+    </div>
+    <div class="btn-row">
+      <button id="chunk-reset" type="button" class="ghost">清空分片学习记录</button>
+    </div>
+    <p id="chunk-detail" class="hint">分片：等待初始化…</p>
+    <p class="hint">
+      设备的接收链路（手机 → 设备）按<b>分片</b>发送：一片最多 = <b>min(MTU − 3, 512)</b>。
+      512 是 Android 框架写死的常量（<code>BluetoothGatt.writeCharacteristic()</code>：
+      <code>value.length &gt; 512</code> 直接抛 <code>IllegalArgumentException</code>），
+      <b>不随 MTU 变化</b> —— 所以 MTU 517 时可用的是 512，<b>不是</b> 514（514 就是之前闪退的那一版）。<br>
+      <b>为什么默认从 20 字节起步：</b>分片太大导致的崩溃<b>无法被 JS 接住</b>（异常同步抛在插件线程上），
+      所以只能"从小到大试"，而且只在<b>连续成功</b>之后才往上走一档；试过的值会记在手机上，
+      下次打开不用重新试。万一某一档真的把进程写死了，下次启动会从落盘的"正在试"记录
+      推断出是它，并把上限压到它下面一档（不会反复崩）。<br>
+      <b>代价（速度）：</b>载荷 20 字节/片时，1.4KB 的底图要 <b>70 片</b>、
+      一次「规划并开始导航」的整轮下行（7 帧 / 5658 字节）要 <b>285 片</b>；
+      244 字节/片时分别是 <b>6 片 / 28 片</b>（约 0.3 秒），512 字节/片时是
+      <b>3 片 / 17 片</b>。所以自动升档一旦确认到 244 以上，速度就和以前（MTU-3）一样 ——
+      区别只是它是**先在安全的一档上验证过**才升上去的。
+      把"自动升档"关掉，就会一直锁在上面那个上限以内不再往上试。
+    </p>
+  </details>
+
   <!-- 后台运行（只在 APK 里有效）：
        用户的要求是"骑车时手机揣兜里、屏幕熄灭，设备那块屏继续导航"。
        浏览器做不到（后台页面被限流到 ~1Hz、还可能被整体冻结），Android 上唯一
@@ -344,8 +409,11 @@
 </div>
 
 <!-- 逻辑模块：均为经典脚本（UMD/全局挂载），顺序不可更改。
+     crashlog.js **必须第一个**：它要抢在 app.js 做任何危险动作之前装好
+     onerror / unhandledrejection，并把"上一轮崩在哪"从 localStorage 读出来。
      ble_native.js 必须在 ble.js 之前：ble.js 的 BleLink.make_transport() 会在
      init() 时去查 root.NavPuckBleNative；它的存在与否决定走原生还是 Web Bluetooth。 -->
+<script src="crashlog.js"></script>
 <script src="navmath.js"></script>
 <script src="proto.js"></script>
 <script src="route.js"></script>

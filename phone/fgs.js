@@ -330,6 +330,62 @@
     }
 
     /**
+     * 崩溃捕获（**本文件里唯一和"熄屏存活"无关的方法**，但同样重要）。
+     *
+     * 闪退时进程直接没了：页面上的 #log 一个字都留不下，JS 的 localStorage
+     * 也可能连 flush 的机会都没有（WebView 渲染进程死亡就是这样）。所以
+     * 关键操作前由页面调用这里，把一句话写进**原生**的 crash.log —— 那份文件
+     * 在 Java 侧、跟着 App 的私有目录走，渲染进程死了它还在（见
+     * android/.../NavPuckCrashLog.java 与 MainActivity 的 uncaught handler）。
+     *
+     * ⚠️ 不 await、失败一律吞掉：这是诊断，绝不能拖慢或挡住导航。
+     *    页面侧调用点见 phone/crashlog.js 的 marker()。
+     */
+    note(kind, msg) {
+      if (!this.plugin || typeof this.plugin.note !== 'function') return false;
+      try {
+        const p = this.plugin.note({ kind: String(kind || ''), msg: String(msg || '') });
+        // ⚠️ 必须显式 catch：不接的话失败会变成 unhandledrejection，
+        //    而那个钩子正是本模块要捕获的东西 —— 自己制造噪声。
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
+
+    /**
+     * 原生侧记下来的崩溃现场（Java 未捕获异常栈 / WebView 渲染进程死亡）。
+     * 页面在**下次启动**时读它，和 JS 侧的落盘日志拼在一起给用户看。
+     */
+    async crash_report() {
+      if (!this.plugin || typeof this.plugin.getCrashReport !== 'function') {
+        return { available: false };
+      }
+      try {
+        return Object.assign({ available: true }, await this.plugin.getCrashReport());
+      } catch (e) {
+        return { available: true, error: String(e) };
+      }
+    }
+
+    /**
+     * 清空**原生**那份崩溃记录（用户按"我已记录，清掉这块"时调用）。
+     * 不清的话，下一轮启动会把同一场崩溃再报一遍 —— 那样用户就分不清
+     * "这是新的还是旧的"。
+     */
+    async clear_crash_report() {
+      if (!this.plugin || typeof this.plugin.clearCrashReport !== 'function') {
+        return { available: false };
+      }
+      try {
+        return Object.assign({ available: true }, await this.plugin.clearCrashReport());
+      } catch (e) {
+        return { available: true, error: String(e) };
+      }
+    }
+
+    /**
      * 把一次读数翻译成人话，直接给界面/日志用。
      *
      * 判据（这一版能给出的**机械**结论，不需要人肉看数字）：

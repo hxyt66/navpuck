@@ -63,8 +63,35 @@
  *        注定白跑（详见 docs/android.md 3.7）。
  *        ⚠️ 第八次同样的坑：不 bump，手机上还是那份"每个 MTU 都写不通"的
  *        ble_native.js —— 服务端日志会继续把程序错误演成链路问题。
+ *    v11：这一版修**闪退**（"连接板子后规划导航直接会闪退"），并且让下一次
+ *        出问题时**能自己说清楚是怎么死的**。动了：
+ *          · 新增 crashlog.js（崩溃黑匣子：关键操作前同步落盘 + onerror /
+ *            unhandledrejection 记录 + 下次启动显示"上次运行异常结束，最后的日志"）；
+ *          · ble_native.js：上行通知的**事件名**（真名是 notification|<id>|<svc>|<char>，
+ *            不是 onNotification）与**值的编码**（插件发的是大写十六进制字符串）。
+ *            这两条错着的时候设备上行整条链路是**静默失效**的（电量/按键/PING
+ *            一个都收不到），而手机侧看起来只是"设备没说话"；
+ *          · app.js：第一次发帧 / 起导航 / 停导航前写同步 marker；fgs.js 加了
+ *            note()/crash_report()/clear_crash_report() 三个封装。
+ *        ⚠️ 第九次同样的坑：不 bump，手机上还是那份"崩了什么都不留"的
+ *        index.html + app.js —— 而这一版的核心价值恰恰是那份落盘日志。
+ *    v12：⭐ 修**真机确认过的闪退根因**（dropbox 里有完整栈）：
+ *        `BluetoothGatt.writeCharacteristic` 在 API 33+ 会因为
+ *        `value.length > 512` 直接抛 IllegalArgumentException
+ *        （"value should not be longer than max length of an attribute value"），
+ *        而这条异常**同步抛在插件的回调线程上**，Capacitor 不把它变成 rejected
+ *        promise ⇒ JS 接不住 ⇒ 进程消失。旧代码按 `MTU - 3` 分片，真机 MTU 517
+ *        ⇒ 514 > 512 ⇒ 必闪退。这一版：
+ *          · ble_native.js：分片上界改成 **min(MTU-3, 512)**（512 是框架硬常量，
+ *            证据 = 设备上 framework-bluetooth.jar 的字节码，写在 docs/android.md 第 9 节），
+ *            并且**从 20 字节起步**、只在连续成功之后才升一档（自适应 + 跨启动落盘 +
+ *            黑匣子推断致命失败）；
+ *          · index.html / app.js：新增"高级 / BLE 分片"面板 + 状态面板"分片"那一格
+ *            （看得见当前值、能设上限、能锁定、能清空学习记录），并写明速度代价。
+ *        ⚠️ 第十次同样的坑：不 bump，手机上还是那份"按 MTU-3 分片"的
+ *        ble_native.js —— 而它一连接就闪退，用户连日志都看不到。
  */
-const CACHE = 'navpuck-phone-v10';
+const CACHE = 'navpuck-phone-v12';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [
@@ -72,10 +99,15 @@ const ASSETS = [
   'style.css',
   'manifest.webmanifest',
   'icon.svg',
+  'crashlog.js',
   'navmath.js',
   'proto.js',
   'route.js',
   'map.js',
+  // ⚠️ ble_native.js 以前**不在**这个清单里：offline 打开 PWA 时它取不到，
+  //    只是"没有原生 BLE 传输"这一条退路而已（PWA 本来就走 Web Bluetooth），
+  //    所以一直没人发现。既然是 index.html 里加载的文件，就该一起预缓存。
+  'ble_native.js',
   'ble.js',
   'fgs.js',
   'fgs_ui.js',

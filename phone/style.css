@@ -360,6 +360,24 @@ button.ghost {
 
 .sim-banner b { font-weight: 800; }
 
+/* 崩溃报告（#crash-block，见 crashlog.js）：闪退后唯一能把现场带回来的东西，
+   所以它必须比普通面板醒目 —— 红边框 + 可滚动，且默认是收起的（不挡导航）。 */
+.crash {
+  border-color: #7a2f2f;
+  border-left: 4px solid #e05252;
+  background: #1d0f10;
+}
+.crash summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: #ffb4b4;
+}
+.crash #crash-report {
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 /* 模拟行驶横幅：底色和"手动位置"同一套警示色，但用虚线边框区分 ——
    这个模式车是真的在动，比静态手动位置更容易被误读成真实定位。
    真跑到终点后转成绿色，表示"跑完了、停住了"，而不是还在走。 */

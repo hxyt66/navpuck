@@ -1490,6 +1490,11 @@
       const demo = rt.DEMO_ROUTE;
       this.dest_lat = demo[2][0];
       this.dest_lon = demo[2][1];
+
+      // ⭐ BLE 分片策略（自适应 + 跨启动落盘，见 phone/ble_native.js）。
+      //   init() 里会换成真正的策略对象；这里先占位，保证别处读它不炸。
+      this.chunk_policy = null;
+      this._chunk_last_text = '';
     }
 
     log(line) {
@@ -1502,8 +1507,35 @@
         el.textContent = this.log_lines.join('\n');
         el.scrollTop = el.scrollHeight;
       }
+      // 崩溃捕获：同一行也进 localStorage 的环形缓冲（见 phone/crashlog.js）。
+      // ⚠️ 闪退 = 进程没了，页面上这块 #log 一个字都留不下；只有落盘的那份能在
+      //    下一次启动时告诉用户"崩之前走到哪一步"。这里只是转发，任何失败都吞掉
+      //    —— 诊断绝不能反过来影响导航。
+      this.crash_note(line);
       // 控制台也留一份，用 USB 调试时方便
       if (typeof console !== 'undefined') console.log(s);
+    }
+
+    /** 把一行日志喂给崩溃捕获（PWA 里也有这个模块，只是没有原生那一段）。 */
+    crash_note(line) {
+      try {
+        const C = root.NavPuckCrash;
+        if (C && typeof C.note === 'function') C.note('app', line);
+      } catch (_e) { /* 诊断不能影响导航 */ }
+    }
+
+    /**
+     * 崩溃"黑匣子"：**危险操作之前**同步写一句话进 localStorage。
+     *
+     * ⚠️ 和 crash_note 的区别只有一个但很关键：marker 是**同步落盘**的。
+     *    崩在下一行时，这句话已经在磁盘上了。所以它只能用在"几步一次"的关键
+     *    节点上（开始下发路线 / 起循环 / 停循环），不能放进 10Hz 循环里。
+     */
+    crash_marker(kind, data) {
+      try {
+        const C = root.NavPuckCrash;
+        if (C && typeof C.marker === 'function') C.marker(kind, data);
+      } catch (_e) { /* 同上 */ }
     }
 
     toast(msg, ms) {
@@ -1534,6 +1566,10 @@
       if (rb) rb.disabled = (state === 'connecting' || state === 'up');
       if (state === 'up') this.toast('设备已连接');
       if (state === 'down') this.toast('链路断开', 5000);
+
+      // 链路状态一变，分片那一格也要跟着变：连上之后才有 MTU，
+      // "当前 N 字节 / 已确认 M / 上限 …" 才是完整的。
+      this.update_chunk_ui();
 
       // ---- 时钟：连上就发一次，之后由那个 1 秒看门狗 tick 每 30 秒补一次 ----
       //
@@ -1991,6 +2027,154 @@
       };
     }
 
+    // -- BLE 分片（闪退修复的调节口，见 phone/ble_native.js）------------------
+    /**
+     * 造策略对象 + 接好界面。**必须在造 transport 之前调用**：
+     * transport 每一帧都要问它"这一帧最多能写多少字节"。
+     */
+    init_chunk_policy() {
+      try {
+        const N = root.NavPuckBleNative;
+        if (N && typeof N.create_chunk_policy === 'function') {
+          this.chunk_policy = N.create_chunk_policy({
+            window: root,
+            onLog: (l) => this.log(l),
+          });
+        }
+      } catch (e) {
+        this.chunk_policy = null;
+        this.log(`[ble] 分片策略初始化失败（不影响导航，退到规范默认分片）：${e}`);
+      }
+      if (!this.chunk_policy) {
+        this.log('[ble] ble_native.js 未加载：分片策略不可用（PWA 走 Web Bluetooth 那条路）');
+      }
+      return this.chunk_policy;
+    }
+
+    /** 分片大小变化（自适应升档确认 / 试探开始）时被 transport 回调。 */
+    on_chunk_size_changed(size) {
+      try {
+        // 把 ble.js 的 chunk_size 对齐到原生实际用的大小。
+        // ⚠️ ble.js **一行代码都没改**：它的 chunk_size 本来就是运行时可变的
+        //    （connect 时从 transport.chunk_size_hint 取，降档时回写），这里走
+        //    的是同一条既有契约。不对齐的话，ble.js 会一直按旧的小分片切，
+        //    策略试出来的更大分片永远用不上。
+        const t = this.ble && this.ble.transport;
+        if (t && this.ble.chunk_size !== size) {
+          this.ble.chunk_size = size;
+          this.ble._chunk_known = false;   // 让 ble.js 下一帧重新报一次"分片大小确定"
+        }
+      } catch (_e) { /* 界面/链路状态不能互相拖累 */ }
+      this.update_chunk_ui();
+    }
+
+    /** 政策当前值的一句话（状态面板 + 详情行共用）。 */
+    chunk_status() {
+      const p = this.chunk_policy;
+      if (!p) {
+        return { short: '—', detail: 'PWA（Web Bluetooth）路径：拿不到 MTU，仍按 512→20 试探（见 docs/ble.md 第 2 节）' };
+      }
+      const t = (this.ble && this.ble.transport) || null;
+      const mtu = t ? t.transport_mtu : null;
+      const s = p.snapshot();
+      const cur = t ? this.ble.chunk_size : p.size(mtu);
+      const cap = p.max_safe(mtu);
+      const bits = [];
+      bits.push(`当前 ${cur} 字节`);
+      bits.push(`已确认 ${s.learned}`);
+      bits.push(`上限 ${Math.min(s.ceiling, cap)}（用户上限 ${s.ceiling}／硬上限 min(MTU-3, ${s.max_attr})=${cap}` +
+                `${mtu ? `，MTU ${mtu}` : '，MTU 未知'}）`);
+      bits.push(`自动升档 ${s.auto ? '开' : '关'}`);
+      if (s.trial != null) bits.push(`正在试 ${s.trial}（已连续成功 ${s.ok}/${p.PROBE_OK_FRAMES}）`);
+      if (s.bad.length) bits.push(`判过致死的档位 ${s.bad.join('/')}`);
+      if (s.crash_verdict) {
+        bits.push(`上次崩溃推断：${s.crash_verdict.size}B 致死 → 上限压到 ${s.crash_verdict.ceiling}B` +
+                  (s.crash_verdict.certain ? '' : '（判据不全，按最保守处理）'));
+      }
+      return { short: `${cur} B`, detail: bits.join('；') };
+    }
+
+    /** 把策略现状画到界面（状态面板那一格 + 分片面板里那行详情）。 */
+    update_chunk_ui() {
+      const st = this.chunk_status();
+      const cell = $('chunk-info');
+      if (cell && cell.textContent !== st.short) cell.textContent = st.short;
+      const det = $('chunk-detail');
+      if (det && det.textContent !== st.detail) det.textContent = st.detail;
+      this._chunk_last_text = st.detail;
+    }
+
+    /** 用户把"上限"调了（下拉框）。 */
+    set_chunk_ceiling(n) {
+      if (!this.chunk_policy) return;
+      const v = this.chunk_policy.set_ceiling(parseInt(n, 10));
+      this.apply_chunk_policy();
+      this.toast(`分片上限已设为 ${v} 字节`);
+    }
+
+    /** 用户开关"自动升档"。 */
+    set_chunk_auto(on) {
+      if (!this.chunk_policy) return;
+      const v = this.chunk_policy.set_auto(!!on);
+      this.apply_chunk_policy();
+      this.toast(v ? '已打开自动升档' : '已关闭自动升档（锁在当前上限内，不再往上试）');
+    }
+
+    /** 清空学到的分片大小（换设备/换固件后用户自己按）。 */
+    reset_chunk_learning() {
+      if (!this.chunk_policy) return;
+      this.chunk_policy.reset();
+      this.apply_chunk_policy();
+      this.toast('分片学习记录已清空，下一帧从 20 字节起步');
+    }
+
+    /** 把策略的新上限**立刻**作用到当前链路（降下来是立刻的，升上去靠探测）。 */
+    apply_chunk_policy() {
+      try {
+        const t = this.ble && this.ble.transport;
+        if (t && this.chunk_policy) {
+          const s = this.chunk_policy.size(t.transport_mtu);
+          t.chunk_size_hint = s;
+          if (this.ble.chunk_size > s) {
+            this.ble.chunk_size = s;
+            this.ble._chunk_known = false;
+          }
+        }
+      } catch (_e) { /* 忽略 */ }
+      this.update_chunk_ui();
+    }
+
+    /** 界面初始化：把落盘的值画进控件，并绑事件。 */
+    init_chunk_ui() {
+      const auto = $('opt-chunk-auto');
+      const ceil = $('opt-chunk-ceiling');
+      const btn = $('chunk-reset');
+      if (this.chunk_policy) {
+        const s = this.chunk_policy.snapshot();
+        if (auto) auto.checked = !!s.auto;
+        if (ceil) ceil.value = String(s.ceiling);
+      } else if (auto && ceil) {
+        auto.checked = false;
+        auto.disabled = true;
+        ceil.disabled = true;
+        if (btn) btn.disabled = true;
+      }
+      const on = (id, ev, fn) => {
+        const el = $(id);
+        if (el) el.addEventListener(ev, fn);
+      };
+      on('opt-chunk-auto', 'change', () => {
+        const el = $('opt-chunk-auto');
+        this.set_chunk_auto(!!(el && el.checked));
+      });
+      on('opt-chunk-ceiling', 'change', () => {
+        const el = $('opt-chunk-ceiling');
+        this.set_chunk_ceiling(el && el.value);
+      });
+      on('chunk-reset', 'click', () => this.reset_chunk_learning());
+      this.update_chunk_ui();
+    }
+
     /**
      * 开关街道路网底图（"显示街道路网底图"复选框）。
      *
@@ -2366,6 +2550,8 @@
       // 原生传输对象存在 = 走 APK 那条路（Web Bluetooth 那条路它是 null）。
       const t = this.ble.transport || null;
       if (t) this.render_scan_state('scanning', null, t);
+      // 崩在扫描/连接里也要留下"正在连"这一笔（扫描是 6 秒窗口，最容易出事的段）
+      this.crash_marker('ble_connect_begin', t ? '原生路径' : 'Web Bluetooth 路径');
       try {
         await this.ble.connect();
         if (t) this.render_scan_state('ok', null, t);
@@ -2417,6 +2603,11 @@
       let src = this.active_source();
 
       this.toast('正在规划路线…', 10000);
+      // 崩溃黑匣子：从这一行开始到"路线 + 底图 + 10Hz 循环全部铺好"之间，是
+      // 这一版真机上闪退的那一段。崩了也至少要留下"当时正在给谁规划、开了多大"。
+      this.crash_marker('route_begin', `dest=${dest[0].toFixed(5)},${dest[1].toFixed(5)} ` +
+        `profile=${profile} map=${use_map ? 'on' : 'off'} rate=${rate_hz}Hz ` +
+        `simdrive=${this.simdrive ? 1 : 0} manual=${this.manual ? 1 : 0}`);
       this.log(`[osrm] 起点 ${this.start_lat.toFixed(6)},${this.start_lon.toFixed(6)} ` +
                `-> 终点 ${dest[0].toFixed(6)},${dest[1].toFixed(6)}（${profile}）` +
                `${this.simdrive ? ' [模拟行驶]' : (this.manual ? ' [手动位置]' : '')}`);
@@ -2518,8 +2709,19 @@
         flags: 1,
       })), 'meta', 2);
 
+      // ⚠️ 这一行是这一版真机闪退的分界线：nv.start() 之后，10Hz 循环会**第一次**
+      //    真的把整条路线写出去（以前 rx 门把它们全吞了）。所以把"即将发生的写"
+      //    的完整参数同步落盘 —— 崩在下面的 start()/第一片写里，这一行就是现场。
+      this.crash_marker('nav_start_begin',
+        `route_pts=${route.points.length} route_km=${(route.total_m / 1000).toFixed(2)} ` +
+        `window_pts=${(this.nav.window_pts ? this.nav.window_pts.length : '?')} ` +
+        `mtu=${(this.ble && this.ble.transport && this.ble.transport.transport_mtu) || '?'} ` +
+        `chunk=${this.ble ? this.ble.chunk_size : '?'} ` +
+        `connected=${this.ble && this.ble.connected ? 1 : 0} ` +
+        `queue=${this.ble && this.ble.stats ? this.ble.stats.queue_length : '?'}`);
       this.nav.start();
       this.nav.set_hidden(this.page_hidden());
+      this.crash_marker('nav_started', `rate=${rate_hz}Hz`);
 
       // ---- 原生节拍器的入口（APK）------------------------------------------
       //
@@ -2601,11 +2803,22 @@
 
     send_frame(frame, kind, prio) {
       if (!this.ble || !this.ble.connected) return false;
+      // 每一种帧**第一次**真的要走线上时记一笔（含字节数/分片/MTU）。
+      // 只记第一次：APK 里每秒都在发帧，每次都记会把现场信息挤掉（崩溃报告只有
+      // 最后 40 行）。这一行回答的正是"第一次大写入到底多大"。
+      if (!this._sent_kinds) this._sent_kinds = {};
+      if (!this._sent_kinds[kind]) {
+        this._sent_kinds[kind] = true;
+        this.crash_marker('first_send',
+          `${kind} ${frame.length}B chunk=${this.ble.chunk_size} ` +
+          `mtu=${(this.ble.transport && this.ble.transport.transport_mtu) || '?'}`);
+      }
       return this.ble.send(frame, kind, prio);
     }
 
     stop_nav() {
       if (this.nav) {
+        this.crash_marker('nav_stop', '用户或重新规划触发的停止');
         this.nav.stop();
         this.nav = null;
         this.log('[nav] 循环已停止');
@@ -2643,10 +2856,16 @@
       //    一个字节都不会碰（见 ble.js 文件头"两条传输路径"）。
       //    不在原生环境时 make_transport() 返回 null，BleLink 走原来的
       //    Web Bluetooth 路径 —— 这就是 PWA 那条路还活着的原因。
+      //
+      // ⭐ 分片策略必须先建：transport 每一帧都要问它"最多能写多少字节"
+      //    （真机闪退的根因就是这一处原来取 MTU-3 = 514 > 框架硬上限 512）。
+      this.init_chunk_policy();
       const ble_transport = (root.NavPuckBle && root.NavPuckBle.BleLink)
         ? root.NavPuckBle.BleLink.make_transport({
             window: root,
             onLog: (l) => this.log(l),
+            chunk_policy: this.chunk_policy || undefined,
+            onChunkSize: (size) => this.on_chunk_size_changed(size),
           })
         : null;
 
@@ -2854,6 +3073,10 @@
         const el = $('opt-map');
         this.set_map_enabled(!!(el && el.checked), false);
       });
+
+      // ---- BLE 分片（真机闪退的调节口，见 phone/ble_native.js）----
+      // 恢复落盘的"上限/自动升档"，并把当前分片画进状态面板。
+      this.init_chunk_ui();
 
       // 手机是否固定：默认当作固定（这是 v1 的正确用法）
       const mounted = $('opt-mounted');
