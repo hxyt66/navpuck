@@ -61,6 +61,11 @@
    *   await fgs.probe_stop()
    *   await fgs.probe_report()   拉一次探针读数
    *   fgs.on_probe(cb)           原生每秒推上来的探针事件（页面被冻时收不到，这本身也是证据）
+   *   await fgs.metronome_start() 让**原生**当节拍器：每 100ms 调一次页面里的
+   *                               window.__navpuckNativeTick()（= 10Hz 循环本体）
+   *   await fgs.metronome_stop()
+   *   await fgs.metronome_stats() 一次拿齐原生/页面两侧的判读读数
+   *   ForegroundService.metronome_verdict(prev, cur)  纯函数：增量 -> 一句话结论
    */
   class ForegroundService {
     constructor(opts) {
@@ -180,6 +185,148 @@
       } catch (e) {
         return { available: true, error: String(e) };
       }
+    }
+
+    // -- 原生节拍器（原生 -> JS 的驱动，见 NavPuckFgsPlugin 的注释）----------
+    //
+    // 它回答的是探针留下的那个洞："定时器被冻了"已经实测确认，但
+    // **原生主动调 evaluateJavascript 里的 JS，页面不可见时会不会执行**？
+    // 如果会，原生就能当节拍器、JS 导航栈原地不动；如果不会，循环就得搬原生。
+    //
+    // 全部方法在 PWA 里返回中性值（available:false），一个异常都不抛 ——
+    // 与这个文件其它方法同一条规矩。
+
+    /** 本环境支不支持节拍器（旧版 APK 里没有这两个原生方法）。 */
+    get metronome_available() {
+      return !!(this.plugin && typeof this.plugin.metronomeStart === 'function');
+    }
+
+    /** 起节拍器：原生每 100ms 调一次 window.__navpuckNativeTick()。 */
+    async metronome_start() {
+      if (!this.plugin) return { available: false };
+      if (!this.metronome_available) return { available: true, unsupported: true };
+      try {
+        const r = await this.plugin.metronomeStart();
+        return Object.assign({ available: true }, r);
+      } catch (e) {
+        this.onLog(`❌ 节拍器启动失败：${e && e.message ? e.message : e}`);
+        return { available: true, error: String(e) };
+      }
+    }
+
+    async metronome_stop() {
+      if (!this.plugin) return { available: false };
+      if (!this.metronome_available) return { available: true, unsupported: true };
+      try {
+        return Object.assign({ available: true }, await this.plugin.metronomeStop());
+      } catch (e) {
+        return { available: true, error: String(e) };
+      }
+    }
+
+    /**
+     * 节拍器的全部读数（原生侧 + 页面侧），一次拿齐。
+     *
+     * 不沿用 state()：这个函数的返回值是**判读表**的输入，字段必须是平的、
+     * 名字必须和界面/文档里那张表逐字对应，多一层嵌套只会让读代码的人多绕一次。
+     */
+    async metronome_stats() {
+      const out = {
+        available: !!this.plugin,
+        metronomeSupported: this.metronome_available,
+        running: false,
+        metroTimerFires: 0,
+        ticksDelivered: 0,
+        ticksSkipped: 0,
+        ticksCallbackRejected: 0,
+        inFlightDepth: 0,
+        jsExecCount: 0,
+        framesSent: 0,
+        framesSentTotal: 0,
+        hbCount: 0,
+        ticks: null,
+        ivTicks: null,
+        workerTicks: 0,
+        workerMainTicks: 0,
+        workerErrors: 0,
+        workerMode: '',
+        error: '',
+      };
+      if (!this.plugin) return out;
+      try {
+        const s = await this.plugin.getState();
+        if (s) Object.assign(out, s);
+      } catch (e) {
+        out.error = String(e);
+      }
+      // 顺带把注入探针的数（旧的那种定时器读数）也带上，好在同一行里对比
+      try {
+        const p = await this.plugin.probeReport();
+        if (p) {
+          out.ticks = p.ticks;
+          out.ivTicks = p.ivTicks;
+          out.jsRuns = (p.ticks != null) ? p.ticks : null;
+        }
+      } catch (_e) { /* 探针没开就没这一项，不是错误 */ }
+      return out;
+    }
+
+    /**
+     * 把一份节拍器读数翻成**一句话结论**。
+     *
+     * 这是整个实验的判据，必须机械、必须只看证据。用**增量**判（cur - prev），
+     * 因为要看的是"熄屏这 30 秒里涨了没有"，不是"现在是多少"。
+     *
+     * 每一条对应一种**修法**（见 docs/android.md §5 的判读表）：
+     *   原生响 + JS 执行 + 出帧  => 原生可以当节拍器，**不用移植**
+     *   原生响 + JS 不执行        => 投递进去了但 JS 没跑，循环必须搬进 Kotlin
+     *   原生不响                  => 原生 Handler 都被冻了，先修前台服务/省电策略
+     *   响而投递被跳过            => JS 根本没在收（在途一直不返回）
+     */
+    static metronome_verdict(prev, cur) {
+      if (!cur) return '样本不足';
+      if (!cur.metronomeSupported) {
+        return '这个 APK 里没有节拍器（原生方法不存在）：需要重新构建安装 APK';
+      }
+      const d = (k) => (prev && prev[k] != null && cur[k] != null)
+        ? (cur[k] - prev[k]) : null;
+      const d_native = d('metroTimerFires');
+      const d_exec = d('jsExecCount');
+      const d_frames = d('framesSent');
+      const d_deliv = d('ticksDelivered');
+      const d_skip = d('ticksSkipped');
+      const d_hb = d('hbCount');
+      const d_ticks = d('ticks');
+
+      const num = (v) => (v == null ? '—' : String(v));
+
+      // 没有基线（刚打开面板）时只能给现状，不能下结论 —— 硬下结论就是编数据
+      if (d_native == null) {
+        return `刚建立基线：原生定时器 ${cur.metroTimerFires || 0} 次 / JS 入口执行 ` +
+               `${cur.jsExecCount || 0} 次 / 出帧 ${cur.framesSent || 0}。` +
+               `关屏 30 秒再回来看这一行（看的是**这 30 秒的增量**）。`;
+      }
+
+      if (d_native <= 0) {
+        return `❌ 原生定时器在熄屏期间**没响**（增量为 0），但原生心跳 ${num(d_hb)}` +
+               (d_hb === 0 ? '也没涨 —— 整个进程被冻/被回收了' : '仍在涨 —— 进程活着而 Handler 停了') +
+               `。这是前台服务/厂商省电策略的问题，先修它，别急着搬导航循环。`;
+      }
+      if (d_exec == null || d_exec <= 0) {
+        return `❌ 原生响了 ${d_native} 次、投递 ${num(d_deliv)} 次，但 JS 入口**执行 0 次**` +
+               `（累计仍是 ${cur.jsExecCount || 0}）` +
+               ((cur.ticksCallbackRejected || 0) > 0
+                 ? `，且 evaluateJavascript 回调 ${cur.ticksCallbackRejected} 次回了 null` : '') +
+               `。=> 页面不可见时投递进来的 JS **不会执行**：10Hz 循环必须搬进 Kotlin。`;
+      }
+      if (d_frames != null && d_frames > 0) {
+        return `✅ 原生响了 ${d_native} 次、JS 真执行 ${d_exec} 次、产出 ${d_frames} 帧` +
+               `（跳过 ${num(d_skip)} 次是防堆积的正常现象）。` +
+               `=> **原生可以当节拍器，JS 导航栈原地不动就能在熄屏后继续跑，不需要移植。**`;
+      }
+      return `⚠️ 原生响了 ${d_native} 次、JS 执行 ${d_exec} 次，但**一帧都没发出去**` +
+             `（framesSent 增量 0）。导航循环在跑，卡住的是发帧那一环：` +
+             `查 BLE 是否连着 / send_frame 是否被 ble.connected 挡掉。`;
     }
 
     /**

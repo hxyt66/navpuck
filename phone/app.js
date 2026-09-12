@@ -602,6 +602,27 @@
       this.stats = { max_cycle_ms: 0, max_gap_ms: 0 };
       this._call_count = 0;
 
+      // ---- 原生节拍器（APK）：谁在敲这个循环 ----
+      //
+      // 背景：实测已经证明**熄屏后 JS 定时器会被 Chromium 冻住**（探针的
+      // "JS 跳数"不涨、原生心跳照涨）。但那个探针数的是**定时器回调**，
+      // 而"原生主动调 evaluateJavascript 里的函数，页面不可见时会不会执行"
+      // 是**另一个**问题 —— 后者才决定要不要把循环搬进原生。
+      //
+      // 于是原生可以请求"让我来当节拍器"（每 100ms 调一次 _tick，
+      // 入口是 App.do_route 装的 window.__navpuckNativeTick）。
+      //   _metronome        有没有人（原生页面的诊断面板）把节拍器打开
+      //   exec_count        这个入口**真的执行**了几次 —— 唯一能证明"JS 跑了"的量，
+      //                     由 JS 自己数，原生只搬运
+      //   frames_at_last_exec  最近一次执行时循环累计发过多少帧（诊断面板用它算增量）
+      //
+      // ⚠️ **默认 false，而且只可能由原生侧打开**：PWA 里永远没有谁来调
+      //    set_metronome()，所以浏览器那条路的行为与加这个功能之前一模一样。
+      this._metronome = false;
+      this.exec_count = 0;
+      this.frames_at_last_exec = 0;
+      this.last_metronome_error = '';
+
       // ---- 循环周期（判定"页面在后台被浏览器限流"）----
       //
       // 这三个量全部由 _tick() 里的真实墙钟差值喂进来（唯一知道"这一帧离上一帧
@@ -1055,6 +1076,9 @@
      */
     start() {
       if (this._timer !== null) return;
+      // 节拍器开着的时候**不要**再起 setInterval：两个驱动叠在一起会让
+      // "开了节拍器"这一组的读数翻倍，整张判读表就没法用了。见 set_metronome。
+      if (this._metronome) return;
       const period_ms = 1000.0 / this.cfg.rate_hz;
       this._last_tick_ms = now_ms();
       this._timer = setInterval(() => this._tick(), Math.max(10, period_ms));
@@ -1065,6 +1089,64 @@
         clearInterval(this._timer);
         this._timer = null;
       }
+    }
+
+    /**
+     * 让**原生**接管节拍（每 100ms 调一次 _tick 的调用者由 setInterval 变成
+     * 原生 Handler）。返回是否真的切换了状态。
+     *
+     * 关掉时立刻把 setInterval 起回来，导航不会有"没有人在推"的空档；
+     * 反过来打开时立刻把 setInterval 停掉，避免双驱动。
+     *
+     * ⚠️ 这里**不重算 dt**：_tick 内部按真实墙钟差值算，谁调它都一样。
+     *    这正是"原生当节拍器"这条路能成立的全部理由 —— 循环体一个字都不用改。
+     */
+    set_metronome(on) {
+      const want = !!on;
+      if (want === this._metronome) return false;
+      this._metronome = want;
+      if (want) {
+        this.stop();
+        // 重新对表：_last_tick_ms 停在"上一次由 setInterval 触发"的时刻，
+        // 而那一刻可能已经过去很久（页面被冻过），不重置的话下一帧的 dt
+        // 会顶到 1 秒的上限 —— 模拟行驶会"卡完突然窜一下"。
+        this._last_tick_ms = now_ms();
+      } else {
+        this.start();
+      }
+      return true;
+    }
+
+    get metronome() { return this._metronome; }
+
+    /**
+     * 原生节拍器每次投递进来时**唯一**该走的入口（由 App 装到
+     * window.__navpuckNativeTick，见 do_route）。
+     *
+     * 它做的就一件事：走一遍原来的 _tick()，然后把"这一次真的执行了"记下来。
+     * 计数必须在**这里**加：native 侧看到的是 evaluateJavascript 的回调，
+     * 回调回来了不等于函数体执行了（比如页面被冻时 WebView 可能回 null）。
+     * 只有 JS 自己数的数才能证明 JS 跑了。
+     */
+    native_tick() {
+      this.exec_count += 1;
+      this._tick();
+      this.frames_at_last_exec = this.frames_sent;
+      return this.frames_at_last_exec;
+    }
+
+    /**
+     * 给诊断面板/测试用的一份节拍器快照（只读，不碰内部状态）。
+     */
+    metronome_state() {
+      return {
+        on: this._metronome,
+        running: this.running,
+        executions: this.exec_count,
+        frames_at_last_exec: this.frames_at_last_exec,
+        frames_sent: this.frames_sent,
+        last_error: this.last_metronome_error,
+      };
     }
 
     get running() { return this._timer !== null; }
@@ -1113,6 +1195,16 @@
       return this.loop_slow;
     }
 
+    /**
+     * 一次节拍：算一帧 NAV_UPDATE 并把它发出去（cycle 内部负责发送）。
+     *
+     * 调用者有且只有两个：
+     *   1. setInterval（默认，见 start()）—— 页面在前台时的正常路径；
+     *   2. 原生 Handler -> window.__navpuckNativeTick -> native_tick()
+     *      —— 熄屏诊断时由原生驱动，见 set_metronome()。
+     * 两条路的**循环体完全相同**（就是下面这一坨），这是"原生能不能当节拍器"
+     * 这个实验的前提：只有循环体是同一个，读数才有可比性。
+     */
     _tick() {
       const t0 = now_ms();
       const dt = Math.max(0.001, Math.min(1.0, (t0 - this._last_tick_ms) / 1000.0));
@@ -1126,7 +1218,9 @@
 
       try {
         this.cycle(dt);
+        this.last_metronome_error = '';
       } catch (e) {
+        this.last_metronome_error = String(e);
         this.onLog(`[nav] cycle 抛错：${e}`);
       }
       const cms = now_ms() - t0;
@@ -1332,6 +1426,11 @@
       // `_clock_next_ms = 0` 表示"下一次 tick 立刻发"，连上时就是这样置的。
       this._clock_next_ms = 0;
       this._clock_logged = false;
+
+      // 原生节拍器的入口与只读状态快照（由 _install_native_tick 装上，
+      // 见 App.do_route）。在 PWA 里它们会被装到 window 上但**永远没人调**。
+      this._native_tick = null;
+      this._native_state = null;
 
       // 起点/终点：默认用内置演示航线（西湖），这样没 GPS 也能验证链路
       const demo = rt.DEMO_ROUTE;
@@ -2279,6 +2378,21 @@
 
       this.nav.start();
       this.nav.set_hidden(this.page_hidden());
+
+      // ---- 原生节拍器的入口（APK）------------------------------------------
+      //
+      // 这是"原生主动调 JS"这条路上唯一被调的函数。它必须：
+      //   1. 走的是**同一个**循环体（nav.native_tick -> _tick -> cycle），
+      //      不是另写一份影子逻辑 —— 否则读数只能证明"JS 引擎没死"，
+      //      证明不了"导航能继续跑"，而那正是这次实验要回答的问题；
+      //   2. 幂等、任意频率都安全：_tick 内部按真实墙钟差值算 dt，
+      //      被调 10 次/秒还是 100 次/秒，输出都只取决于墙钟；
+      //   3. 导航停了/重开时行为可预期（见 _clear_native_tick 与 stop_nav）。
+      //
+      // 在 PWA 里这个函数**也会被装上，但永远没人调它**：只有 APK 的诊断面板
+      // 会请求原生起节拍器（见 fgs_ui.js）。浏览器那条路因此一个字都没变。
+      this._install_native_tick();
+
       // 屏幕常亮：**导航开始**时申请（这是"保持 10Hz"唯一真正有用的手段，
       // 见 ScreenWakeLock 那段说明）。request() 自己吞掉所有错误并只写日志，
       // 所以这里不需要 await、更不需要 catch —— 拿不到也绝不能挡住导航。
@@ -2286,6 +2400,61 @@
       this.render_awake_loop(this._ui_last);
       this.toast('导航已启动');
       this.log('[nav] 10Hz 循环已启动');
+    }
+
+    /**
+     * 把原生节拍器的入口装到 window 上（见 do_route 里的调用）。
+     *
+     * 入口名是**跨语言契约**：NavPuckFgsPlugin 的 METRONOME_TICK_JS 里按字面量
+     * 找 window.__navpuckNativeTick。改名字必须两边一起改（docs/android.md §5 有表）。
+     *
+     * 同时挂一份 __navpuckNativeState：原生每帧读回 executions/frames 时要用的
+     * 只读快照。用"对象 + 每次执行时刷新"而不是 getter，是因为 getter 在
+     * 原生读回时也可能被执行，而我们要的是**上一次执行的真实结果**。
+     */
+    _install_native_tick() {
+      const nav = this.nav;
+      if (!nav) return false;
+      const self = this;
+      // ⚠️ 顺序要紧：先建状态对象，再定义会去写它的入口函数。
+      //    反过来写虽然也能跑（闭包到调用时才解析），但"先建好再暴露"
+      //    少一个"第一次调用时 undefined"的隐患。
+      this._native_state = { executions: 0, frames: 0, lastError: '' };
+      this._native_tick = function () {
+        const n = self.nav;
+        // 导航已经停了（stop_nav 把 nav 置空）时不做任何事：原生可能还没收到
+        // "停"的消息，但这里绝不能对着一个空对象调方法而抛错 ——
+        // 抛错会让原生侧看到 error，污染"JS 到底跑没跑"的判读。
+        if (!n) return 0;
+        try {
+          const frames = n.native_tick();
+          self._native_state.executions = n.exec_count;
+          self._native_state.frames = frames;
+          self._native_state.lastError = n.last_metronome_error || '';
+          return frames;
+        } catch (e) {
+          self._native_state.lastError = String(e);
+          return 0;
+        }
+      };
+      root.__navpuckNativeTick = this._native_tick;
+      root.__navpuckNativeState = this._native_state;
+      return true;
+    }
+
+    /** 导航停止时把入口摘掉：留着它就是"往一个已经不在的循环里投帧"。 */
+    _clear_native_tick() {
+      // 只摘自己装的那一个（用引用比对）。别的代码以后也往同名属性上挂东西时，
+      // 这里不会把人家的实现删掉。
+      if (this._native_tick && root.__navpuckNativeTick === this._native_tick) {
+        try { delete root.__navpuckNativeTick; } catch (_e) { root.__navpuckNativeTick = undefined; }
+      }
+      this._native_tick = null;
+      const st = this._native_state;
+      if (st && root.__navpuckNativeState === st) {
+        try { delete root.__navpuckNativeState; } catch (_e) { root.__navpuckNativeState = undefined; }
+      }
+      this._native_state = null;
     }
 
     send_frame(frame, kind, prio) {
@@ -2299,6 +2468,10 @@
         this.nav = null;
         this.log('[nav] 循环已停止');
       }
+      // 原生节拍器的入口跟着导航一起摘掉（见 _clear_native_tick）：
+      // 留着它，原生那 10Hz 的投递就变成"往一个不存在的循环里发帧"——
+      // 每次都返回 0 帧，看起来像"JS 不执行"，会把判读带偏。
+      this._clear_native_tick();
       // 停止导航 = 不再需要屏幕常亮：立刻放开（空闲时占着它是在偷用户的电）。
       // 这里同样**不 await**：release() 内部也不允许抛错。
       this.wake().release();

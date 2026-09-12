@@ -331,6 +331,38 @@ const APP_SRC = fs.readFileSync(path.join(PHONE_DIR, 'app.js'), 'utf8');
   // 这些是有意留着的（结构/样式钩子），列出来是为了可见性，不算失败
   console.log(`      （html 里未被 app.js 引用的 id：${unused.length ? unused.join(', ') : '无'}）`);
   ok(true, '反向引用检查完成（上面这行是信息，不是断言）');
+
+  // ⚠️ fgs_ui.js 是另一块界面接线（后台运行 + 探针 + 原生节拍器），它**不在**
+  //    app.js 里取 id，所以上面那条断言覆盖不到它。以前这里没查它，代价是
+  //    "按钮 id 打错一个字 -> 点了没反应、编译不报错、测试也不报错"。
+  //    原生节拍器那三个按钮尤其要紧：它们是这次设备实验的唯一入口。
+  {
+    const FGS_UI_SRC = fs.readFileSync(path.join(PHONE_DIR, 'fgs_ui.js'), 'utf8');
+    const fgs_refs = new Set();
+    for (const m of FGS_UI_SRC.matchAll(/\$\('([^']+)'\)/g)) fgs_refs.add(m[1]);
+    for (const m of FGS_UI_SRC.matchAll(/on\('([^']+)',\s*'([^']+)'/g)) fgs_refs.add(m[1]);
+    const fgs_missing = [...fgs_refs].filter((id) => !HTML_IDS.has(id)).sort();
+    eq(fgs_missing, [],
+       `fgs_ui.js 引用/绑定的 ${fgs_refs.size} 个 id 全部在 index.html 里存在`);
+
+    // 原生节拍器的读数面板必须真的在页面里（否则 bind 不到、读数无处可显示）
+    for (const id of ['fgs-metro-btn', 'fgs-metro-stop', 'fgs-cmp-btn', 'fgs-metro-out']) {
+      ok(HTML_IDS.has(id), `index.html 里有 #${id}（原生节拍器的按钮/读数）`);
+    }
+    // 这三个按钮的绑定必须真的写出来了（漏一个 = 用户在手机上按不动）
+    for (const [id, ev] of [['fgs-metro-btn', 'click'], ['fgs-metro-stop', 'click'],
+                            ['fgs-cmp-btn', 'click']]) {
+      ok(new RegExp(`on\\('${id}',\\s*'${ev}'`).test(FGS_UI_SRC),
+         `fgs_ui.js 给 #${id} 绑了 ${ev}`);
+    }
+    // 读数里那几根针的名字必须和 docs/android.md 的判读表逐字对应 ——
+    // 对不上的话，用户照着文档找不到界面上的那一行。
+    for (const k of ['metroTimerFires', 'ticksDelivered', 'ticksSkipped',
+                     'ticksCallbackRejected', 'jsExecCount', 'framesSent',
+                     'workerTicks', 'workerMainTicks', 'hbCount', 'ticks']) {
+      ok(FGS_UI_SRC.includes(k), `fgs_ui.js 的读数里带着 ${k}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,7 +1191,123 @@ section('10] NAV_CLOCK：点"连接设备"后真的把手机时间发出去了')
 }
 
 // ---------------------------------------------------------------------------
-section('11] "不支持 Web Bluetooth" 的提示路径');
+section('11] 原生节拍器：入口、计数、切换（"要不要把循环搬进原生"那把尺子）');
+// ---------------------------------------------------------------------------
+//
+// 这一节钉住的是**这次设备实验能不能得出结论**所依赖的那几件事。
+// 设备上的现象我在这里测不了（那是真机实验），但下面这些是纯逻辑，
+// 任何一条错了，手机上那次实验就是白跑：
+//   1. window.__navpuckNativeTick 真的被 do_route 装上（没装 = 读数是 0 =
+//      看起来跟"JS 被冻住"一模一样，会把结论做反）；
+//   2. 入口调的是**同一个**循环体（帧数真的涨），不是另写一份影子逻辑；
+//   3. exec_count 只在**入口真的执行**时涨（唯一能证明"JS 跑了"的量）；
+//   4. set_metronome(true) 会把 setInterval 停掉（双驱动会让读数翻倍）。
+{
+  const RT = require(path.join(PHONE_DIR, 'route.js'));
+  const FGS = require(path.join(PHONE_DIR, 'fgs.js'));
+
+  // 自带的一条小航线（与集成自测同一个套路：不依赖网络、不依赖 GPS）
+  const route = new RT.Route(RT.DEMO_ROUTE.map((p) => [p[0], p[1], p[2]]), true);
+
+  const A = new APP.App();
+  A.init();
+  const sim = new APP.RouteSimSource({});
+  sim.set_route(route);
+  sim.active = true;
+  const nav = new APP.Navigator(route, sim, {
+    send: () => true, onLog: () => {}, onUi: () => {},
+    config: { no_map: true },
+  });
+  A.nav = nav;
+  nav.start();
+
+  // ---- 1) 入口装上 / 摘掉 ----
+  eq(typeof globalThis.__navpuckNativeTick, 'undefined',
+     'init() 之后入口还没装（它由 do_route 装，不是全局常驻）');
+  A._install_native_tick();
+  eq(typeof globalThis.__navpuckNativeTick, 'function',
+     'do_route 的那一步装上 window.__navpuckNativeTick');
+  ok(globalThis.__navpuckNativeState &&
+     typeof globalThis.__navpuckNativeState.executions === 'number',
+     '同时挂上只读状态快照 __navpuckNativeState（原生每帧读回 executions/frames）');
+
+  // ---- 2) 幂等：连调 5 次 = 走 5 帧 ----
+  const f0 = nav.frames_sent;
+  const e0 = nav.exec_count;
+  for (let i = 0; i < 5; i++) globalThis.__navpuckNativeTick();
+  eq(nav.exec_count - e0, 5, '入口被调 5 次就执行 5 次（真正的 _tick，不是影子逻辑）');
+  ok(nav.frames_sent - f0 >= 4,
+     `5 次调用真的产出了导航帧（${f0} -> ${nav.frames_sent}）——` +
+     '只数调用次数而不动导航的话，这个实验就白做了');
+  eq(globalThis.__navpuckNativeState.executions, nav.exec_count,
+     '__navpuckNativeState.executions 与 Navigator 自己的 exec_count 一致');
+
+  // ---- 3) 节拍器开关：把 setInterval 让出来 / 还回去 ----
+  eq(nav.metronome, false, '默认没开节拍器（浏览器/PWA 那条路一个字都不变）');
+  nav.set_metronome(true);
+  eq(nav.metronome, true, 'set_metronome(true) 生效');
+  eq(nav.running, false, '开了节拍器就把 setInterval 停掉（双驱动会让读数翻倍）');
+  const f1 = nav.frames_sent;
+  globalThis.__navpuckNativeTick();
+  ok(nav.frames_sent > f1, '节拍器模式下，循环体仍然每调一帧地出帧');
+  nav.set_metronome(false);
+  eq(nav.running, true, '关掉节拍器立刻把 setInterval 起回来（导航不能没人推）');
+  eq(nav.set_metronome(false), false, '重复关闭是幂等的（返回 false = 状态没变）');
+
+  // ---- 4) 导航停了以后入口必须安全（原生可能还没收到"停"） ----
+  A.stop_nav();
+  eq(A.nav, null, 'stop_nav() 把 nav 置空');
+  eq(typeof globalThis.__navpuckNativeTick, 'undefined',
+     'stop_nav() 顺手把入口摘掉（留着它 = 往一个不存在的循环里投帧，看起来像"JS 不执行"）');
+  const before = nav.exec_count;
+  eq(nav.native_tick() >= 0, true, '（脱手后直接调 Navigator.native_tick 也不抛错）');
+  eq(nav.exec_count, before + 1, '（这一条只是确认计数仍然自洽）');
+
+  // ---- 5) metronome_verdict：判读表本身 ----
+  // 这个纯函数是整份实验的判据，每一行对应一种**修法**，必须逐条钉住。
+  const R = (o) => Object.assign({
+    metronomeSupported: true, running: true,
+    metroTimerFires: 0, ticksDelivered: 0, ticksSkipped: 0,
+    ticksCallbackRejected: 0, jsExecCount: 0, framesSent: 0,
+    workerTicks: 0, workerMainTicks: 0, hbCount: 0, ticks: 0,
+  }, o);
+  const base = R({ hbCount: 10, ticks: 1000, metroTimerFires: 0, jsExecCount: 0, framesSent: 0 });
+
+  ok(/没有节拍器/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ metronomeSupported: false }))),
+     '旧 APK（原生方法不存在）=> 明说"这个 APK 里没有节拍器"，不硬下结论');
+
+  // ⚠️ 第一次采样时 prev 是 null（面板刚打开）—— 这时**不能**下结论：
+  //    增量还不存在，"全都没动"和"刚建立基线"在数字上完全一样，
+  //    硬下结论就会把"还没开始测"说成"JS 被冻住了"。
+  ok(/刚建立基线/.test(FGS.ForegroundService.metronome_verdict(null, base)),
+     '没有基线（prev=null）时不编结论，只说"先关屏 30 秒"');
+
+  ok(/没响/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ hbCount: 40, metroTimerFires: 0 }))),
+     '原生定时器不涨 => 先修前台服务/省电策略（不是搬循环）');
+
+  ok(/执行 0 次/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ hbCount: 40, metroTimerFires: 300, ticksDelivered: 300,
+           jsExecCount: 0, framesSent: 0 }))) &&
+     /必须搬进 Kotlin/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ hbCount: 40, metroTimerFires: 300, ticksDelivered: 300,
+           jsExecCount: 0, framesSent: 0 }))),
+     '原生响了、JS 执行 0 次 => **循环必须搬进 Kotlin**（这是要移植的那一行）');
+
+  ok(/不需要移植/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ hbCount: 40, metroTimerFires: 300, ticksDelivered: 300, ticksSkipped: 2,
+           jsExecCount: 300, framesSent: 295 }))),
+     '原生响了、JS 执行了、出帧了 => **原生可以当节拍器，不用移植**');
+
+  ok(/一帧都没发出去/.test(FGS.ForegroundService.metronome_verdict(base,
+       R({ hbCount: 40, metroTimerFires: 300, ticksDelivered: 300,
+           jsExecCount: 300, framesSent: 0 }))),
+     '循环在跑但一帧没出 => 指向发帧那一环（BLE/连接），不是架构问题');
+}
+
+// ---------------------------------------------------------------------------
+section('12] "不支持 Web Bluetooth" 的提示路径');
 // ---------------------------------------------------------------------------
 // ⚠️ 这一节必须放在最后：它会再新建一个 App 实例，而 DOM 桩是共享的 ——
 //    新实例 init() 会把**它自己的**监听器绑到同一批元素上，之后任何一次

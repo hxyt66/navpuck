@@ -387,6 +387,32 @@ button.ghost {
   flex: 0 1 10em;
 }
 
+/* ---------- 后台诊断的读数面板（探针 / 原生节拍器） ---------- */
+
+/*
+ * 这两块是**给人在阳光下、戴着手套、单手拿手机看**的读数，所以：
+ *   - 等宽字体 + 保留空格：每一列要对齐，"↑+312"这种增量必须一眼扫到；
+ *   - 关掉 .hint 的 word-break: break-all：那个规则会把一行拆得七零八落，
+ *     判读表就散了（宁可横向滚动，也不要换行错位）；
+ *   - 保留换行、给一点底色：读数块和正文提示要在视觉上分开。
+ */
+#fgs-probe-out,
+#fgs-metro-out {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  font-size: .72rem;
+  line-height: 1.45;
+  color: var(--fg);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 8px 0 0;
+  white-space: pre;
+  word-break: normal;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 /* ---------- 日志 ---------- */
 
 #log {

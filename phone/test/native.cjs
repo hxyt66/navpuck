@@ -448,7 +448,7 @@ section('9] 字节序列化：DataView 和 base64 两种都要能吃');
 // ---------------------------------------------------------------------------
 // 10] fgs.js：前台服务封装在 PWA 里必须完全无声
 // ---------------------------------------------------------------------------
-section('10] 前台服务封装：PWA 里一个异常都不能抛');
+section('10] 前台服务封装：PWA 里一个异常都不能抛（含原生节拍器）');
 {
   const FGS = require(path.join(PHONE_DIR, 'fgs.js'));
   const pwa = { navigator: {} };
@@ -462,6 +462,27 @@ section('10] 前台服务封装：PWA 里一个异常都不能抛');
   eq((await fgs.probe_start()).available, false, 'probe_start() 同样');
   eq((await fgs.probe_stop()).available, false, 'probe_stop() 同样');
   eq((await fgs.probe_report()).available, false, 'probe_report() 同样');
+
+  // 原生节拍器（APK 里才有的那条路）在 PWA 里也必须**完全无声**：
+  // 一个"浏览器里悄悄起了个定时器去驱动导航"的实现，会直接违反
+  // "PWA 的行为与加这个功能之前一模一样"这条硬要求。
+  eq(fgs.metronome_available, false, 'PWA 里 metronome_available = false（没有原生方法）');
+  eq((await fgs.metronome_start()).available, false, 'metronome_start() 返回 {available:false}，不抛错');
+  eq((await fgs.metronome_stop()).available, false, 'metronome_stop() 同样');
+  {
+    const ms = await fgs.metronome_stats();
+    eq(ms.available, false, 'metronome_stats() 同样不抛错');
+    // 字段必须是**平**的、名字与判读表一致（界面直接按名字读）
+    for (const k of ['metroTimerFires', 'ticksDelivered', 'ticksSkipped',
+                     'ticksCallbackRejected', 'jsExecCount', 'framesSent',
+                     'workerTicks', 'workerMainTicks']) {
+      ok(k in ms, `metronome_stats() 里始终有 ${k}（PWA 下为 0）`);
+    }
+    eq(ms.jsExecCount, 0, 'PWA 下 jsExecCount = 0');
+  }
+  ok(/没有节拍器/.test(FGS.ForegroundService.metronome_verdict(null,
+       { metronomeSupported: false })),
+     'metronome_verdict：没有原生方法时不硬下结论，直说"这个 APK 里没有节拍器"');
 
   // verdict() 是纯函数：两根秒针的差 -> 结论。这段逻辑是"熄屏后还行不行"
   // 这个问题的判据，必须钉住。

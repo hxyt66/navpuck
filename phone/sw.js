@@ -35,8 +35,16 @@
  *           日志和界面（"已发 / 丢"那一格）。
  *        ⚠️ 第五次同样的坑：不 bump，手机上还是那版"偶尔把空片吃掉、而且计数
  *        一直是 0"的 ble.js —— 症状是设备上偶尔出现新旧窗口拼出来的假路线。
+ *    v8：加入**原生节拍器**（app.js / fgs.js / fgs_ui.js / index.html / style.css
+ *        都动了）：APK 里可以开关"由原生每 100ms 驱动 JS 循环"，用来回答
+ *        "熄屏后原生主动调的 JS 会不会执行"——这一条决定导航循环要不要搬进原生。
+ *        同时把 fgs.js / fgs_ui.js 加进预缓存清单（以前它们不在，只是靠
+ *        "首次访问时被 fetch 顺带缓存"兜着，离线打开时面板会整个缺失）。
+ *        ⚠️ 第六次同样的坑：不 bump，手机上的 PWA 还是那版没有节拍器面板的
+ *        index.html + app.js —— 而"读数是旧的"正是这类诊断最危险的失败模式
+ *        （人会对着一份过期读数下结论）。
  */
-const CACHE = 'navpuck-phone-v7';
+const CACHE = 'navpuck-phone-v8';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [
@@ -49,6 +57,8 @@ const ASSETS = [
   'route.js',
   'map.js',
   'ble.js',
+  'fgs.js',
+  'fgs_ui.js',
   'app.js'
 ];
 

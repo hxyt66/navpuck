@@ -300,6 +300,24 @@
       <button id="fgs-probe-stop" type="button" class="ghost">停止探针</button>
     </div>
     <pre id="fgs-probe-out" class="hint">探针未启动</pre>
+
+    <h2>原生节拍器（决定要不要移植的那个实验）</h2>
+    <p class="hint">
+      上面的探针数的是<b>定时器回调</b>，它已经证明熄屏后 JS 定时器会被冻住。
+      但它回答不了真正决定架构的那个问题：<b>页面不可见时，原生主动调
+      <code>evaluateJavascript("window.__navpuckNativeTick()")</code>，JS 会不会执行？</b><br>
+      会 &rarr; 原生可以当节拍器，JS 导航栈原地不动，<b>不用移植</b>；
+      不会 &rarr; 10Hz 循环必须搬进 Kotlin。<br>
+      <b>用法（30 秒）</b>：先点上面的「规划并开始导航」（必须先有导航，节拍器调的
+      就是导航循环本体），再点「开启原生节拍器」，然后关屏放桌上 30 秒，
+      解锁回来直接看下面这一行 —— 它会自己把结论写出来。
+    </p>
+    <div class="btn-row">
+      <button id="fgs-metro-btn" type="button">开启原生节拍器</button>
+      <button id="fgs-metro-stop" type="button" class="ghost">停止节拍器</button>
+      <button id="fgs-cmp-btn" type="button" class="ghost">重置基线</button>
+    </div>
+    <pre id="fgs-metro-out" class="hint">节拍器未开启</pre>
   </details>
 
   <!-- 诊断日志：仅在 body.show-log 时显示 -->
