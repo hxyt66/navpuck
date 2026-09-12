@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="NavPuck">
+  <title>NavPuck</title>
+  <defs>
+    <linearGradient id="arrow" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#12b45f"/>
+      <stop offset="1" stop-color="#6dffae"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 铺满画布的背景，便于 maskable 裁切 -->
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="#0b0e13"/>
+  <rect x="6" y="6" width="500" height="500" rx="90" fill="none" stroke="#1d2a3a" stroke-width="12"/>
+
+  <!-- 圆环：全部位于中心 80% 安全区内 -->
+  <circle cx="256" cy="256" r="176" fill="none" stroke="#1f4d7a" stroke-width="20"/>
+
+  <!-- 导航箭头 -->
+  <path d="M256 150 L348 366 L256 314 L164 366 Z" fill="url(#arrow)"/>
+</svg>

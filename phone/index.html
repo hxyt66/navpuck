@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e13">
+<meta name="description" content="NavPuck 手机端导航大脑：通过 BLE 向 ESP32 摩托导航显示屏推送导航帧。">
+<title>NavPuck 导航</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<noscript>
+  <p class="noscript">本应用需要启用 JavaScript 才能运行。</p>
+</noscript>
+
+<div id="app">
+
+  <!-- 顶部：连接状态与设备操作 -->
+  <header class="top">
+    <div class="top-row">
+      <h1>NavPuck 导航</h1>
+      <span id="link-state" data-state="idle">未连接</span>
+    </div>
+    <div class="top-row meta">
+      <span id="device-name">未选择设备</span>
+      <span id="battery">—</span>
+    </div>
+    <div class="top-row actions">
+      <button id="connect-btn" type="button">连接设备</button>
+      <button id="disconnect-btn" type="button" class="ghost">断开</button>
+    </div>
+  </header>
+
+  <!-- 手动位置横幅：模拟运行必须一眼可辨，免得把测试当成真实定位 -->
+  <p id="manual-badge" class="sim-banner" hidden>
+    ⚠️ 正在使用<b>手动位置</b>（模拟坐标，不是真实 GPS）
+  </p>
+
+  <!-- 状态面板：实时读数 -->
+  <section class="panel" aria-label="实时状态">
+    <div class="grid">
+      <div class="cell">
+        <span class="cap">速度</span>
+        <span id="speed" class="val">0</span>
+      </div>
+      <div class="cell">
+        <span class="cap">剩余</span>
+        <span id="remaining" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">下一个动作</span>
+        <span id="next-turn" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">距路口</span>
+        <span id="turn-dist" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">视距</span>
+        <span id="view-range" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">进度</span>
+        <span id="progress" class="val">0%</span>
+      </div>
+      <div class="cell">
+        <span class="cap">航向</span>
+        <span id="heading" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">预计剩余</span>
+        <span id="eta" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">已发帧</span>
+        <span id="frames" class="val">0</span>
+      </div>
+      <div class="cell">
+        <span class="cap">底图</span>
+        <span id="map-info" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">定位</span>
+        <span id="gps-state" class="val">等待</span>
+      </div>
+      <div class="cell">
+        <span class="cap">定位次数</span>
+        <span id="gps-fixes" class="val">0</span>
+      </div>
+      <div class="cell">
+        <span class="cap">精度</span>
+        <span id="gps-accuracy" class="val">—</span>
+      </div>
+    </div>
+    <!-- 定位的错误/来源与"下一步该做什么"：日志默认是收起的，这两行必须常显 -->
+    <p id="gps-error" class="hint">还没有收到任何定位数据</p>
+    <p id="gps-hint" class="hint warn" hidden></p>
+    <!-- 底图（Overpass）的详情：抓取中/不可用/来自缓存，都在这一行说清楚。
+         公共 Overpass 会整体挂掉，而"等待路网"四个字什么也没说明白 -->
+    <p id="map-detail" class="hint" hidden></p>
+  </section>
+
+  <!-- 目的地与路线 -->
+  <section class="panel" aria-label="目的地">
+    <h2>目的地</h2>
+    <div class="fld">
+      <label for="dest-lat">纬度</label>
+      <input id="dest-lat" type="number" step="any" inputmode="decimal" placeholder="纬度" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="dest-lon">经度</label>
+      <input id="dest-lon" type="number" step="any" inputmode="decimal" placeholder="经度" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="dest-preset">常用地点</label>
+      <select id="dest-preset">
+        <option value="">自定义坐标</option>
+        <option value="30.2545,120.1350">杭州 北山街</option>
+        <option value="30.2585,120.1490">杭州 断桥残雪</option>
+        <option value="30.2500,120.1600">杭州 湖滨路</option>
+        <option value="30.2330,120.1530">杭州 南山路</option>
+        <option value="39.9097,116.3974">北京 天安门</option>
+        <option value="31.2397,121.4998">上海 外滩</option>
+        <option value="22.5431,114.0579">深圳 市民中心</option>
+      </select>
+    </div>
+    <div class="btn-row">
+      <button id="use-gps-btn" type="button" class="ghost">用当前位置作起点</button>
+    </div>
+    <div class="btn-row">
+      <button id="route-btn" type="button">规划并开始导航</button>
+      <button id="stop-btn" type="button" class="ghost">停止</button>
+    </div>
+    <p id="start-info" class="hint">起点：未确定</p>
+    <p id="route-info" class="hint">路线：未规划</p>
+  </section>
+
+  <!-- 高级：手动/模拟定位。室内收不到 GPS 时，用它把整条链路（BLE -> 路线 ->
+       底图 -> 10Hz 更新 -> 设备显示）跑通，不依赖任何卫星 -->
+  <details class="panel opts">
+    <summary>高级 / 手动定位</summary>
+    <div class="opt">
+      <input id="opt-manual" type="checkbox">
+      <label for="opt-manual">使用手动位置（模拟，不用 GPS）</label>
+    </div>
+    <div class="fld">
+      <label for="man-lat">纬度</label>
+      <input id="man-lat" type="number" step="any" inputmode="decimal"
+             placeholder="十进制度，如 30.254500" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="man-lon">经度</label>
+      <input id="man-lon" type="number" step="any" inputmode="decimal"
+             placeholder="十进制度，如 120.135000" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="man-heading">航向</label>
+      <input id="man-heading" type="number" step="any" inputmode="decimal" value="0"
+             placeholder="度，0=正北" autocomplete="off">
+    </div>
+    <div class="fld">
+      <label for="man-speed">速度</label>
+      <input id="man-speed" type="number" step="any" min="0" inputmode="decimal" value="0"
+             placeholder="米/秒，只影响速度与 ETA 显示" autocomplete="off">
+    </div>
+    <div class="btn-row">
+      <button id="man-apply" type="button" class="ghost">应用手动位置</button>
+    </div>
+    <p class="hint">
+      勾选或按"应用"后，导航改用这里填的坐标，<b>不再</b>读取 GPS：位置是静态的
+      （车不动、地图不滚），只有航向会影响地图旋转 —— 设备没有磁力计，"车头朝上"
+      必须由手机提供，所以想验证地图转得对不对，就改这里的航向（0=正北，顺时针）。
+      模拟期间顶部会一直显示"手动位置"横幅，避免把测试误当成真实定位。
+    </p>
+  </details>
+
+  <!-- 选项 -->
+  <details class="panel opts">
+    <summary>选项</summary>
+    <div class="opt">
+      <input id="opt-map" type="checkbox" checked>
+      <label for="opt-map">显示街道路网底图</label>
+    </div>
+    <p class="hint">
+      底图来自公共 Overpass 服务（免费、无 key），抓不到时<b>不影响导航</b>：路线、箭头、
+      转向提示和 10Hz 更新照常。关掉它就一个 Overpass 请求都不发（省流量、省电，
+      Overpass 挂掉时也不会有任何等待）；这个选择会被记住。
+    </p>
+    <div class="opt">
+      <label for="opt-osrm-profile">路线模式</label>
+      <select id="opt-osrm-profile">
+        <option value="driving">驾车</option>
+        <option value="cycling">骑行</option>
+        <option value="foot">步行</option>
+      </select>
+    </div>
+    <div class="opt">
+      <label for="opt-rate">帧率 Hz</label>
+      <input id="opt-rate" type="number" value="10" min="1" max="20" inputmode="numeric">
+    </div>
+    <div class="opt">
+      <input id="opt-mounted" type="checkbox" checked>
+      <label for="opt-mounted">手机与车头同向固定</label>
+    </div>
+    <p class="hint">
+      设备没有磁力计，"相对车头方位"必须由手机提供。取消勾选（手机放口袋）后箭头会
+      改用路线切线方向，不再表示"相对车头"。
+    </p>
+    <div class="opt">
+      <input id="opt-log" type="checkbox">
+      <label for="opt-log">显示日志</label>
+    </div>
+  </details>
+
+  <!-- 诊断日志：仅在 body.show-log 时显示 -->
+  <pre id="log"></pre>
+
+  <!-- 瞬时提示 -->
+  <div id="toast"></div>
+
+  <!-- 浏览器不支持提示 -->
+  <div id="unsupported" hidden>
+    <strong>当前浏览器不支持 Web Bluetooth</strong>
+    <span>请使用 Android 版 Chrome 打开本页面，且仅能通过 https 或 localhost 访问。</span>
+  </div>
+
+</div>
+
+<!-- 逻辑模块：均为经典脚本（UMD/全局挂载），顺序不可更改 -->
+<script src="navmath.js"></script>
+<script src="proto.js"></script>
+<script src="route.js"></script>
+<script src="map.js"></script>
+<script src="ble.js"></script>
+<script src="app.js"></script>
+
+<script>
+// 注册 Service Worker；file:// 下会失败，静默忽略即可
+try {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js')['catch'](function () {});
+  }
+} catch (e) { /* 忽略 */ }
+</script>
+
+</body>
+</html>
