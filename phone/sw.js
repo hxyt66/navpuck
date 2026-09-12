@@ -43,8 +43,20 @@
  *        ⚠️ 第六次同样的坑：不 bump，手机上的 PWA 还是那版没有节拍器面板的
  *        index.html + app.js —— 而"读数是旧的"正是这类诊断最危险的失败模式
  *        （人会对着一份过期读数下结论）。
+ *    v9：修 APK 里"连接设备永远扫不到"（ble_native.js / app.js / index.html /
+ *        style.css / AndroidManifest.xml 都动了）。两件事：
+ *        1) BLE 扫描**不再依赖定位**：插件 initialize({androidNeverForLocation:true})
+ *           + 清单里 BLUETOOTH_SCAN 加 android:usesPermissionFlags="neverForLocation"
+ *           （Android 12+ 以前要求"定位权限 + 定位服务开着"才给扫描结果，
+ *           缺一个就静默返回空 —— 而网页那条路走 Chrome 自己的实现，不受影响，
+ *           所以"同一个手机网页能连、APK 连不上"）；
+ *        2) 扫描失败不再静默：日志里打真实的权限状态/蓝牙开关/收到的广播条数，
+ *           界面上把"权限被拒""蓝牙没开""扫完了但没有广播"分成三种说法，
+ *           并加了「重试扫描」。
+ *        ⚠️ 第七次同样的坑：不 bump，手机上还是那份"点连接只报没找到设备"的
+ *        index.html + app.js + ble_native.js —— 而这一版修的正是它。
  */
-const CACHE = 'navpuck-phone-v8';
+const CACHE = 'navpuck-phone-v9';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [

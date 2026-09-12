@@ -77,6 +77,57 @@
   const LOOP_SLOW_MS = 400.0;
 
   // -------------------------------------------------------------------------
+  // 原生（APK）扫描失败：三种失败**必须**看得出区别
+  // -------------------------------------------------------------------------
+  //
+  // 用户报的现象是"APK 里点连接设备报没找到设备，同一个手机用网页能连上"。
+  // 根因在 ble_native.js（扫描被绑在定位权限上）里修掉了，但**另一个**问题是
+  // 它从来不说人话：权限被拒、蓝牙没开、扫完了但没有广播，这三种以前都只显示
+  // 一句"没找到设备" —— 而它们的修法完全不同（开权限 / 开蓝牙 / 去断开别处
+  // 的连接或给设备上电）。用户没法自己分类，就只能反复试。
+  //
+  // 判据是 ble_native.js 抛出的 **错误码**（err.code），不是错误文案：
+  // 文案随时会改，用文案做判据的界面和测试都是脆的。
+  //
+  // state 用的是和 #gps-state / #map-info 同一套配色约定：
+  //   bad  = 红（扫描**根本没跑**）; warn = 黄（跑了但没收到）; ok = 绿。
+  const SCAN_FAIL = {
+    NAV_BLE_PERMISSION_DENIED: {
+      state: 'bad',
+      lead: '扫描没能开始：蓝牙权限被拒绝。',
+      hint: '⚠️ 这一条不是"设备没开机"：扫描根本没跑起来。没有「附近的设备」权限时，' +
+            'Android 不报错，只是永远返回空结果。请到 设置 → 应用 → NavPuck → 权限 → ' +
+            '附近的设备 里允许，回到本页点「重试扫描」。',
+    },
+    NAV_BLE_ADAPTER_OFF: {
+      state: 'bad',
+      lead: '扫描没能开始：手机的蓝牙是关闭的。',
+      hint: '⚠️ 蓝牙关着时同样不报错、只返回空结果 —— 和"没有设备"看起来一模一样，' +
+            '但修法完全不同。请在系统里打开蓝牙，再点「重试扫描」。',
+    },
+    NAV_BLE_SCAN_FAILED: {
+      state: 'bad',
+      lead: '扫描没能开始：蓝牙扫描接口直接报错。',
+      hint: '这是插件/系统当场拒绝（不是"没扫到"）。具体原文看下面那一行；' +
+            '点「重试扫描」可以再来一次。',
+    },
+    NAV_BLE_NO_DEVICE: {
+      state: 'warn',
+      lead: '扫描已经跑完，但一条 NavPuck 广播都没收到。',
+      hint: '⚠️ 这一条和上面两种不是一回事：权限和蓝牙开关都正常，扫描真的执行了。' +
+            '最常见的解释是设备正被别的中心连着（刚才的网页 / 上一个 App）——' +
+            'BLE 外设一旦被连上就会停止广播；其次才是设备没上电。' +
+            '请先在那边断开（或关掉那个页面），或给设备断电重启，然后点「重试扫描」。',
+    },
+  };
+
+  /** 错误 -> SCAN_FAIL 的键；没有错误码（Web 路径 / 老插件）返回 null。 */
+  function scan_fail_kind(e) {
+    const code = e && e.code;
+    return (typeof code === 'string' && SCAN_FAIL[code]) ? code : null;
+  }
+
+  // -------------------------------------------------------------------------
   // 小工具
   // -------------------------------------------------------------------------
   const $ = (id) => {
@@ -1426,6 +1477,9 @@
       // `_clock_next_ms = 0` 表示"下一次 tick 立刻发"，连上时就是这样置的。
       this._clock_next_ms = 0;
       this._clock_logged = false;
+      // "上一次发送失败了没有"。用来给失败日志去重（见 send_clock）——
+      // 与 _clock_logged 分开：那个管"成功只报一次"，这个管"失败别刷屏"。
+      this._clock_failed = false;
 
       // 原生节拍器的入口与只读状态快照（由 _install_native_tick 装上，
       // 见 App.do_route）。在 PWA 里它们会被装到 window 上但**永远没人调**。
@@ -1474,6 +1528,10 @@
       if (cb) cb.disabled = (state === 'connecting' || state === 'up');
       const db = $('disconnect-btn');
       if (db) db.disabled = (state === 'idle');
+      // "重试扫描"跟"连接设备"是同一件事的两个入口：扫描中/已连上时不能重复点。
+      // （失败之后这个按钮由 render_scan_state 显出来，见 do_connect。）
+      const rb = $('rescan-btn');
+      if (rb) rb.disabled = (state === 'connecting' || state === 'up');
       if (state === 'up') this.toast('设备已连接');
       if (state === 'down') this.toast('链路断开', 5000);
 
@@ -1531,13 +1589,27 @@
       // 写反的后果是设备上的钟差**一整个时区**，而屏幕上看起来完全正常。
       const frame = proto.encode_nav_clock(proto.now_clock());
       const ok = this.send_frame(frame, 'ctl', 1);
-      // 只记第一次（不每 30 秒刷一行日志，日志面板就那么高）
-      if (!this._clock_logged) {
-        this._clock_logged = true;
-        const c = proto.now_clock();
-        this.log(`[clock] 已下发设备时间 ${new Date(c.epoch_s * 1000).toLocaleString()}` +
-                 `（时区 ${c.tz_offset_min >= 0 ? '+' : ''}${c.tz_offset_min} 分钟）` +
-                 `${ok ? '' : '（链路未就绪，下一次重试）'}`);
+      // 日志只在**状态变化**时写一行（日志面板就那么高，每 30 秒刷一行会把它淹掉），
+      // 但"只记成功那一次"和"只记第一次尝试"是两件不同的事：
+      //
+      // ⚠️ `_clock_logged` 必须**发成功之后**才置位。原来它是"第一次尝试"就置位的
+      //    （无论成败），于是"连上那一瞬间链路还没就绪"会把唯一的日志名额用掉：
+      //    之后每 30 秒的补发**即使全部成功**，日志面板上也永远只有最初那条
+      //    "链路未就绪"。真机上排查"主页还是 --:--"时，这一点会把人直接引到
+      //    "手机根本没发过"这个错误结论上 —— 而实际是发了、只是没到。
+      //    失败也照样留痕（不静默），但按"从好变坏"去重，不刷屏。
+      const c = proto.now_clock();
+      const line = `[clock] 设备时间 ${new Date(c.epoch_s * 1000).toLocaleString()}` +
+                   `（时区 ${c.tz_offset_min >= 0 ? '+' : ''}${c.tz_offset_min} 分钟）`;
+      if (ok) {
+        this._clock_failed = false;
+        if (!this._clock_logged) {
+          this._clock_logged = true;
+          this.log(`${line} 已下发`);
+        }
+      } else if (!this._clock_failed) {
+        this._clock_failed = true;
+        this.log(`${line} **没送进发送队列**（链路未就绪，30 秒后自动重试）`);
       }
       return ok;
     }
@@ -2226,13 +2298,83 @@
     }
 
     // -- 连接 --------------------------------------------------------------
+
+    /**
+     * 把一次扫描的结果写进顶部那两行诊断（只有 APK 的原生路径会显示）。
+     *
+     * kind：
+     *   'scanning'  正在扫（最长 6 秒）—— 顺带解释"为什么点了没反应"；
+     *   'ok'        扫到并选中了：把**收到的广播条数**写出来。这是"扫描确实在
+     *               收包"的证据，也正是"设备在广播"和"设备没在广播"的分界；
+     *   SCAN_FAIL 的键 / 'other'  三类失败 + 兜底。
+     *
+     * ⚠️ 传输对象为 null（PWA / Web Bluetooth）时整块直接隐藏：网页那条路的
+     *    失败原因由 Chrome 自己解释（选择框里就写着"找不到设备"），多一块红字
+     *    只会让 Web 路径的行为变样 —— 而它现在是好的，不该被这次改动碰到。
+     */
+    render_scan_state(kind, err, t) {
+      const el = $('scan-state');
+      const hint = $('scan-hint');
+      const rb = $('rescan-btn');
+      if (!el) return;
+
+      if (!t) {                       // Web 路径：一个字都不显示
+        el.hidden = true;
+        if (hint) hint.hidden = true;
+        if (rb) rb.hidden = true;
+        return;
+      }
+
+      if (kind === 'scanning') {
+        const secs = (t.scan_window_ms / 1000).toFixed(1);
+        el.dataset.state = 'busy';
+        el.hidden = false;
+        el.textContent = `正在扫描（最长 ${secs} 秒）…权限状态和收到的广播条数都在日志里`;
+        if (hint) hint.hidden = true;
+        if (rb) { rb.hidden = false; rb.disabled = true; }
+        return;
+      }
+
+      if (kind === 'ok') {
+        const adv = (t.adverts_seen === null || t.adverts_seen === undefined) ? '?' : t.adverts_seen;
+        const dev = (t.devices_seen === null || t.devices_seen === undefined) ? '?' : t.devices_seen;
+        el.dataset.state = 'ok';
+        el.hidden = false;
+        el.textContent = `扫描完成：收到 ${adv} 条广播、看到 ${dev} 台设备，选中 ` +
+          `${t.device_name || '设备'}` +
+          (t.scan_mode === 'lescan' ? '。' : '（这个插件版本没有 requestLEScan，广播条数拿不到）。');
+        if (hint) hint.hidden = true;
+        if (rb) { rb.hidden = true; rb.disabled = false; }
+        return;
+      }
+
+      const f = SCAN_FAIL[kind] || null;
+      const why = (err && err.message) ? err.message : String(err || '连接失败');
+      el.dataset.state = f ? f.state : 'bad';
+      el.hidden = false;
+      el.textContent = (f ? f.lead : '连接失败：') + ' ' + why;
+      if (hint) {
+        hint.dataset.state = f ? f.state : 'bad';
+        hint.hidden = false;
+        hint.textContent = f ? f.hint : '看下面的日志（勾选「显示日志」）。点「重试扫描」可以再来一次。';
+      }
+      if (rb) { rb.hidden = false; rb.disabled = false; }
+    }
+
     async do_connect() {
       if (!this.ble) return;
+      // 原生传输对象存在 = 走 APK 那条路（Web Bluetooth 那条路它是 null）。
+      const t = this.ble.transport || null;
+      if (t) this.render_scan_state('scanning', null, t);
       try {
         await this.ble.connect();
+        if (t) this.render_scan_state('ok', null, t);
       } catch (e) {
         // connect() 内部已经报过状态了；用户取消不算错误
         if (!/cancel|NotFoundError/i.test(String(e))) this.log(`连接失败：${e}`);
+        // ⚠️ 这里**不能**退化成"没找到设备"：ble_native.js 抛的是带错误码的
+        //    分类错误（权限 / 蓝牙开关 / 扫完了但没有 / 插件报错），按码显示。
+        if (t) this.render_scan_state(scan_fail_kind(e) || 'other', e, t);
       }
     }
 
@@ -2560,6 +2702,10 @@
 
       // ⚠️ connect 必须在用户手势的**同步**处理里发起，中间不能有 await
       on('connect-btn', 'click', () => this.do_connect());
+      // 「重试扫描」= 再走一遍完全相同的连接流程。它**必须是真正 <button> 上的
+      // 点击**：以后若要回到 Web Bluetooth（Chrome 要求用户手势），这条路径
+      // 依然成立；而在原生路径上它就是"再扫 6 秒"。
+      on('rescan-btn', 'click', () => this.do_connect());
       on('disconnect-btn', 'click', () => {
         if (this.ble) this.ble.disconnect();
         this.stop_nav();

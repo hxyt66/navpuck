@@ -710,7 +710,24 @@
       this._draining = true;
       try {
         while (this._queue.length > 0) {
-          if (!this.connected || !this.rx) {
+          // ⚠️ "这条链路有没有写入端"**不能只看 this.rx**。
+          //
+          //    Web Bluetooth 那条路上写入端是 RX 特征（_gatt_connect 里
+          //    `this.rx = await service.getCharacteristic(NUS_RX)`）；但**原生
+          //    那条路（APK 里）故意把 rx/tx 都置空**（见 _gatt_connect 的原生
+          //    分支），字节由 transport.write_frame() 写下去。
+          //
+          //    早先这里写的是 `if (!this.connected || !this.rx)`，于是 APK 里
+          //    **每一帧**都被判成"链路不可用"整队清掉：NAV_CLOCK 永远到不了
+          //    设备（主页永远 --:--），而 send() 照样返回 true、app.js 照样
+          //    写"已下发设备时间…"—— 从手机侧看**完全成功**。症状是"连上了、
+          //    日志也说发了，设备那边什么都没有"。这个 bug 由
+          //    phone/test/native.cjs 第 11 节和 phone/test/ui.mjs 第 11.5 节钉住。
+          //
+          //    判据改成"这条链路的写入端在不在"：原生看 transport，
+          //    Web 看 rx 特征。connected 两条路都要。
+          const writable = this.connected && (this.transport ? true : !!this.rx);
+          if (!writable) {
             // 链路没了：清空队列。重连之后 app.js 会把整条路线重发一遍
             // （route_resend_t 那条路径），所以这里丢掉是安全的 —— 但**要记账**，
             // 不然"设备侧少收了几帧"就永远对不上账了。

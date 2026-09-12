@@ -74,12 +74,28 @@ const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 /**
  * 插件桩。它把"手机写出去的字节"按调用顺序记下来，并能把上行字节推回页面。
  *
- * 行为刻意做得和真插件一致的地方：
- *   - requestDevice 返回 {deviceId, name}
- *   - writeWithoutResponse / write 都要 {deviceId, service, characteristic, value}
- *   - getMtu 返回 {value}
- *   - addListener('onNotification', cb) 推 {value: DataView}
- *   - disconnect 时推 onDisconnected 回调
+ * ⚠️ 这个桩必须**照着真插件的行为**写，否则自测会在一片绿里放过真机上的 bug。
+ *    这一版特意改掉了两处"桩比真插件好用"的地方：
+ *
+ *   1. **checkPermissions() 的键名。** 真插件（@capacitor-community/bluetooth-le
+ *      8.3.0）把权限声明成 @CapacitorPlugin(permissions=[...])，Capacitor 的
+ *      Bridge.getPermissionStates() 按 alias 当键返回，于是真机上拿到的是
+ *      {ACCESS_FINE_LOCATION, BLUETOOTH_SCAN, BLUETOOTH_CONNECT, ...}，
+ *      **没有** st.scan / st.connect / st.location。以前的桩返回短名，
+ *      于是"代码读错字段名"这件事在自测里永远看不出来（真机上权限被拒时，
+ *      代码会以为权限是好的，一路走到"没扫到设备"）。现在按真插件的键名返回。
+ *
+ *   2. **initialize() 会因为权限被拒而 reject。** 真插件在
+ *      BluetoothLe.kt 第 130-141 行要求它那一组别名**全部** GRANTED，否则
+ *      reject("Permission denied.")。桩以前永远 resolve，于是
+ *      "initialize 被拒 → 界面只显示链路断开"这条路从来没被覆盖。
+ *
+ * 其他刻意与真插件一致的地方：
+ *   - requestLEScan 之后由 onScanResult 逐条推广播（allowDuplicates=true 时每条都推）；
+ *   - isEnabled 返回 {value}；getConnectedDevices 返回 {devices:[...]}；
+ *   - writeWithoutResponse / write 都要 {deviceId, service, characteristic, value}；
+ *   - getMtu 返回 {value}；addListener('onNotification', cb) 推 {value: DataView}；
+ *   - disconnect 时推 onDisconnected 回调。
  */
 class FakePlugin {
   constructor(opts) {
@@ -87,32 +103,96 @@ class FakePlugin {
     this.mtu = o.mtu === undefined ? 247 : o.mtu;
     this.mtu_throws = !!o.mtu_throws;
     this.name = o.name || 'NavPuck-A1B2';
-    this.no_device = !!o.no_device;
-    this.deny_permissions = !!o.deny_permissions;
+    this.no_device = !!o.no_device;                 // 扫描跑了，但一条广播都没有
+    this.deny_permissions = !!o.deny_permissions;   // 权限被拒
+    this.enabled = o.enabled === undefined ? true : !!o.enabled;   // 蓝牙开关
+    this.no_lescan = !!o.no_lescan;                 // 老版本插件：没有 requestLEScan
     this.fail_writes_above = o.fail_writes_above === undefined ? Infinity : o.fail_writes_above;
+    this.system_links = o.system_links || [];       // "系统里已连接的 GATT 设备"
+
+    // 这一轮会广播什么。默认：同一台 NavPuck 连发 3 条（手机侧应该去重成 1 台）。
+    this.adverts = o.adverts || [
+      { deviceId: 'AA:BB:CC:DD:EE:FF', name: this.name, rssi: -62 },
+      { deviceId: 'AA:BB:CC:DD:EE:FF', name: this.name, rssi: -55 },
+      { deviceId: 'AA:BB:CC:DD:EE:FF', name: this.name, rssi: -58 },
+    ];
+    // 老插件没有 requestLEScan。⚠️ 必须赋成 undefined 遮住**原型上**那个方法
+    //（delete 删不掉原型链上的，会假装成功）。
+    if (this.no_lescan) this.requestLEScan = undefined;
 
     this.calls = [];              // 方法调用流水（含参数）
     this.writes = [];             // 每次写出去的字节（按序拼接就是设备看到的流）
     this.write_sizes = [];        // 每个分片的长度
     this.notify_cb = null;        // 上行通知回调
+    this.scan_cb = null;          // onScanResult 回调
     this.disc_cb = null;          // 断开回调
     this.notifications_started = false;
+    this.scanning = false;
     this.connected = false;
     this.initialize_args = null;
+    this.required_aliases = null;  // initialize 这一轮要求哪几个权限别名
   }
 
   _rec(method, args) { this.calls.push({ method, args: args || null }); }
 
-  async initialize(args) { this._rec('initialize', args); this.initialize_args = args; }
+  /**
+   * 真插件：initialize 决定它要求哪几个权限别名，任何一个没给就
+   * reject("Permission denied.")（BluetoothLe.kt 第 104-141 行）。
+   * 这一条让"androidNeverForLocation 传没传"变成**可断言的行为**，
+   * 而不只是"参数里有个 true"。
+   */
+  async initialize(args) {
+    this._rec('initialize', args);
+    this.initialize_args = args;
+    const never_for_location = !!(args && args.androidNeverForLocation);
+    this.required_aliases = never_for_location
+      ? ['BLUETOOTH_SCAN', 'BLUETOOTH_CONNECT']
+      : ['BLUETOOTH_SCAN', 'BLUETOOTH_CONNECT', 'ACCESS_FINE_LOCATION'];
+    if (this.deny_permissions) throw new Error('Permission denied.');
+  }
 
+  /** 真插件按 @Permission 的 alias 当键返回（见类头上面的说明）。 */
   async checkPermissions() {
     this._rec('checkPermissions');
-    return this.deny_permissions
-      ? { scan: 'denied', connect: 'denied', location: 'denied' }
-      : { scan: 'granted', connect: 'granted', location: 'granted' };
+    const ble = this.deny_permissions ? 'denied' : 'granted';
+    const loc = this.deny_permissions ? 'denied' : 'granted';
+    return {
+      ACCESS_COARSE_LOCATION: loc,
+      ACCESS_FINE_LOCATION: loc,
+      BLUETOOTH: 'granted',
+      BLUETOOTH_ADMIN: 'granted',
+      BLUETOOTH_SCAN: ble,
+      BLUETOOTH_CONNECT: ble,
+    };
   }
 
   async requestPermissions() { this._rec('requestPermissions'); return this.checkPermissions(); }
+
+  async isEnabled() { this._rec('isEnabled'); return { value: this.enabled }; }
+
+  async getConnectedDevices() {
+    this._rec('getConnectedDevices');
+    return { devices: this.system_links };
+  }
+
+  async requestLEScan(args) {
+    this._rec('requestLEScan', args);
+    this.scanning = true;
+    if (this.no_device) return;           // 扫描真的在跑，就是没有广播
+    for (const a of this.adverts) this.emit_scan(a);
+  }
+
+  async stopLEScan() { this._rec('stopLEScan'); this.scanning = false; }
+
+  /** 推一条扫描结果（等价于 Android 的 onScanResult）。 */
+  emit_scan(a) {
+    if (!this.scan_cb) throw new Error('测试自己写错了：onScanResult 监听还没挂上');
+    this.scan_cb({
+      device: { deviceId: a.deviceId, name: a.name },
+      localName: a.name,
+      rssi: a.rssi,
+    });
+  }
 
   async requestDevice(args) {
     this._rec('requestDevice', args);
@@ -123,6 +203,7 @@ class FakePlugin {
   async addListener(event, cb) {
     this._rec('addListener', event);
     if (event === 'onDisconnected') this.disc_cb = cb;
+    else if (event === 'onScanResult') this.scan_cb = cb;
     else this.notify_cb = cb;
     return { remove: async () => { this._rec('removeListener', event); } };
   }
@@ -179,6 +260,8 @@ class FakePlugin {
   async disconnect() { this._rec('disconnect'); this.connected = false; }
 
   methods() { return this.calls.map((c) => c.method); }
+  /** 某个方法在流水里第一次出现的位置；没出现返回 -1（比 indexOf 好读）。 */
+  at(method) { return this.methods().indexOf(method); }
 }
 
 /** 造一个"在 Capacitor 里"的假 window。 */
@@ -190,6 +273,19 @@ function fake_window(plugin) {
     },
   };
   return win;
+}
+
+/**
+ * 造一个原生传输对象。
+ *
+ * ⚠️ `scan_window_ms: 0`：生产的扫描窗口是 6000ms（骑车现场点一下要等得起），
+ *    自测里每个用例都真等 6 秒就没人愿意跑了。窗口本身也不测时间 ——
+ *    测的是"窗口里收到了什么、没收到什么"。
+ */
+function mk_transport(plugin, extra) {
+  return new NATIVE.NativeTransport(Object.assign({
+    window: fake_window(plugin), onLog: () => {}, scan_window_ms: 0,
+  }, extra || {}));
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +335,7 @@ section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth
 {
   const plugin = new FakePlugin({ mtu: 247 });
   const win = fake_window(plugin);
-  const t = new NATIVE.NativeTransport({ window: win, onLog: () => {} });
+  const t = mk_transport(plugin);
   await t.connect();
 
   ok(t.connected, '连接后 connected = true');
@@ -258,8 +354,19 @@ section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth
   eq(m[m.length - 1], 'startNotifications', '最后一步是 startNotifications');
 
   // 按服务 UUID 扫，不按名字（名字分包发，见 docs/ble.md）
-  const rd = plugin.calls.find((c) => c.method === 'requestDevice');
-  eq(rd.args.services, [NUS_SERVICE], 'requestDevice 按 NUS 服务过滤');
+  const rd = plugin.calls.find((c) => c.method === 'requestLEScan');
+  eq(rd.args.services, [NUS_SERVICE], 'requestLEScan 按 NUS 服务过滤');
+  eq(rd.args.allowDuplicates, true,
+     'allowDuplicates=true：不重复收广播就数不出"看到几条"（那正是诊断要的读数）');
+  eq(rd.args.scanMode, NATIVE.SCAN_MODE_LOW_LATENCY,
+     '前台用 LOW_LATENCY 扫（点一下要马上有结果）');
+  ok(plugin.at('addListener') < plugin.at('requestLEScan'),
+     'onScanResult 监听在 requestLEScan **之前**挂上（否则会漏掉开头几条广播）');
+  ok(plugin.at('requestLEScan') < plugin.at('stopLEScan'),
+     '扫描窗口结束才 stopLEScan（自己控时，不靠插件那 30 秒的超时）');
+  eq(t.scan_mode, 'lescan', '这一轮走的是 requestLEScan（能数广播）');
+  eq(t.adverts_seen, 3, '收到 3 条广播（桩里那台 NavPuck 连发了 3 条）');
+  eq(t.devices_seen, 1, '但去重之后只有 1 台设备');
 
   // 订阅通知用的是 TX 特征，写用的是 RX 特征
   const sn = plugin.calls.find((c) => c.method === 'startNotifications');
@@ -272,7 +379,7 @@ section('2] 连接流程与 MTU：分片必须 = MTU-3，而不是 Web Bluetooth
 section('3] 分片写：按 MTU 分片，字节序与设备看到的完全一致');
 {
   const plugin = new FakePlugin({ mtu: 247 });
-  const t = new NATIVE.NativeTransport({ window: fake_window(plugin), onLog: () => {} });
+  const t = mk_transport(plugin);
   await t.connect();
 
   // 造一个 1400 字节的载荷（真实 NAV_MAP 的量级）
@@ -304,7 +411,7 @@ section('3] 分片写：按 MTU 分片，字节序与设备看到的完全一致
 section('4] MTU 协商失败：不能因此连不上，要退到试探分片');
 {
   const plugin = new FakePlugin({ mtu_throws: true });
-  const t = new NATIVE.NativeTransport({ window: fake_window(plugin), onLog: () => {} });
+  const t = mk_transport(plugin);
   await t.connect();
   ok(t.connected, 'MTU 拿不到也照样连上（正确性不依赖 MTU）');
   eq(t.transport_mtu, null, 'MTU 记为 null');
@@ -318,7 +425,7 @@ section('5] 上行：原生通知与 Web Bluetooth 走同一个 FrameParser');
 {
   const plugin = new FakePlugin();
   const win = fake_window(plugin);
-  const t = new NATIVE.NativeTransport({ window: win, onLog: () => {} });
+  const t = mk_transport(plugin);
 
   const seen = [];
   const states = [];
@@ -365,7 +472,7 @@ section('6] 写失败：整帧作废 + 降档重试（与 Web 路径同一策略
 {
   // 设备单次最多接受 64 字节 —— 244 的分片会被拒
   const plugin = new FakePlugin({ mtu: 247, fail_writes_above: 64 });
-  const t = new NATIVE.NativeTransport({ window: fake_window(plugin), onLog: () => {} });
+  const t = mk_transport(plugin);
   const logs = [];
   t.log = (l) => logs.push(l);
   const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
@@ -390,7 +497,7 @@ section('6] 写失败：整帧作废 + 降档重试（与 Web 路径同一策略
 section('7] 断开：设备侧掉线要能自动重连，用户手动断开不能偷偷重连');
 {
   const plugin = new FakePlugin();
-  const t = new NATIVE.NativeTransport({ window: fake_window(plugin), onLog: () => {} });
+  const t = mk_transport(plugin);
   const states = [];
   const link = new BLE.BleLink({ transport: t, onLog: () => {}, onState: (s) => states.push(s) });
   await link.connect();
@@ -410,24 +517,165 @@ section('7] 断开：设备侧掉线要能自动重连，用户手动断开不�
 }
 
 // ---------------------------------------------------------------------------
-// 8] 没有设备 / 权限被拒时的错误信息要能指路
+// 8] 三种失败必须分得开：权限被拒 / 蓝牙没开 / 扫完了但没有广播
 // ---------------------------------------------------------------------------
-section('8] 失败路径：错误信息要能指到真正的原因');
+//
+// 用户报的现象是"APK 里点连接设备报没找到设备，同一个手机用网页能连上"。
+// 真正的根因（扫描被绑在定位权限上）在第 8b 节钉住；这一节钉的是**另一半**：
+// 以前这三种完全不同的故障都只报一句"没有扫描到 NavPuck 设备"，用户只能靠猜。
+// 判据是 err.code（不是文案），而且三种的 code / 文案必须两两不同。
+section('8] 失败路径：三种失败（权限 / 蓝牙开关 / 扫完了没有）必须互不相同、且能指路');
 {
-  const plugin = new FakePlugin({ no_device: true });
-  const t = new NATIVE.NativeTransport({ window: fake_window(plugin), onLog: () => {} });
+  // ── (a) 权限被拒 ──────────────────────────────────────────────────────
+  // 真插件在 initialize() 里就因为权限 reject("Permission denied.")，
+  // 所以这里连扫描都不该开始。
+  const plugin = new FakePlugin({ deny_permissions: true });
+  const t = mk_transport(plugin);
   let err = null;
   try { await t.connect(); } catch (e) { err = e; }
-  ok(err !== null, '扫不到设备时抛错');
-  ok(err && /没有扫描到 NavPuck/.test(err.message), '错误信息点明"没扫到 NavPuck"');
+  ok(err !== null, '权限被拒时抛错（不是静默返回）');
+  eq(err && err.code, NATIVE.ERR_PERMISSION, '错误码 = NAV_BLE_PERMISSION_DENIED（界面按码分类）');
+  ok(err && /权限被拒绝/.test(err.message), '文案点明"权限被拒绝"');
+  ok(err && /BLUETOOTH_SCAN/.test(err.message), '点名是哪一个权限在挡路（BLUETOOTH_SCAN）');
+  ok(err && /附近的设备/.test(err.message) && /设置/.test(err.message),
+     '并且说清楚去哪儿开（设置 → 应用 → NavPuck → 权限 → 附近的设备）');
+  ok(err && /一个设备都看不到/.test(err.message),
+     '明说"没有它扫描不可能工作"，而不是含糊地说失败');
+  ok(err && !/没有扫描到/.test(err.message), '**不能**退化成"没有扫描到设备"（那会把用户引到错方向）');
+  eq(plugin.at('requestLEScan'), -1, '权限被拒时扫描根本没开始（requestLEScan 没被调用）');
 
-  const plugin2 = new FakePlugin({ deny_permissions: true });
-  const t2 = new NATIVE.NativeTransport({ window: fake_window(plugin2), onLog: () => {} });
+  // ── (b) 蓝牙没开 ─────────────────────────────────────────────────────
+  const plugin2 = new FakePlugin({ enabled: false });
+  const t2 = mk_transport(plugin2);
   let err2 = null;
   try { await t2.connect(); } catch (e) { err2 = e; }
-  ok(err2 !== null, '权限被拒时抛错');
-  ok(err2 && /权限被拒绝/.test(err2.message), '错误信息点明"权限被拒绝"');
-  ok(err2 && /设置/.test(err2.message), '并且告诉用户去哪里开权限');
+  ok(err2 !== null, '蓝牙关闭时抛错');
+  eq(err2 && err2.code, NATIVE.ERR_ADAPTER_OFF, '错误码 = NAV_BLE_ADAPTER_OFF');
+  ok(err2 && /蓝牙是关闭的/.test(err2.message) && /isEnabled=false/.test(err2.message),
+     '文案点明"蓝牙是关闭的"（并且带上 isEnabled 这个实测值）');
+  ok(err2 && /打开蓝牙/.test(err2.message), '告诉用户去开蓝牙');
+  eq(plugin2.at('isEnabled') >= 0, true, '真的问了适配器状态（isEnabled 被调用）');
+  eq(plugin2.at('requestLEScan'), -1, '蓝牙没开时扫描根本没开始');
+
+  // ── (c) 扫描跑了，但一条广播都没有 ────────────────────────────────────
+  const plugin3 = new FakePlugin({ no_device: true });
+  const t3 = mk_transport(plugin3);
+  let err3 = null;
+  try { await t3.connect(); } catch (e) { err3 = e; }
+  ok(err3 !== null, '扫不到设备时抛错');
+  eq(err3 && err3.code, NATIVE.ERR_NO_DEVICE, '错误码 = NAV_BLE_NO_DEVICE');
+  ok(err3 && /扫描已经跑完/.test(err3.message), '文案说清楚"扫描**跑完了**"（不是没跑成）');
+  ok(err3 && /0 条广播/.test(err3.message), '并且把实测到的广播条数写出来（0 条）');
+  ok(err3 && /停止广播/.test(err3.message) && /网页/.test(err3.message),
+     '提示第七种可能性：设备被别的中心连着时会停止广播（网页/上一个 App）');
+  eq(plugin3.at('requestLEScan') >= 0, true, '这一种扫描**确实执行了**（requestLEScan 被调用）');
+  eq(plugin3.at('stopLEScan') >= 0, true, '窗口结束照样 stopLEScan（不把扫描留在后台）');
+  eq(t3.adverts_seen, 0, '传输对象上记着这一轮收到 0 条广播');
+
+  // ── (d) 三种必须两两不同 ─────────────────────────────────────────────
+  const codes = [err.code, err2.code, err3.code];
+  eq(new Set(codes).size, 3, `三个错误码互不相同：${codes.join(' / ')}`);
+  const texts = [err.message, err2.message, err3.message];
+  eq(new Set(texts).size, 3, '三段文案也互不相同（用户看得出区别）');
+}
+
+// ---------------------------------------------------------------------------
+// 8b] 扫描不再依赖定位：androidNeverForLocation 真的传下去了
+// ---------------------------------------------------------------------------
+//
+// 这是"APK 扫不到、网页能连"的**主根因**。两处必须成对：
+//   · 插件侧 initialize({androidNeverForLocation:true})  —— 插件据此决定
+//     initialize() 要求哪几个权限别名，并且不再索要 ACCESS_FINE_LOCATION；
+//   · 清单侧 BLUETOOTH_SCAN 上的 android:usesPermissionFlags="neverForLocation"
+//     —— Android 12+ 据此不再把扫描结果与"定位权限 + 定位服务开关"绑定。
+// 少任何一处都等于没改。
+section('8b] 扫描与定位解耦：androidNeverForLocation 两处都要有');
+{
+  const plugin = new FakePlugin({ mtu: 247 });
+  const t = mk_transport(plugin);
+  await t.connect();
+
+  eq(plugin.initialize_args, { androidNeverForLocation: true },
+     'initialize() 传的是 {androidNeverForLocation:true}（旧代码是 false）');
+  eq(plugin.required_aliases, ['BLUETOOTH_SCAN', 'BLUETOOTH_CONNECT'],
+     '插件据此只要求 BLUETOOTH_SCAN/BLUETOOTH_CONNECT（不再要求 ACCESS_FINE_LOCATION）');
+
+  // 清单侧：真源文件里必须带这个属性。APK 里的字节由构建后的 zip 核对
+  // （见 docs/android.md 6.2），这里先把**源**钉住，防止有人手滑把它删掉。
+  const fs = require('node:fs');
+  const manifest_path = path.resolve(PHONE_DIR, '..', 'android', 'android', 'app',
+                                     'src', 'main', 'AndroidManifest.xml');
+  if (fs.existsSync(manifest_path)) {
+    const xml = fs.readFileSync(manifest_path, 'utf8');
+    const m = /<uses-permission[^>]*BLUETOOTH_SCAN[^>]*>/s.exec(xml);
+    ok(!!m, 'AndroidManifest.xml 里有 BLUETOOTH_SCAN 的声明');
+    ok(!!m && /android:usesPermissionFlags="neverForLocation"/.test(m[0]),
+       'BLUETOOTH_SCAN 上带了 android:usesPermissionFlags="neverForLocation"');
+    ok(/android\.permission\.ACCESS_FINE_LOCATION/.test(xml),
+       'ACCESS_FINE_LOCATION 仍然保留（导航要 GPS —— 解耦的只是扫描）');
+  } else {
+    console.log(`      （跳过 manifest 检查：找不到 ${manifest_path}）`);
+  }
+
+  // 权限/开关读数必须真的进日志：真机上用户就是拿这几行来定位问题的。
+  const logs = [];
+  const plugin2 = new FakePlugin({ system_links: [{ deviceId: 'AA:BB:CC:DD:EE:FF', name: 'NavPuck-A1B2' }] });
+  const t2 = mk_transport(plugin2, { onLog: (l) => logs.push(l) });
+  await t2.connect();
+  ok(logs.some((l) => /BLUETOOTH_SCAN=granted/.test(l)),
+     '扫描前把权限状态按**真插件的别名**打进日志（BLUETOOTH_SCAN=granted）');
+  ok(logs.some((l) => /BLUETOOTH_CONNECT=granted/.test(l)), 'BLUETOOTH_CONNECT 也打了');
+  ok(!logs.some((l) => /scan=undefined/.test(l)),
+     '不会再打出 scan=undefined（旧代码读错了字段名，日志等于没写）');
+  ok(logs.some((l) => /isEnabled=true/.test(l)), '蓝牙开关状态也打了（isEnabled=true）');
+  ok(logs.some((l) => /GATT 已连接设备/.test(l)),
+     '把系统里已连接的 GATT 设备列出来（第七种可能性的证据：设备在别处连着就不广播）');
+  ok(logs.some((l) => /收到 3 条广播 \/ 1 台设备/.test(l)),
+     '把"收到几条广播、几台设备"写进日志（这是"扫描真的在收包"的证据）');
+
+  // 挑设备：名字以 NavPuck- 开头优先，其次信号最强
+  eq(NATIVE._pick_device(new Map([
+    ['1', { deviceId: '1', name: 'Other', rssi: -20 }],
+    ['2', { deviceId: '2', name: 'NavPuck-B', rssi: -80 }],
+  ])).deviceId, '2', '名字以 NavPuck- 开头的优先（哪怕信号更弱）');
+  eq(NATIVE._pick_device(new Map([
+    ['1', { deviceId: '1', name: '', rssi: -70 }],
+    ['2', { deviceId: '2', name: '', rssi: -40 }],
+  ])).deviceId, '2', '名字都拿不到时挑信号最强的');
+}
+
+// ---------------------------------------------------------------------------
+// 8c] 扫描前先放开自己的连接；老插件退回 requestDevice
+// ---------------------------------------------------------------------------
+section('8c] 扫描前的清理与老插件的退路');
+{
+  // 连第二次之前，必须先把上一次自己建的 GATT 连接放掉：
+  // BLE 外设被连着就不广播，不清掉的话第二次扫描必然为空。
+  const plugin = new FakePlugin();
+  const t = mk_transport(plugin);
+  await t.connect();
+  plugin.calls.length = 0;
+  await t.reconnect();     // 不重新扫描，只重连（不该有 requestLEScan）
+  eq(plugin.at('requestLEScan'), -1, 'reconnect() 复用上次的 deviceId，不再扫一遍');
+  eq(t.device_id, 'AA:BB:CC:DD:EE:FF', 'deviceId 仍然是上次那台');
+
+  const plugin2 = new FakePlugin();
+  const t2 = mk_transport(plugin2);
+  await t2.connect();
+  plugin2.calls.length = 0;
+  await t2.connect();      // 再连一次：这一次要重新扫描，且扫描前要断开
+  ok(plugin2.at('disconnect') >= 0 && plugin2.at('disconnect') < plugin2.at('requestLEScan'),
+     '第二次扫描**之前**先 disconnect（否则设备还连着上一次，根本不广播）');
+
+  // 老版本插件没有 requestLEScan：退回 requestDevice，能连上，
+  // 但广播条数**记成 null**（不编数 —— 界面会显示 "?"）。
+  const plugin3 = new FakePlugin({ no_lescan: true });
+  const t3 = mk_transport(plugin3);
+  await t3.connect();
+  eq(t3.scan_mode, 'requestDevice', '没有 requestLEScan 时退回 requestDevice');
+  eq(t3.adverts_seen, null, '退路下广播条数记 null（不瞎编一个 0 或 1）');
+  eq(plugin3.at('requestDevice') >= 0, true, 'requestDevice 真的被调用了');
+  eq(t3.device_name, 'NavPuck-A1B2', '退路下照样连上（老插件不能用不了）');
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +752,86 @@ section('10] 前台服务封装：PWA 里一个异常都不能抛（含原生节
   ok(/降频/.test(FGS.ForegroundService.verdict(base,
        { hbCount: 11, ticks: 100020, ivTicks: 1000, runMs: 1010000 })),
      'JS 在走但只有约 2Hz => 判定为降频（不是被冻，也不是被杀）');
+}
+
+// ---------------------------------------------------------------------------
+// 11] 下行：APK 那条路上 send() 必须真的写到传输上
+// ---------------------------------------------------------------------------
+//
+// 这一节钉的是一段**真机上完全没有第二道防线**的接线，而且它出过一次真事故：
+//
+//   - Web Bluetooth 路径的"连上就发时钟"由 ui.mjs 第 10 节覆盖（那条路上
+//     link.rx 是 RX 特征，字节走 _write_chunk / rx.writeValue*）；
+//   - 原生路径（APK 里）**故意**把 rx/tx 都置空（见 ble.js _gatt_connect 的
+//     原生分支），字节走 transport.write_frame()。而 _drain() 曾经用
+//     `!this.rx` 当"这条链路能不能写"的判据 —— 于是 APK 里**每一帧**都被判成
+//     "链路不可用"、整队清掉：NAV_CLOCK 一个字节都到不了设备，主页永远 --:--。
+//     更糟的是 send() 仍然返回 true、app.js 仍然在日志里写"已下发设备时间"，
+//     从手机侧看**完全成功** —— 症状和"对端根本没发"长得一模一样。
+//
+// 所以这里要同时钉住三件事：
+//   1. 原生路径下 rx 就是 null 且 connected 是 true（判据不能看 rx）；
+//   2. send() 之后字节**真的**出现在传输上，且就是金标 NAV_CLOCK 帧；
+//   3. 把写出去的字节喂回 FrameParser（设备侧解析用的就是它）能解出
+//      正确的 epoch / 时区 —— 也就是"设备确实能收到这个时间"。
+//
+// ⚠️ 这里刻意走 send()（排队 + 异步 _drain）而不是直接调 _write_frame()：
+//    第 6 节用的是 _write_frame，正因为绕过了 _drain，那个 bug 才从它眼皮底下
+//    溜过去了。测哪一层，就只能覆盖哪一层。
+section('11] 下行：原生路径 send() 的字节必须真的写到传输上（NAV_CLOCK）');
+{
+  const plugin = new FakePlugin();
+  const t = mk_transport(plugin);
+  const logs = [];
+  const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
+  await link.connect();
+
+  // 前置事实：原生路径下 rx/tx 就是 null。它不是"链路没接好"，
+  // 所以任何 `!this.rx` 形式的判据都必然是错的。
+  eq(link.rx, null, '原生路径下 link.rx = null（写走 transport，不写 GATT 特征）');
+  eq(link.tx, null, '原生路径下 link.tx = null');
+  eq(link.connected, true, '但 link.connected = true —— 链路是好的');
+
+  plugin.writes.length = 0;
+  const frame = proto.encode_nav_clock(new proto.NavClock({
+    epoch_s: 1757500000, tz_offset_min: 330,
+  }));
+  const accepted = link.send(frame, 'ctl', 1);
+  eq(accepted, true, 'send() 收下了这一帧（ctl 是已知 kind，不会被拒收）');
+  await sleep(50);                    // 等异步 _drain 真的跑完
+
+  eq(plugin.writes.length, frame.length,
+     `整帧写到了原生传输上（${plugin.writes.length}/${frame.length} 字节）`);
+  eq(Buffer.from(plugin.writes).toString('hex'), 'a55a010606006052c1684a016a5f',
+     '写出去的字节 == 金标 NAV_CLOCK 帧（epoch 1757500000 / tz +330）');
+  eq(link.frames_sent, 1, 'frames_sent = 1（真的发出去了）');
+  eq(link.frames_dropped, 0, 'frames_dropped = 0（没有被当成"链路不可用"整队清掉）');
+  eq(link.dropped_disconnected, 0, 'dropped_disconnected = 0（正是这个桶在吞 APK 的帧）');
+  ok(!logs.some((l) => /链路不可用/.test(l)),
+     '日志里没有"链路不可用"（APK 里刷这句 = 每一帧都被吞了）');
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     '记账不变量仍然成立：offered == sent + dropped');
+
+  // 端到端到底：把传输上真正出现的字节喂回 FrameParser（设备侧用的就是它），
+  // 必须解出一帧 NAV_CLOCK，且两个字段都对得上。
+  const dev_parser = new proto.FrameParser();
+  const frames = dev_parser.feed(Uint8Array.from(plugin.writes));
+  eq(frames.length, 1, '设备侧解析器从这条字节流里解出 1 帧');
+  if (frames.length === 1) {
+    eq(frames[0].type, proto.MsgType.NAV_CLOCK, '帧类型 = NAV_CLOCK（0x06）');
+    const ck = proto.NavClock.unpack(frames[0].payload);
+    eq(frames[0].payload.length, proto.NAV_CLOCK_LEN, `载荷 ${proto.NAV_CLOCK_LEN} 字节`);
+    eq(ck.epoch_s, 1757500000, 'epoch 是秒，且与发出的一致');
+    eq(ck.tz_offset_min, 330, '时区偏移原样到达（+5:30 这种半点时区不能被抹平）');
+  }
+
+  // 断开之后仍然不能再往链路上写（这条不能因为放宽判据而被一起放开）
+  await link.disconnect();
+  plugin.writes.length = 0;
+  eq(link.send(frame, 'ctl', 1), true, '（断开后 send() 仍会收下——它只负责入队）');
+  await sleep(50);
+  eq(plugin.writes.length, 0, '断开后 queue 被清空，一个字节都没写出去');
+  eq(link.dropped_disconnected, 1, '而且这一帧如实记进了 dropped_disconnected');
 }
 
 // ---------------------------------------------------------------------------

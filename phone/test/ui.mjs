@@ -1307,6 +1307,230 @@ section('11] 原生节拍器：入口、计数、切换（"要不要把循环搬
 }
 
 // ---------------------------------------------------------------------------
+section('11.5] NAV_CLOCK 走**原生**（APK）那条路：点连接后设备真的收到时间');
+// ---------------------------------------------------------------------------
+//
+// 第 10 节盖的是 **PWA / Web Bluetooth** 那条路（link.rx 是 RX 特征）。
+// 但用户实在用的是 APK，而 APK 走的是**原生适配器**那一条：ble.js 的
+// _gatt_connect() 在原生分支里**故意**把 rx/tx 置空，字节由
+// transport.write_frame() 写下去。
+//
+// 就是因为这一点不同，"连上就发时钟"在 APK 里曾经**整条死掉**：_drain() 用
+// `!this.rx` 判"链路能不能写"，于是每一帧都被当成"链路不可用"整队清掉 ——
+// 手机侧日志照样写"已下发设备时间"、界面照样显示"已连接"，设备却一个字节
+// 都收不到，主页永远 --:--。第 10 节测的是 Web 路径，所以它一路全绿。
+//
+// 这一节就是把第 10 节原样搬到**原生**路径上：假装在 Capacitor 壳里，
+// 点一次"连接设备"，然后证明设备的字节流里**真的**出现了 NAV_CLOCK。
+// 这才是用户报的那个现象对应的那一层。
+{
+  const NATIVE = require(path.join(PHONE_DIR, 'ble_native.js'));
+  const PN = require(path.join(PHONE_DIR, 'proto.js'));
+
+  // 假插件：只实现 ble_native.js 真正会调的那几个方法。
+  // `device_writes` = 设备侧**真实收到**的字节（分片按顺序拼起来）。
+  const device_writes = [];
+  const plugin = {
+    connected: false,
+    async initialize() {},
+    async checkPermissions() { return { scan: 'granted', connect: 'granted', location: 'granted' }; },
+    async requestPermissions() { return { scan: 'granted', connect: 'granted', location: 'granted' }; },
+    async requestDevice() { return { deviceId: 'AA:BB:CC:DD:EE:FF', name: 'NavPuck-NATIVE' }; },
+    async addListener() { return { remove: async () => {} }; },
+    async connect() { this.connected = true; },
+    async requestMtu() {},
+    async getMtu() { return { value: 247 }; },
+    async discoverServices() {},
+    async startNotifications() {},
+    async writeWithoutResponse(args) {
+      const u8 = new Uint8Array(args.value.buffer, args.value.byteOffset, args.value.byteLength);
+      for (const b of u8) device_writes.push(b);
+    },
+    async disconnect() { this.connected = false; },
+  };
+
+  // 装成"在 Capacitor 壳里"。必须在这个 App 实例 init() **之前**装 ——
+  // app.js 的 init() 就是在这个时刻决定"用原生还是 Web"的。
+  // ⚠️ 用完必须拆掉：第 12 节要验"没有 navigator.bluetooth 时的提示"，
+  //    留着它 native_ble 就为真，那个提示永远不会出现（12 节会假失败）。
+  globalThis.NavPuckBleNative = NATIVE;
+  globalThis.Capacitor = {
+    isNativePlatform: () => true,
+    Plugins: { BluetoothLe: plugin },
+  };
+
+  try {
+    const A = new APP.App();
+    A.init();
+    ok(A.ble.transport !== null,
+       'init() 认出原生环境，走的是原生传输（APK 的真实路径，不是 Web Bluetooth）');
+
+    device_writes.length = 0;
+    const t_before = Math.floor(Date.now() / 1000);
+    await A.ble.connect();                   // 等价于点"连接设备"
+    await sleep(80);                         // 等异步 drain 真的写出去
+    const t_after = Math.floor(Date.now() / 1000);
+
+    eq(A.ble.rx, null, '（前置事实）原生路径下 rx = null —— 所以判据不能看 rx');
+    ok(device_writes.length > 0,
+       `连接后字节**真的到了设备**（${device_writes.length} 字节；` +
+       '只是入队而没写出去的话，这里就是 0 —— 那正是 APK 里时钟丢失的样子）');
+
+    const clockFrames = [];
+    for (const f of new PN.FrameParser().feed(Uint8Array.from(device_writes))) {
+      if (f.type === PN.MsgType.NAV_CLOCK) clockFrames.push(f);
+    }
+    ok(clockFrames.length >= 1,
+       `设备的字节流里有 NAV_CLOCK 帧（共 ${clockFrames.length} 帧）` +
+       '——设备收到它才会把主页上的 --:-- 换成真实时间');
+
+    if (clockFrames.length >= 1) {
+      const ck = PN.NavClock.unpack(clockFrames[0].payload);
+      eq(clockFrames[0].payload.length, PN.NAV_CLOCK_LEN, `载荷 ${PN.NAV_CLOCK_LEN} 字节`);
+      ok(ck.epoch_s >= t_before - 2 && ck.epoch_s <= t_after + 2,
+         `epoch 是秒且就是当前时间（${ck.epoch_s}，本机 ${t_before}..${t_after}）`);
+      eq(ck.tz_offset_min, -new Date().getTimezoneOffset(),
+         `时区 = -getTimezoneOffset()（本机 ${-new Date().getTimezoneOffset()} 分钟）`);
+    }
+    ok(A.log_lines.some((l) => /\[clock\]/.test(l) && /已下发/.test(l)),
+       '手机侧日志如实写了"已下发"（而在修好之前它也会这么写 —— 所以日志不能当证据）');
+
+    await A.ble.disconnect();
+  } finally {
+    delete globalThis.NavPuckBleNative;
+    delete globalThis.Capacitor;
+  }
+}
+
+// ---------------------------------------------------------------------------
+section('11.7] 原生扫描失败：三类失败在界面上必须分得开（+「重试扫描」）');
+// ---------------------------------------------------------------------------
+//
+// 用户报的现象是"APK 里点连接设备报没找到设备，同一个手机用网页能连上"。
+// 根因的修法（扫描与定位解耦）在 native.cjs 第 8b 节钉；这一节钉**界面**这一半：
+//
+//   权限被拒 / 蓝牙没开   -> "根本没扫成"（红）+ 点明是哪一个 + 去哪开
+//   扫完了但 0 条广播     -> "扫了但没有"（黄）+ 计数 + "设备可能被别处连着"
+//   扫到并选中            -> 绿 + **广播条数**（"扫描真的在收包"的证据）
+//
+// 以前这三种都只显示一句"没找到设备"，而它们的修法完全不同 —— 用户只能反复试。
+// 还有一条同样重要：**PWA 那条路一个字都不能变**（它是好的，不该被这次改动碰到）。
+{
+  const NATIVE = require(path.join(PHONE_DIR, 'ble_native.js'));
+
+  // ---- (0) PWA：这两行 + 重试按钮永远不显示 ----
+  const apwa = new APP.App();
+  apwa.init();
+  eq(apwa.ble.transport, null, '（前置）PWA 下没有原生传输对象');
+  await apwa.do_connect();                 // Web 路径照旧走（假 navigator.bluetooth）
+  await sleep(20);
+  eq(BY_ID.get('scan-state').hidden, true, 'PWA 里 #scan-state 永远 hidden（Web 路径行为不变）');
+  eq(BY_ID.get('scan-hint').hidden, true, 'PWA 里也不显示"现在该做什么"那一行');
+  eq(BY_ID.get('rescan-btn').hidden, true, 'PWA 里不出现「重试扫描」（那是原生才有的入口）');
+
+  // ---- 假原生插件：照真插件的行为写（别名权限 / LEScan / isEnabled）----
+  const plugin = {
+    mode: 'denied',
+    scan_cb: null,
+    async initialize() { if (this.mode === 'denied') throw new Error('Permission denied.'); },
+    async checkPermissions() {
+      const v = (this.mode === 'denied') ? 'denied' : 'granted';
+      return {
+        ACCESS_COARSE_LOCATION: v, ACCESS_FINE_LOCATION: v,
+        BLUETOOTH: 'granted', BLUETOOTH_ADMIN: 'granted',
+        BLUETOOTH_SCAN: v, BLUETOOTH_CONNECT: v,
+      };
+    },
+    async requestPermissions() { return this.checkPermissions(); },
+    async isEnabled() { return { value: this.mode !== 'adapter_off' }; },
+    async getConnectedDevices() { return { devices: [] }; },
+    async addListener(ev, cb) {
+      if (ev === 'onScanResult') this.scan_cb = cb;
+      return { remove: async () => {} };
+    },
+    async requestLEScan() {
+      if (this.mode === 'empty') return;              // 扫描真的在跑，就是没有广播
+      this.scan_cb({ device: { deviceId: 'AA:BB:CC:DD:EE:FF', name: 'NavPuck-UI' }, rssi: -55 });
+      this.scan_cb({ device: { deviceId: 'AA:BB:CC:DD:EE:FF', name: 'NavPuck-UI' }, rssi: -50 });
+    },
+    async stopLEScan() {},
+    async connect() {}, async requestMtu() {},
+    async getMtu() { return { value: 247 }; },
+    async discoverServices() {}, async startNotifications() {},
+    async writeWithoutResponse() {}, async disconnect() {},
+  };
+  globalThis.NavPuckBleNative = NATIVE;
+  globalThis.Capacitor = { isNativePlatform: () => true, Plugins: { BluetoothLe: plugin } };
+
+  try {
+    const A = new APP.App();
+    A.init();
+    ok(A.ble.transport !== null, '认出原生环境（这一节走的就是 APK 那条路）');
+    ok(BY_ID.get('rescan-btn').hasListener('click'), '「重试扫描」绑上了 click 监听器');
+    ok(A.ble.transport.scan_window_ms >= 1000,
+       `生产的扫描窗口是真的（${A.ble.transport.scan_window_ms}ms，不是自测里那个 0）`);
+
+    const st = BY_ID.get('scan-state');
+    const hint = BY_ID.get('scan-hint');
+    const rb = BY_ID.get('rescan-btn');
+
+    // ---- (1) 权限被拒：红 + 点名 + 去处 ----
+    await A.do_connect();
+    eq(st.hidden, false, '权限被拒：诊断行露出来（不再只弹一句"没找到设备"）');
+    eq(st.dataset.state, 'bad', '权限被拒 = 红（根本没扫成）');
+    const t_perm = st.textContent;
+    ok(/扫描没能开始/.test(t_perm) && /权限/.test(t_perm), `第一行说清"没扫成 + 权限"：${t_perm.slice(0, 40)}…`);
+    ok(!/没找到设备|没有扫描到/.test(t_perm), '**不会**退化成"没找到设备"（那会把用户引到错方向）');
+    eq(hint.hidden, false, '第二行给出"现在该做什么"');
+    ok(/附近的设备/.test(hint.textContent) && /重试扫描/.test(hint.textContent),
+       '点明去哪儿开权限、以及可以重试');
+    eq(rb.hidden, false, '「重试扫描」露出来');
+
+    // ---- (2) 蓝牙没开：红，但和权限那一类文案不同 ----
+    plugin.mode = 'adapter_off';
+    await A.do_connect();
+    const t_bt = st.textContent;
+    eq(st.dataset.state, 'bad', '蓝牙没开 = 红（同样根本没扫成）');
+    ok(/蓝牙/.test(t_bt) && /关闭/.test(t_bt), `点明是蓝牙开关：${t_bt.slice(0, 40)}…`);
+    ok(t_bt !== t_perm, '和"权限被拒"不是同一句话（用户看得出区别）');
+
+    // ---- (3) 扫完了但 0 条广播：黄，并且和上面两种明显不同 ----
+    plugin.mode = 'empty';
+    await A.do_connect();
+    const t_empty = st.textContent;
+    eq(st.dataset.state, 'warn', '扫完了没有 = 黄（**不是**红：扫描确实执行了）');
+    ok(/扫描已经跑完/.test(t_empty), `第一行说清"扫完了"：${t_empty.slice(0, 40)}…`);
+    ok(/0 条广播/.test(t_empty), '把实测到的广播条数写出来（0 条 = 扫描真的在收包但什么都没收到）');
+    eq(hint.dataset.state, 'warn', '"该怎么办"那一行跟着变成黄');
+    ok(/停止广播/.test(hint.textContent) && /网页/.test(hint.textContent),
+       '提示第七种可能性：设备被别的中心连着时会停止广播');
+    ok(t_empty !== t_perm && t_empty !== t_bt, '和"根本没扫成"那两种都不是同一句话');
+    eq(A.ble.transport.adverts_seen, 0, '传输对象上的广播计数 = 0（界面读数与它同源）');
+
+    // ---- (4) 扫到并选中：绿 + 广播条数 ----
+    plugin.mode = 'ok';
+    await A.do_connect();
+    eq(st.dataset.state, 'ok', '扫到并连上 = 绿');
+    ok(/2 条广播/.test(st.textContent) && /1 台设备/.test(st.textContent),
+       `把广播条数/设备台数写出来（这是"扫描确实在收包"的证据）：${st.textContent}`);
+    ok(/NavPuck-UI/.test(st.textContent), '并且写清楚选中了哪一台');
+    eq(rb.hidden, true, '连上之后「重试扫描」收起来（没有东西可重试）');
+
+    // ---- (5) 「重试扫描」真的能再来一次 ----
+    plugin.mode = 'denied';
+    await A.do_connect();
+    eq(st.dataset.state, 'bad', '（前置）又失败一次，诊断行回到红');
+    plugin.mode = 'ok';
+    rb.fire('click');                        // 用户点「重试扫描」
+    await sleep(30);
+    eq(st.dataset.state, 'ok', '点「重试扫描」后重新扫一遍并连上（不是个摆设按钮）');
+  } finally {
+    delete globalThis.NavPuckBleNative;
+    delete globalThis.Capacitor;
+  }
+}
+
+// ---------------------------------------------------------------------------
 section('12] "不支持 Web Bluetooth" 的提示路径');
 // ---------------------------------------------------------------------------
 // ⚠️ 这一节必须放在最后：它会再新建一个 App 实例，而 DOM 桩是共享的 ——

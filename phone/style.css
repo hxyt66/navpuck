@@ -136,6 +136,27 @@ h2 {
   border-color: #ff8b8b;
 }
 
+/* ---------- 扫描诊断（只有 APK 的原生路径会显示）----------
+   配色沿用"定位 / 底图"那一套约定：
+     绿 = 扫到并选中（附广播条数，这是"扫描确实在收包"的证据）；
+     灰 = 正在扫；
+     黄 = 扫完了但一条广播都没有（设备侧问题）；
+     红 = 根本没扫成（权限被拒 / 蓝牙没开 / 插件报错）。
+   三种失败的颜色必须不同 —— 以前它们都只是一句"没找到设备"。 */
+#scan-state { word-break: normal; }
+#scan-state[data-state="ok"] { color: var(--ok); }
+#scan-state[data-state="busy"] { color: var(--muted); }
+#scan-state[data-state="warn"] { color: #ffd08a; }
+#scan-state[data-state="bad"] { color: #ffb3b3; }
+
+/* "现在该做什么"那一行：默认是 .hint.warn 的黄框；"根本没扫成"时换成红框，
+   免得两类失败看着一模一样。 */
+#scan-hint[data-state="bad"] {
+  color: #ffd9d9;
+  background: #3a1414;
+  border-color: var(--bad);
+}
+
 /* ---------- 通用面板 ---------- */
 
 .panel {

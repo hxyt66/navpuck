@@ -31,8 +31,17 @@
     </div>
     <div class="top-row actions">
       <button id="connect-btn" type="button">连接设备</button>
+      <!-- 重试扫描：失败之后才出现。它不是"再点一次连接设备"的同义词 ——
+           它出现时上面那两行已经把"为什么没连上"分成三类说清楚了。 -->
+      <button id="rescan-btn" type="button" class="ghost" hidden>重试扫描</button>
       <button id="disconnect-btn" type="button" class="ghost">断开</button>
     </div>
+    <!-- 扫描诊断（**只有 APK 的原生路径会显示**，PWA 里这两行永远 hidden）。
+         存在的理由：以前权限被拒 / 蓝牙没开 / 扫完了但没收到广播，三种都只显示
+         一句"没找到设备"，而它们的修法完全不同。第一行说"是哪一类 + 为什么"，
+         第二行说"现在该做什么"。 -->
+    <p id="scan-state" class="hint" data-state="idle" hidden></p>
+    <p id="scan-hint" class="hint warn" hidden></p>
   </header>
 
   <!-- 手动位置横幅：模拟运行必须一眼可辨，免得把测试当成真实定位 -->
