@@ -819,6 +819,9 @@ section('12] 底图（Overpass）永久失败：导航照常，且网络行为�
 //     d) 失败后指数退避（不把刚恢复的服务打限流）＋ 轮换起点（排头的死镜子不饿死后面）；
 //     e) 关掉底图 = 一个请求都不发；
 //     f) 底图代码内部抛错也绝不能吃掉这一帧 NAV_UPDATE。
+//     g) 预算常数与查询参数钉在"实测 17.6 秒"这条事实上（谁想调小超时，先过这里）；
+//     h) **慢但能用的镜像不会被预算饿死**（这一版的现场问题）；
+//     i) sticky 镜像：成功过的排第一，失败了立刻退回静态顺序。
 {
   const route = demo_route();
   const mk_ways = (n, lat0, lon0) => {
@@ -1066,6 +1069,202 @@ section('12] 底图（Overpass）永久失败：导航照常，且网络行为�
     eq(dev.frames_of_type(P.MsgType.NAV_UPDATE).length, 30, '设备侧 30 帧全解出来');
     const map_log = logs.filter((l) => /\[map\]/.test(l))[0] || '';
     ok(map_log.length > 0, `日志里有 [map] 那条（不是静默吞掉）：${map_log}`);
+  }
+
+  // ---- g) 预算常数与查询参数：钉在"实测 17.6 秒"这条事实上 ----
+  // 开发机实测（详见 map.js 文件头那张表）：9 个公共实例里只有 maps.mail.ru
+  // 能用，而它上面一个 around:300 的**小**查询要 **17.6 秒**。
+  // 这一节把那份实测变成可执行的约束 —— 以后谁想把超时"优化"回去，会先在这里
+  // 撞墙，而不是等用户再一次看到"全部镜像失败"。
+  {
+    const MEASURED_QUERY_MS = 17600;      // 实测：200 / 17.6s / 43.9KB / 46 条路
+    const N = MAP.ENDPOINTS.length;
+
+    // 1) 顺序：实测唯一能用的那个必须在第一个
+    eq(MAP.ENDPOINTS[0], 'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+       `实测唯一能用的镜像排在第一个：${MAP.ENDPOINTS[0]}`);
+    eq(N, 3, '三个镜像（能用的排头，另外两个留作 fallback）');
+    eq(new Set(MAP.ENDPOINTS).size, N, '镜像列表里没有重复项');
+    ok(!MAP.ENDPOINTS.some((ep) => /osm\.jp/.test(ep)),
+       'TLS 信任失败的那个实例没有被写进列表（写进去只会白烧一个切片）');
+
+    // 2) 超时：必须 2 倍以上于实测查询时间（12 秒那一版就是死在这里）
+    ok(MAP.MAP_ENDPOINT_TIMEOUT_MS >= 2 * MEASURED_QUERY_MS,
+       `单镜像超时 ${MAP.MAP_ENDPOINT_TIMEOUT_MS}ms >= 2 × 实测查询时间 ` +
+       `${MEASURED_QUERY_MS}ms（有余量，不是刚好卡在实测值上）`);
+    ok(MAP.MAP_MIN_ENDPOINT_SLICE_MS > MEASURED_QUERY_MS,
+       `"这一片够用"的下限 ${MAP.MAP_MIN_ENDPOINT_SLICE_MS}ms > 实测查询时间 ` +
+       `${MEASURED_QUERY_MS}ms（否则等于明知一次真查询跑不完还去开一个镜像）`);
+    ok(MAP.MAP_MIN_ENDPOINT_SLICE_MS < MAP.MAP_ENDPOINT_TIMEOUT_MS,
+       `下限 ${MAP.MAP_MIN_ENDPOINT_SLICE_MS}ms < 单镜像超时 ` +
+       `${MAP.MAP_ENDPOINT_TIMEOUT_MS}ms（否则一个镜像都开不起来）`);
+
+    // 3) 预算：把**最后一个**镜像也算进来 —— 前 N-1 个哪怕每个都烧掉一整片，
+    //    最后一个仍然拿得到一片"够用"的（> 实测查询时间）。
+    //    这就是上一版的病根：3 个镜像、30 秒预算，前两个各烧 12 秒之后只剩 6 秒。
+    const last_left = MAP.MAP_REFRESH_BUDGET_MS - (N - 1) * MAP.MAP_ENDPOINT_TIMEOUT_MS;
+    ok(last_left > MAP.MAP_MIN_ENDPOINT_SLICE_MS,
+       `整轮预算 ${MAP.MAP_REFRESH_BUDGET_MS}ms 减去前 ${N - 1} 个镜像各一整片，` +
+       `最后一个还能拿到 ${last_left}ms > 下限 ${MAP.MAP_MIN_ENDPOINT_SLICE_MS}ms` +
+       `（不会被记成"未尝试"）`);
+    ok(MAP.MAP_REFRESH_BUDGET_MS >= 2 * MAP.MAP_ENDPOINT_TIMEOUT_MS,
+       `整轮预算 >= 两个完整切片（排头挂了，第二个镜像仍有一整片）`);
+
+    // 4) 查询参数：半径就是 MAP_RADIUS_M，服务端超时严格早于客户端 abort
+    const qsrc = new MAP.OsmMapSource({ storage: null });
+    eq(qsrc.radius_m, RT.MAP_RADIUS_M, '查询半径就是 MAP_RADIUS_M（260 米，不能动）');
+    const slice_ms = MAP.MAP_ENDPOINT_TIMEOUT_MS;
+    const q = qsrc._build_query(30.25, 120.13, slice_ms);
+    ok(q.indexOf('around:260,30.250000,120.130000') >= 0,
+       `查询里就是 around:260（和 app 的 ~260m 底图半径一致）：${q}`);
+    const m = /\[timeout:(\d+)\]/.exec(q);
+    ok(m !== null, `查询里有服务端 [timeout:N]：${q}`);
+    const server_s = m ? Number(m[1]) : -1;
+    ok(server_s * 1000 < slice_ms,
+       `服务端超时 ${server_s}s < 客户端 abort ${slice_ms / 1000}s` +
+       `（它才有机会回一个带 remark 的 200，而不是只留一个 AbortError）`);
+    ok(server_s * 1000 >= MEASURED_QUERY_MS,
+       `服务端超时 ${server_s}s >= 实测查询时间 ${MEASURED_QUERY_MS / 1000}s`);
+    ok(q.indexOf('way[highway](around:') >= 0,
+       '查询形状与实测时逐字相同（way[highway](around:...);out geom;）' +
+       '—— 改了形状，那份"17.6 秒 / 200 / CORS *"的实测就不再说明任何事');
+  }
+
+  // ---- h) "慢但能用"的镜像不会被预算饿死（这一版修的现场问题）----
+  // 现场形状：排头的镜像装死，唯一能用的那个要 ~18 秒才回，结果被预算/超时掐断，
+  // 用户看到"全部镜像失败"，而其实它只是慢。
+  // 这里把真实常数**按同一比例**缩到毫秒级（免得自测真的等两分钟）：比例不变，
+  // 测的就是同一个形状。两个方向都测：新常数必须成，旧常数必须败。
+  {
+    // 100ms 代表 MAP_ENDPOINT_TIMEOUT_MS（45 秒），其余按同一比例
+    const SCALE = 100 / MAP.MAP_ENDPOINT_TIMEOUT_MS;
+    const T = 100;
+    const B = Math.round(MAP.MAP_REFRESH_BUDGET_MS * SCALE);
+    const MIN = Math.round(MAP.MAP_MIN_ENDPOINT_SLICE_MS * SCALE);
+    // "慢"的程度按实测来：17.6 秒 / 45 秒 ≈ 0.39 个切片
+    const SLOW_MS = Math.max(5, Math.round(17600 * SCALE));
+
+    // 跑一遍"前两个装死、第三个慢但能用"（就是现场那个顺序）
+    const run = async (timeout_ms, budget_ms, min_slice_ms) => {
+      const EPS = ['https://dead1.example/x', 'https://dead2.example/x',
+                   'https://slow.example/x'];
+      const tried = [];
+      const src = new MAP.OsmMapSource({
+        storage: null, endpoints: EPS,
+        endpoint_timeout_ms: timeout_ms, budget_ms: budget_ms, min_slice_ms: min_slice_ms,
+        fetch: (url) => {
+          tried.push(url);
+          if (url !== EPS[2]) return new Promise(() => {});      // 装死到超时
+          // 慢，但在超时之前回来（用真实的 17.6 秒比例）
+          return sleep(SLOW_MS).then(() => ({ ok: true, json: async () => mk_ways(5, 30.25, 120.13) }));
+        },
+      });
+      const got = await src.refresh(30.25, 120.13, 0);
+      return { src, got, tried };
+    };
+
+    const now = await run(T, B, MIN);
+    eq(now.tried.length, 3,
+       `新常数下三个镜像都被试到了（${T}/${B}/${MIN}ms）：` +
+       `一个装死的镜像不会把后面的饿死`);
+    eq(now.got, true, `新常数下"慢但能用"的镜像仍然拿到了数据（慢 ${SLOW_MS}ms）`);
+    eq(now.src.state, 'ok', '状态 = ok');
+    eq(now.src.current_endpoint, 'https://slow.example/x', '数据来自那个慢镜像');
+    // 它慢到 SLOW_MS 才回、却仍然成功返回 —— 说明分给它的那一片一定 >= SLOW_MS，
+    // 也就是 >= 实测查询时间按比例缩小的那个值。这正是"慢镜像没被预算饿死"。
+    // （成功后 errors 会被清空，这是有意的：界面上只剩"底图正常"。）
+    eq(now.src.errors.length, 0, '成功后失败原因被清空（界面只显示"底图正常"）');
+
+    // 反向对照：旧常数（12 秒 / 30 秒 / 2.5 秒）下同一个场景**必然失败**。
+    // 这条是这段自测的"我能测出那个 bug"的证明 —— 不然它只是装饰。
+    const OLD = {
+      t: Math.max(2, Math.round(12000 * SCALE)),
+      b: Math.max(4, Math.round(30000 * SCALE)),
+      min: 1,
+    };
+    const old = await run(OLD.t, OLD.b, OLD.min);
+    eq(old.got, false,
+       `旧常数（${OLD.t}/${OLD.b}/${OLD.min}ms ↔ 12/30/2.5 秒）下同一场景失败 ` +
+       `—— 正是用户看到的"全部镜像失败"`);
+    eq(old.src.state, 'unavailable', '旧常数下状态 = unavailable');
+    eq(old.src.errors.length, 3, '旧常数下三个镜像各留下一条失败/未尝试的原因');
+    ok(old.src.errors.every((e) => /请求超时|未尝试/.test(e.reason)),
+       `旧常数下三条原因都是"超时/没轮到"：` +
+       `${old.src.errors.map((e) => e.reason).join('；')}`);
+  }
+
+  // ---- i) sticky 镜像：成功过的排第一，失败了立刻退回静态顺序 ----
+  {
+    const storage = mk_storage();
+    const EPS = ['https://a.example/x', 'https://b.example/x', 'https://c.example/x'];
+    // 注意：缓存和 sticky 是**两个独立的键**。这里每轮都把路网缓存清掉，
+    // 免得测到"缓存命中"那条早退路径上去（缓存不分镜像，见 map.js）。
+    const drop_cache = () => storage.removeItem(MAP.MAP_CACHE_KEY);
+    const mk = (fetch_impl) => new MAP.OsmMapSource({
+      storage, endpoints: EPS,
+      endpoint_timeout_ms: 5, budget_ms: 60, min_slice_ms: 1,
+      fetch: fetch_impl,
+    });
+    const ways_json = async () => mk_ways(5, 30.25, 120.13);
+
+    // 第一轮：a 挂、b 成 —— b 被记住
+    const tried1 = [];
+    const s1 = mk(async (url) => {
+      tried1.push(url);
+      if (url === EPS[1]) return { ok: true, json: ways_json };
+      throw new Error('挂了');
+    });
+    eq(s1._preferred, '', '一开始没有"上次成功的镜像"（存储是空的）');
+    eq(await s1.refresh(30.25, 120.13, 0), true, '第一轮：a 挂、b 成');
+    eq(s1.current_endpoint, EPS[1], '数据来自 b');
+    eq(tried1, [EPS[0], EPS[1]], '第一轮按静态顺序试 a → b');
+    eq(storage.getItem(MAP.MAP_ENDPOINT_KEY), EPS[1],
+       '成功的 b 被持久化进 localStorage（sticky）');
+
+    // 第二轮（新实例、同一份存储）：b 排第一，一次就成
+    drop_cache();
+    const tried2 = [];
+    const s2 = mk(async (url) => { tried2.push(url); return { ok: true, json: ways_json }; });
+    eq(s2._preferred, EPS[1], '新实例（等价于重新打开页面）读回了"上次成功的是 b"');
+    eq(s2._endpoint_order(), [EPS[1], EPS[0], EPS[2]],
+       'b 被排到第一个，其余保持静态顺序（仍然是不重不漏的一个排列）');
+    eq(await s2.refresh(30.25, 120.13, 0), true, '第二轮成功');
+    eq(tried2, [EPS[1]],
+       '第二轮**第一次**就试 b —— 不再先白等前两个挂掉的镜像（这就是省下的那一整片）');
+
+    // 第三轮：b 挂了 —— 退回静态顺序，c 顶上成为新的 sticky
+    drop_cache();
+    const tried3 = [];
+    const s3 = mk(async (url) => {
+      tried3.push(url);
+      if (url === EPS[2]) return { ok: true, json: ways_json };
+      throw new Error('挂了');
+    });
+    eq(await s3.refresh(30.25, 120.13, 0), true, '第三轮：b 挂了，后面还有能用的');
+    eq(tried3, [EPS[1], EPS[0], EPS[2]], 'b 失败后继续按静态顺序试 a → c（退回静态顺序）');
+    eq(storage.getItem(MAP.MAP_ENDPOINT_KEY), EPS[2], 'c 成了，sticky 换成 c');
+
+    // 存储里是一个"已经不在列表里"的镜像：当作没有，退回静态顺序（不能崩）
+    storage.setItem(MAP.MAP_ENDPOINT_KEY, 'https://gone.example/x');
+    const s4 = mk(async () => { throw new Error('挂了'); });
+    eq(s4._preferred, '', '存储里那个镜像不在当前列表里 = 当作没有 sticky');
+    eq(s4._endpoint_order(), EPS, '退回静态顺序');
+
+    // 存储整个坏掉（隐私模式 / 配额爆了）也不能影响抓取
+    const bad_storage = {
+      getItem() { throw new Error('SecurityError'); },
+      setItem() { throw new Error('QuotaExceededError'); },
+      removeItem() { throw new Error('SecurityError'); },
+    };
+    const s5 = new MAP.OsmMapSource({
+      storage: bad_storage, endpoints: EPS,
+      endpoint_timeout_ms: 5, budget_ms: 60, min_slice_ms: 1,
+      fetch: async () => ({ ok: true, json: ways_json }),
+    });
+    eq(s5._preferred, '', '存储读不了时当作没有 sticky（不抛）');
+    eq(await s5.refresh(30.25, 120.13, 0), true,
+       '存储写不了时照样抓得到（sticky 只是记不住，不是依赖）');
+    eq(s5.state, 'ok', '状态 = ok');
   }
 }
 

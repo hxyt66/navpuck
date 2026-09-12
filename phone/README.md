@@ -4,7 +4,8 @@
 ESP32-S3 圆屏，不需要 USB、不需要电脑、不需要任何地图 API key。
 
 - 路线：**OSRM** 公共实例（免费、无 key）
-- 街道路网：**Overpass API**（免费、无 key），localStorage 缓存 + 失败退避；
+- 街道路网：**Overpass API**（免费、无 key），localStorage 缓存 + 失败退避 +
+  **记住上次成功的镜像**（sticky）；
   **抓不到时不影响导航**（状态面板会说清楚，也可以整个关掉）
 - 链路：**Nordic UART Service**（设备已经实现）
 - 线协议：**一个字节都没有改**，与 `tools/navpuck_proto.py` 逐字节相同
@@ -229,34 +230,52 @@ Chrome 右上角 `⋮` → **`添加到主屏幕`** / **`安装应用`**。
 
 ### 底图（Overpass）挂掉的时候（这一版补的）
 
-公共 Overpass **真的会整体挂掉**。开发机上实测：`overpass-api.de` 只解析到 IPv6
-且 TCP 443 不通；`overpass.kumi.systems` 的 `/api/status` 回 200，但真正的
-`way[highway](around:...);out geom;` 查询 **>90 秒**没有响应。改之前的表现是
-界面永远停在"等待路网" —— 用户既不知道这是上游故障，也不知道**导航根本没受影响**。
+公共 Overpass **真的会整体挂掉**，而且**哪一个还活着是随时间变的**。开发机上实测
+（对 9 个公共实例逐个探活 `GET /api/status`，再对能用的那个发一次真的
+`way[highway](around:300,...);out geom;`）：
 
-现在这层的行为（全部在 `map.js`，命令字 `MAP_*`）：
+| 实例 | 结果 |
+|---|---|
+| `maps.mail.ru/osm/tools/overpass` | **HTTP 200 —— 9 个里唯一能用的** |
+| `overpass-api.de` / `overpass.kumi.systems` / `overpass.private.coffee` / `overpass.openstreetmap.ru` / `z.overpass-api.de` / `lz4.overpass-api.de` | `/api/status` 超时 |
+| `overpass.osm.jp` | TLS 证书信任失败 |
+| `overpass.osm.ch` | HTTP 400 |
+
+`maps.mail.ru` 的真查询是 **HTTP 200 + `Access-Control-Allow-Origin: *`**（所以浏览器
+**可以**直连），但**慢：一个小查询要 17.6 秒**，43.9 KB / 46 条路。
+⚠️ 这些是**开发机**上的实测，**没有**在手机所处的网络、也没有在真正的浏览器里复验过。
+
+改之前的表现是界面永远停在"等待路网" —— 用户既不知道这是上游故障，也不知道
+**导航根本没受影响**。现在这层的行为（全部在 `map.js`，命令字 `MAP_*`）：
 
 | 常量 / 行为 | 值 | 为什么 |
 |---|---|---|
-| `MAP_ENDPOINT_TIMEOUT_MS` | **12000** | 每个镜像单独超时（`AbortController` + `Promise.race` 双保险）。再短会误杀"只是慢"的正常查询 |
-| `MAP_REFRESH_BUDGET_MS` | **30000** | 一整轮刷新的**墙钟预算**。一个不回应的镜像最多吃 12 秒，绝不可能是整轮 |
-| `MAP_MIN_ENDPOINT_SLICE_MS` | **2500** | 剩余预算不够就不再开新镜像（开了也必然超时，只把失败拖更久） |
+| `ENDPOINTS[0]` | **`maps.mail.ru`** | 实测唯一能用的排第一。上一版它排第三：两个死镜像各烧 12 秒，轮到它时 30 秒预算只剩 6 秒 —— **唯一能用的镜像被饿死**，用户看到"全部镜像失败" |
+| `MAP_ENDPOINT_TIMEOUT_MS` | **45000** | 每个镜像单独超时（`AbortController` + `Promise.race` 双保险）。**17.6 秒实测值的 2.5 倍** —— 12 秒那一版 < 17.6 秒，等于注定掐断唯一能用的镜像。谁要调小，先重新实测 |
+| `MAP_REFRESH_BUDGET_MS` | **120000** | 一整轮刷新的**墙钟预算** = 2 个完整切片（2×45s）+ 第三片至少 30 秒。N 个镜像里前 N-1 个哪怕各烧一整片，最后一个也拿得到 ≥ 20 秒（> 实测 17.6 秒） |
+| `MAP_MIN_ENDPOINT_SLICE_MS` | **20000** | 剩余预算不够就不再开新镜像。这一片必须长得够一次真查询跑完（实测 17.6 秒），否则失败原因会写成"请求超时"，看起来像镜像的错，其实是我们的预算不够 |
+| **sticky 镜像** | 成功过的排下一轮第一 | `localStorage` 的 `navpuck.osm_endpoint.v1` 记着上次成功的是谁，下一轮先试它；它要是再失败就**立刻忘掉**、退回静态顺序。静态列表永远会有一段时间是错的（实测那一刻 9 个里只有 1 个能用） |
 | 镜像轮换 | 失败后从下一个开始 | 排头但长期挂掉的实例不会把后面的镜像永远饿死 |
 | 退避冷却 | 60 → 120 → 240 → 480 → **600**（上限） | `MAP_FAIL_COOLDOWN_S` 起算的指数退避。服务刚恢复时最怕一群客户端同时回来把它再打死 |
 | 缓存优先 | 新鲜缓存：**完全不联网**；过期缓存：**先用上**并标"缓存已旧" | 缓存键里**没有 endpoint**，所以镜像列表怎么改，手机上的旧缓存都还能用 |
 | `显示街道路网底图`（复选框） | 关掉 = 一个 Overpass 请求都不发 | 省流量、省电、Overpass 挂了时不用干等。选择**记在 localStorage** 里（`navpuck.opt.map.v1`），关掉时还会给设备发一帧空 `NAV_MAP` 把已经画出来的路网清掉（设备对 `seg_count == 0` 的处理见 `src/ui/ui_puck.cpp` 的 `renderMap()`） |
 
+⚠️ 查询本身（`way[highway](around:260,...);out geom;`）**一个字都没改**：半径必须是
+`MAP_RADIUS_M`（`MAP_RADIUS_M - MAP_REFRESH_MOVE_M = 180m > ROUTE_FAR_M = 160m`，调小
+就会出现空洞，而且它是和 Python 对拍的常量），而"17.6 秒 / 200 / CORS `*`"这份实测
+就是**这条查询**测出来的 —— 改了形状，那份实测就不再说明任何事。
+
 界面上的状态（`OsmMapSource.status()` → 状态面板 `底图` 一格 + 下面那行详情）：
 
 | 状态 | 那一格 | 详情（摘要） |
 |---|---|---|
-| `trying` | `拉取中 2/3` | 正在请求第 2/3 个镜像 `overpass.kumi.systems`（单镜像 12 秒、整轮 30 秒）；导航不受影响 |
-| `ok` | `42段/330点` | 底图正常：来自 `overpass-api.de`，42 段 / 330 点（本次实时抓取） |
+| `trying` | `拉取中 2/3` | 正在请求第 2/3 个镜像 `overpass.kumi.systems`（单镜像 45 秒、整轮 120 秒）；导航不受影响 |
+| `ok` | `42段/330点` | 底图正常：来自 `maps.mail.ru`，42 段 / 330 点（本次实时抓取） |
 | `cached` | `42段/330点·缓存` | 底图来自本地缓存（抓取于 3 分钟前）；本次没有联网 |
 | `stale` | `42段/330点·缓存已旧` | 数据偏旧（抓取于 9 天前），正在后台尝试刷新；导航不受影响 |
-| `unavailable` | `不可用 · 60s后重试` | **底图服务（Overpass）暂时无响应，不影响导航，路线和箭头照常工作。** 后面接逐镜像的原因（`overpass-api.de：请求超时（12 秒）；…`）和退避说明 |
+| `unavailable` | `不可用 · 60s后重试` | **底图服务（Overpass）暂时无响应，不影响导航，路线和箭头照常工作。** 后面接逐镜像的原因（`overpass-api.de：请求超时（45 秒）；…`）和退避说明 |
 | `disabled` | `已关闭` | 已关闭：不再向 Overpass 发任何请求；不影响导航，勾选可重新打开 |
-| `idle` | `等待路网…` | 只在导航刚启动、还没发出第一次请求的那 0.5 秒里出现 |
+| `idle` | `未开始拉取` | 只在导航刚启动、还没发出第一次请求的那 0.5 秒里出现 |
 
 ⚠️ 上一版那三句话里含糊的"等待路网…"**只在 `idle` 这半秒里出现**；一旦问过
 Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + 原因）。
@@ -333,13 +352,17 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
   设备没有磁力计，方向完全依赖手机 —— 手机一歪，全屏就歪。
 - **Overpass / OSRM 的实际可用性**。两者都是公共实例，会限流。代码有缓存和
   退避，但没在真机路线上跑过。
-- **三个 Overpass 镜像一个都没验证过**（`map.js` 的 `ENDPOINTS`）：
-  `overpass-api.de`、`overpass.kumi.systems`，以及这一版新加的
-  `maps.mail.ru/osm/tools/overpass`（rOpenSci 的 `osmdata` 包在
-  `list_overpass_urls()` 里默认采样的两个之一，所以"这个地址真实存在"是有出处的）。
-  **开发机（也就是手机所处的这个网络）三个都连不通**，所以：可用性、限流策略、
-  以及**是否带 CORS 响应头**全部**没有**用真请求验证过 —— "写在列表里"不等于"能用"。
-  换/加镜像时请自己确认这三点，别照着这份列表抄。
+- **Overpass 镜像：只有 `maps.mail.ru` 是开发机上实测过能用的**（`map.js` 的
+  `ENDPOINTS`）。9 个候选里它是唯一 `/api/status` 回 200、真查询也回 200 的
+  （17.6 秒，带 `Access-Control-Allow-Origin: *`），它也是 rOpenSci 的 `osmdata`
+  包 `list_overpass_urls()` 默认采样的公共实例之一。另外两个
+  （`overpass-api.de`、`overpass.kumi.systems`）是 Python 版就有的 fallback，
+  **一次都没连通过**。
+  ⚠️ 而且这份实测是**开发机**上的，**没有**在手机所处的网络、也没有在真正的浏览器里
+  复验过（手机在另一个网络）。换/加镜像时请自己确认三件事：探活、真查询、CORS 响应头
+  —— "写在列表里"不等于"能用"。
+  好在 `map.js` 现在会**记住上次成功的那个镜像**（sticky，`navpuck.osm_endpoint.v1`），
+  所以"哪个活着"这件事不用靠维护这份静态列表来猜。
 - **PWA 安装与离线**。manifest / service worker 只做了语法与清单检查，
   没有在真机上装过。
 
@@ -382,9 +405,9 @@ python tools/selftest.py
 `sw.js` 的 `ASSETS` 清单里那些文件（`index.html` / `style.css` / `app.js` /
 `map.js` / `ble.js` / `route.js` / `proto.js` / `navmath.js` / `manifest.webmanifest`
 / `icon.svg`）改完，**必须**把 `sw.js` 顶部的 `CACHE` 版本号 +1
-（当前是 `navpuck-phone-v3`）。Service Worker 是**缓存优先**的：版本号不变，
+（当前是 `navpuck-phone-v4`）。Service Worker 是**缓存优先**的：版本号不变，
 手机上的 PWA 会一直吃旧副本，症状是"代码明明改了、手机上还是老样子"——
 而且因为改动本身没生效，用户根本看不出是缓存问题。
 
-这一版（`v2` → `v3`）改的正是底图那套（`map.js` / `app.js` / `index.html` /
-`style.css`），所以**必须在手机上看到 `v3` 才会拿到这个修复**。
+这一版（`v3` → `v4`）改的正是底图那套（`map.js` 的镜像顺序 / 超时 / sticky +
+本文件），所以**必须在手机上看到 `v4` 才会拿到这个修复**。

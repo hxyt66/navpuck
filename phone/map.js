@@ -20,23 +20,52 @@
  * ---------------------------------------------------------------------------
  * 失败要快、要说得清楚、绝不能拖累导航
  * ---------------------------------------------------------------------------
- * 公共 Overpass 实例**真的会整体挂掉**。开发机上实测（手机侧同样的网络环境）：
- *   - overpass-api.de：只解析到 IPv6，TCP 443 不通；
- *   - overpass.kumi.systems：/api/status 回 200，但真正的
- *     way[highway](around:...);out geom; 查询 **>90 秒**没有响应。
+ * 公共 Overpass 实例**真的会整体挂掉**，而且**哪一个活着是随时间变的**。
+ *
+ * ⚠️ 下面这组数字全部来自**开发机上的一次实测**（对 9 个公共实例逐个探活
+ *    GET /api/status，再对能用的那个发一次真的
+ *    `way[highway](around:300,...);out geom;`）：
+ *
+ *    | 实例                              | 结果                       |
+ *    |-----------------------------------|----------------------------|
+ *    | maps.mail.ru/osm/tools/overpass   | **HTTP 200，唯一能用的**    |
+ *    | overpass-api.de                   | /api/status 超时           |
+ *    | overpass.kumi.systems             | /api/status 超时           |
+ *    | overpass.private.coffee           | /api/status 超时           |
+ *    | overpass.openstreetmap.ru         | /api/status 超时           |
+ *    | z.overpass-api.de                 | /api/status 超时           |
+ *    | lz4.overpass-api.de               | /api/status 超时           |
+ *    | overpass.osm.jp                   | TLS 证书信任失败           |
+ *    | overpass.osm.ch                   | HTTP 400                   |
+ *
+ *   maps.mail.ru 的真查询：**HTTP 200 + `Access-Control-Allow-Origin: *`**
+ *   （所以浏览器**可以**直连，不是 CORS 被挡），但**慢：小查询要 17.6 秒**，
+ *   43.9 KB / 46 条路。**这个 17.6 秒是下面所有超时数字的依据。**
+ *
+ * ⚠️ 再说一遍：这些是**开发机**上的实测，**没有**在手机所处的网络、也没有在
+ *    真正的浏览器里复验过（手机在另一个网络）。所以"哪个镜像能用"这件事
+ *    **不能**当成静态事实用 —— 这正是这一版加 sticky 的原因，见第 2 条。
+ *
  * 没有这一层的话，用户看到的就是永远停在"等待路网" —— 既不知道这是上游故障，
  * 也不知道**导航其实完全没受影响**。所以这一版：
  *
- *   1. **每个镜像单独超时**（MAP_ENDPOINT_TIMEOUT_MS = 12 秒，AbortController），
- *      一整轮刷新还有**总预算**（MAP_REFRESH_BUDGET_MS = 30 秒）。一个不响应的
+ *   1. **每个镜像单独超时**（MAP_ENDPOINT_TIMEOUT_MS = 45 秒，AbortController），
+ *      一整轮刷新还有**总预算**（MAP_REFRESH_BUDGET_MS = 120 秒）。一个不响应的
  *      镜像最多吃掉一个切片，绝不可能吃掉整轮 —— refresh() 的墙钟时间因此是
  *      **有界的**（集成自测 12 节钉着这条）。
- *   2. **失败后从下一个镜像开始**（轮换）：排在最前面但长期挂掉的实例不会把后面
+ *      ⚠️ 45 秒是 17.6 秒实测值的 2.5 倍。上一版是 12 秒 —— 而 12 秒 < 17.6 秒，
+ *      等于**注定掐断那个唯一能用的镜像**。别在没有重新实测的情况下把它调回去。
+ *   2. **能用的镜像排第一，而"上次成功的那个"会被记住**（sticky，见
+ *      _endpoint_order / MAP_ENDPOINT_KEY）：成功一次就写进 localStorage，
+ *      下一轮先试它；它要是再失败就立刻忘掉、退回静态顺序。静态列表**永远**
+ *      会有一段时间是错的（实测那一刻 9 个里只有 1 个能用），把列表排一次不算
+ *      修好 —— "记住上次谁成了"才是。
+ *   3. **失败后从下一个镜像开始**（轮换）：排在最前面但长期挂掉的实例不会把后面
  *      的镜像永远饿死。再配合指数退避冷却（60 → 120 → … → 600 秒），服务刚恢复
  *      时不会被我们一群客户端重新打死（打限流的后果比"少几条路"严重得多）。
- *   3. **缓存不分镜像**：缓存键里没有 endpoint，所以镜像列表怎么改，手机上的旧
+ *   4. **缓存不分镜像**：缓存键里没有 endpoint，所以镜像列表怎么改，手机上的旧
  *      缓存都还能用。过期缓存也**先用上**（状态标"缓存已旧"），而不是让屏幕空着。
- *   4. **状态机说得清楚**（status()）：在试第几个镜像 / 不可用（含逐镜像的失败
+ *   5. **状态机说得清楚**（status()）：在试第几个镜像 / 不可用（含逐镜像的失败
  *      原因）/ 好（多少段多少点、是否来自缓存）。界面直接照抄，不再有含糊的
  *      "等待路网"。文案常量就在这个文件里，只有一份。
  *
@@ -58,21 +87,36 @@
 }(typeof globalThis !== 'undefined' ? globalThis : this, function (nm, proto, rt) {
 
   const MAP_CACHE_KEY = 'navpuck.osm_cache.v1';
+  // "上次成功的镜像"（sticky）。**单独一个键**，和路网缓存互不影响：
+  // 界面上"清空路网缓存"不该顺手把"哪个镜像好用"这件事也忘掉。
+  // 存的就是 endpoint URL 本身（不是 JSON）：存坏了顶多是拼不上列表里的任何
+  // 一条，自然退回静态顺序 —— 没有"JSON 解析失败"这一说。
+  const MAP_ENDPOINT_KEY = 'navpuck.osm_endpoint.v1';
 
   // ---- 网络预算（毫秒；见文件头那段说明）----------------------------------
   //
   // ⚠️ 这几个数是"用户会盯着等多久"的直接来源，改之前先想清楚：
-  //   - 单个镜像 12 秒：公共实例被限流时经常二三十秒才回 504，再短会误杀
-  //     "只是慢"的正常查询；再长用户就盯着"拉取中"发呆了。
-  //   - 整轮 30 秒：一个不响应的镜像最多吃掉 12 秒，后面的镜像仍然有机会被试到。
-  //   - 剩余预算不足 2.5 秒就不再开新镜像 —— 开了也几乎必然超时，只会把
-  //     "失败"这件事拖得更久。
-  const MAP_ENDPOINT_TIMEOUT_MS = 12000;
-  const MAP_REFRESH_BUDGET_MS = 30000;
-  const MAP_MIN_ENDPOINT_SLICE_MS = 2500;
+  //   - 单个镜像 45 秒 = **实测查询时间 17.6 秒的 2.5 倍**。那个 17.6 秒是在
+  //     唯一能用的 maps.mail.ru 上、用这条查询、对一个 around:300 的小区域测
+  //     出来的（文件头有完整那张表）。12 秒那一版就是这么坏了事的：**12 < 17.6**，
+  //     唯一能用的镜像每次都在半路被掐断，用户看到的却是"全部镜像失败"。
+  //     45 秒同时也盖住了"公共实例被限流时二三十秒才回 504"这个常见形状。
+  //     ⚠️ 谁想把它调小，请先重新实测一遍并把这个数字一起改掉。
+  //   - 整轮 120 秒 = **两个完整切片（2×45）+ 第三片至少 30 秒**。这条不是凑的：
+  //     N 个镜像，前 N-1 个哪怕每个都烧掉一整个切片，最后一个也还能拿到
+  //     ≥ 30 秒（> 实测 17.6 秒，还留了十几秒给定时器抖动），不会被记成
+  //     "未尝试"。上一版是 30 秒预算：两个死镜像各烧 12 秒之后，唯一能用的
+  //     那个只剩 6 秒 —— 饿死。集成自测 12 节 g/h 两块钉着这个算式。
+  //   - 剩余预算不足 20 秒就不再开新镜像。这一片必须长得够一次真查询跑完
+  //     （实测 17.6 秒），开了才有意义；否则只是把"失败"这件事拖得更久，
+  //     而且会把原因写成"请求超时"，看起来像镜像的错，其实是我们的预算不够。
+  const MAP_ENDPOINT_TIMEOUT_MS = 45000;
+  const MAP_REFRESH_BUDGET_MS = 120000;
+  const MAP_MIN_ENDPOINT_SLICE_MS = 20000;
   // 服务端自己的 [timeout:N] 要比客户端的 abort **早**这么多秒：这样它还有机会
   // 回一个带 remark 的 200（"Query timed out"），我们能把它当"限流/超时"记下来，
   // 而不是只留下一个没有上下文的 AbortError。
+  // （45 秒的切片 -> 服务端 43 秒，仍在 Overpass 默认的 180 秒上限之内。）
   const MAP_QUERY_TIMEOUT_MARGIN_S = 2;
   // 失败退避的上限（秒）。指数退避：60 -> 120 -> 240 -> 480 -> 600。
   // 服务刚恢复时最怕一堆客户端同时回来把它再打死。
@@ -88,20 +132,31 @@
     '路线、箭头、转向提示和 10Hz 更新都照常；勾选"显示街道路网底图"可以重新打开。';
 
   /**
-   * Overpass 实例。按顺序尝试，全失败才算失败。
+   * Overpass 实例。按这个顺序试，全失败才算失败。
    *
-   * 前两个是 Python 版就有的行为：公共实例会轮到某个 504/超时，换一个就能过。
-   * 第三个是 rOpenSci 的 osmdata 包默认采样的公共实例之一（见该包的
-   * list_overpass_urls()，它列的就是 overpass-api.de 和 maps.mail.ru 这两个）。
+   * ⚠️ 顺序是**实测**排出来的（文件头有整张表），不是抄来的：
+   *   - 第 1 个 maps.mail.ru 是 9 个候选里**唯一**探活成功、真查询也成功的
+   *     那一个（HTTP 200 + `Access-Control-Allow-Origin: *`，浏览器能直连）。
+   *     它**必须**排第一：上一版这里是 overpass-api.de，12 秒超时，两个死镜像
+   *     各烧掉 12 秒，轮到它时 30 秒预算只剩 6 秒 —— 唯一能用的镜像被饿死，
+   *     用户看到"全部镜像失败"，而其实它只是慢（17.6 秒）。
+   *   - 它也是 rOpenSci 的 osmdata 包 `list_overpass_urls()` 默认采样的公共实例
+   *     之一，所以"这个地址真实存在"是有出处的。
+   *   - 后两个是 Python 版就有的行为：公共实例会轮到某个 504/超时，换一个就能过。
    *
-   * ⚠️ 这三条**都是"文档上真实存在"的公共实例，但开发机（以及手机所处的网络）
-   *    一个都连不上通**（见文件头那段实测），所以**没有任何一条的可用性/限流
-   *    策略/CORS 响应头是在这里验证过的**。别把"写在列表里"当成"能用"。
+   * ⚠️ 实测那一刻只有 1/9 个能用，其余 8 个（6 个超时、1 个 TLS 信任失败、
+   *    1 个 400）**故意不写进这个列表**：每多一个死镜像就多烧掉一个切片，
+   *    而它们一次都没成功过。"写在列表里"从来不等于"能用"。
+   *    真要加，请自己先探活 + 真查询 + 看 CORS 响应头，三样都过了再加。
+   *
+   * ⚠️ 这个列表只是**冷启动时的猜测**。成功过的镜像会被记到
+   *    MAP_ENDPOINT_KEY 里，下一轮直接排到最前面（见 _endpoint_order）——
+   *    因为"哪个活着"是随时间变的，静态顺序永远会有一段时间是错的。
    */
   const ENDPOINTS = [
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
     'https://overpass-api.de/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
-    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   ];
 
   /** 从 endpoint URL 里取主机名，只用于界面显示。 */
@@ -190,6 +245,9 @@
       this.fail_cooldown_used_s = 0;
       // 下一次从哪个镜像开始试（失败后轮换，见 _endpoint_order）
       this._start = 0;
+      // 上次成功的镜像（sticky，见 _endpoint_order）。必须在 _storage 和
+      // endpoints 都赋值之后再读。
+      this._preferred = this._load_preferred();
       this._used_endpoint = '';
       this.last_ok_t = -1e9;
       this.built_segs = 0;                // build() 真的画出去过多少段/点（界面读）
@@ -226,6 +284,50 @@
           this.last_error = `缓存写入失败（忽略）：${e}`;
         }
       }
+    }
+
+    /**
+     * 读"上次成功的镜像"（sticky）。
+     *
+     * ⚠️ **不信任存储里的任何内容**：必须是**当前列表里真有**的那一条，否则当作
+     * 没有（返回 ''）。这样镜像列表改过、值被写坏、或者存的是别的版本留下的
+     * URL，都只是退回静态顺序，不会变成"每轮都先试一个不存在的地址"。
+     * 读失败（隐私模式 / 存储被禁）也当作没有 —— sticky 只是优化，不是依赖。
+     *
+     * @returns {string} endpoint URL，或 ''（没有/不可用）
+     */
+    _load_preferred() {
+      let raw = null;
+      try {
+        raw = this._storage ? this._storage.getItem(MAP_ENDPOINT_KEY) : null;
+      } catch (_e) {
+        return '';
+      }
+      if (typeof raw !== 'string' || raw === '') return '';
+      return this.endpoints.indexOf(raw) >= 0 ? raw : '';
+    }
+
+    /** 记住这个镜像好用：下一轮先试它。写不进去也不影响这一轮。 */
+    _remember_preferred(ep) {
+      this._preferred = ep;
+      try {
+        if (this._storage) this._storage.setItem(MAP_ENDPOINT_KEY, ep);
+      } catch (_e) {
+        // 配额爆了 / 隐私模式：这一轮照样用，只是下次打开不记得
+      }
+    }
+
+    /**
+     * 忘掉"上次成功"（它刚刚失败了），退回静态顺序。
+     *
+     * 不"降级到第二顺位"是**故意**的：留着它就得每轮先白等一个完整切片
+     * （45 秒）才轮到别人。忘掉之后由轮换接手，而它下次成功时还会被重新记住。
+     */
+    _forget_preferred() {
+      this._preferred = '';
+      try {
+        if (this._storage) this._storage.removeItem(MAP_ENDPOINT_KEY);
+      } catch (_e) { /* 忽略 */ }
     }
 
     /**
@@ -287,6 +389,31 @@
     }
 
     // -- 联网 --------------------------------------------------------------
+    /**
+     * 拼 Overpass 查询。
+     *
+     * ⚠️ 半径就是 MAP_RADIUS_M（260 米），**不能调小也不能调大**：
+     *   - 调小不行：navigator.py 那条约束算的是
+     *     "MAP_RADIUS_M - MAP_REFRESH_MOVE_M > 可视半径"，也就是
+     *     260 - 80 = 180 > ROUTE_FAR_M(160)。再小的话，锚点落后（车已经往前
+     *     跑了 80 米还没刷新）时前方就会出现一圈"没有路网"的空洞。
+     *     而且 MAP_RADIUS_M 是和 Python 对拍的常量，这里更不能动。
+     *   - 调大也不行：实测一个 around:300 的"小"查询在唯一能用的镜像上就要
+     *     17.6 秒（文件头）。半径每大一档，超时的概率就高一档，而我们只需要
+     *     160 米的视野 —— 拿超时换一圈画不出来的路，是纯亏。
+     *
+     * ⚠️ 这条查询**和实测时用的那条是同一串字节**（`way[highway](around:...)`，
+     *    只在数字上不同）。maps.mail.ru 那次 "200 / 17.6 秒 / 43.9 KB / 46 条路"
+     *    就是**这条查询**测出来的。所以没有重新实测之前**不要改它的形状**：
+     *    别调半径、别加标签值过滤、别换过滤器顺序。改了，那份实测就不再说明
+     *    任何事 —— 而"哪个镜像能用、要等多久"目前只剩这一份实测撑着。
+     *
+     * [timeout:N] 是**服务端**自己的超时，比客户端的 abort 早
+     * MAP_QUERY_TIMEOUT_MARGIN_S 秒：这样它还有机会回一个带 remark 的 200
+     * （"Query timed out"），我们能把它当"限流/超时"记下来，而不是只留下一个
+     * 没有上下文的 AbortError。它也跟着**切片**走：预算快用完时切片会变短，
+     * 服务端超时跟着变短，不会出现"客户端已经不等了、服务端还在跑"。
+     */
     _build_query(lat, lon, timeout_ms) {
       const server_s = Math.max(5,
         Math.floor(timeout_ms / 1000) - MAP_QUERY_TIMEOUT_MARGIN_S);
@@ -310,12 +437,28 @@
       return ways;
     }
 
-    /** 这一轮按什么顺序试镜像：从 _start 起绕一圈（失败后会轮换）。 */
+    /**
+     * 这一轮按什么顺序试镜像。
+     *
+     *   1. **上次成功的那个排第一**（sticky）。实测那一刻 9 个公共实例里只有 1 个
+     *      能用，而且"哪个活着"是随时间变的 —— 静态列表永远会有一段时间是错的，
+     *      所以真正的修法是"记住上次谁成了"，而不是把列表排一次就完事。
+     *      它不在当前列表里（列表换了/值写坏了）就当没有。
+     *   2. 其余按静态顺序，从 _start 起绕一圈（失败后会轮换，排头的死镜像不会
+     *      永远把后面的饿死）。
+     *
+     * ⚠️ 返回的一定是 this.endpoints 的一个**排列**（不重不漏）：状态机里
+     *    "第 i/n 个镜像"和失败原因列表都依赖这一点。
+     */
     _endpoint_order() {
       const n = this.endpoints.length;
       if (n <= 1) return this.endpoints.slice();
       const start = ((this._start % n) + n) % n;
-      return this.endpoints.slice(start).concat(this.endpoints.slice(0, start));
+      const rot = this.endpoints.slice(start).concat(this.endpoints.slice(0, start));
+      const pref = this._preferred;
+      if (!pref || rot.indexOf(pref) < 0) return rot;
+      // 注意是"排第一"而不是"只试它"：它挂了后面照样有 fallback。
+      return [pref].concat(rot.filter((ep) => ep !== pref));
     }
 
     /**
@@ -516,6 +659,10 @@
         // 不碰 this.ways / this.anchor，所以正在画的那份数据不会被改坏。
         const r = await this._try_endpoint(ep, this._build_query(lat, lon, slice), slice);
         if (r.ok) { json = r.json; used = ep; break; }
+        // 记住的那个镜像刚失败了：**立刻**忘掉它，这一轮剩下的部分和下一轮都
+        // 退回静态顺序。（不降级到第二顺位是故意的：留着它就得每轮先白等一个
+        // 完整的 45 秒切片。它下次成功时还会被重新记住。）
+        if (ep === this._preferred) this._forget_preferred();
         this.errors.push({ endpoint: ep, reason: r.reason, ms: r.ms });
       }
 
@@ -546,6 +693,9 @@
       this.cache_endpoint = '';
       this.current_endpoint = used;
       this._used_endpoint = used;
+      // sticky：下一轮先试它。哪个镜像活着是随时间变的，静态列表永远会有一
+      // 段时间是错的 —— 这条才是"下次还能连上"的真正保障。
+      this._remember_preferred(used);
       this.consecutive_fails = 0;
       this.fail_cooldown_used_s = 0;
       this.fail_until_t = -1e9;
@@ -580,7 +730,8 @@
      *   short    很短，塞进状态面板"底图"那一格
      *   summary  一句话（unavailable 时就是固定的那句"不影响导航"）
      *   detail   完整说明：现在在干什么 / 每个镜像为什么失败 / 下一步做什么
-     *   reasons  每个镜像的失败原因（数组，元素形如 "overpass-api.de：请求超时（12 秒）"）
+     *   reasons  每个镜像的失败原因（数组，元素形如 "overpass-api.de：请求超时（45 秒）"）
+     *   preferred  上次成功的镜像 URL（sticky；没有就是 ''）—— 诊断用
      *
      * @param {number} now_s 导航时钟（秒）。给了才能算出"还有几秒重试"。
      */
@@ -596,6 +747,8 @@
         endpoint_host: this.current_endpoint ? _host_of(this.current_endpoint) : '',
         attempt: this.attempt,
         attempts: this.endpoints.length,
+        preferred: this._preferred,
+        preferred_host: this._preferred ? _host_of(this._preferred) : '',
         reasons: this.errors.map((e) => `${_host_of(e.endpoint)}：${e.reason}`),
         errors: this.errors.map((e) => ({
           endpoint: e.endpoint, host: _host_of(e.endpoint), reason: e.reason,
@@ -642,7 +795,9 @@
           out.detail = `正在请求街道路网底图：第 ${this.attempt}/${this.endpoints.length} ` +
             `个镜像 ${out.endpoint_host}（单个镜像最多 ` +
             `${Math.floor(this.endpoint_timeout_ms / 1000)} 秒，整轮最多 ` +
-            `${Math.floor(this.budget_ms / 1000)} 秒）。导航不受影响。`;
+            `${Math.floor(this.budget_ms / 1000)} 秒）。导航不受影响。` +
+            (this.current_endpoint && this.current_endpoint === this._preferred
+              ? '（上次成功的就是它，所以先试它）' : '');
           break;
 
         case 'ok':
@@ -755,7 +910,13 @@
       });
     }
 
-    /** 诊断用：清空缓存（界面上"清空路网缓存"按钮会调）。 */
+    /**
+     * 诊断用：清空缓存（界面上"清空路网缓存"按钮会调）。
+     *
+     * ⚠️ **不动** MAP_ENDPOINT_KEY（sticky 镜像）：那是"哪个镜像好用"的记忆，
+     * 和"这一带的路网"是两件事。清路网缓存之后第一轮最该做的就是拿上次成功
+     * 的镜像去重拉一遍，而不是顺手把这条唯一的线索也删掉。
+     */
     clear_cache() {
       this.cache = [];
       this.from_cache = false;
@@ -781,7 +942,7 @@
   }
 
   return {
-    MAP_CACHE_KEY, ENDPOINTS, OsmMapSource, _clamp_i16,
+    MAP_CACHE_KEY, MAP_ENDPOINT_KEY, ENDPOINTS, OsmMapSource, _clamp_i16,
     // 预算常量：自测和界面文案都要读，所以导出（不是"内部细节"）
     MAP_ENDPOINT_TIMEOUT_MS, MAP_REFRESH_BUDGET_MS, MAP_MIN_ENDPOINT_SLICE_MS,
     MAP_FAIL_COOLDOWN_MAX_S, MAP_QUERY_TIMEOUT_MARGIN_S,
