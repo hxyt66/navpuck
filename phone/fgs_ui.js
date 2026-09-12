@@ -53,6 +53,17 @@
       return null;
     }
 
+    // ⚠️ 必须**显式取消 hidden**。
+    //    index.html 里这块带 `hidden` 属性（为了 PWA 下不闪一下），
+    //    而这里以前只有 `hidden = true` 一条路径、从来没有把它打开过 ——
+    //    结果就是**面板在任何环境下都永远不显示**，包括 APK 里。
+    //    这个 bug 编译不报错、测试也抓不到（ui.mjs 当时只断言了 PWA 下隐藏），
+    //    只有真的在手机上打开才会发现。
+    {
+      const d = $('fgs-block');
+      if (d) d.hidden = false;
+    }
+
     const fgs = new W({
       window: root,
       onLog: log,
