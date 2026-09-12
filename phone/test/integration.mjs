@@ -401,15 +401,37 @@ section('3b] 队列里一个 update 都没有时：route 撑大队列，而不�
   for (let i = 0; i < BLE.QUEUE_MAX; i++) link.send(clearFrame, 'route', 0);
   eq(link._queue.length, BLE.QUEUE_MAX, `队列已满（${BLE.QUEUE_MAX} 帧 route）`);
   // 再来一帧 route：老代码**就是在这里丢掉它的**
-  const ok_send = link.send(clearFrame, 'route', 0);
-  eq(ok_send, true, '队满且只有 route 时，新来的 route 仍然入队（返回 true）');
+  const accepted = link.send(clearFrame, 'route', 0);
+  eq(accepted, true, '队满且只有 route 时，新来的 route 仍然入队（返回 true）');
   eq(link._queue.length, BLE.QUEUE_MAX + 1,
      `队列**超额**而不是丢 route（${BLE.QUEUE_MAX} -> ${link._queue.length}）`);
   eq(link.queue_overflow, 1, 'queue_overflow = 1（超额这件事本身有计数）');
   eq(link.route_frames_dropped, 0, 'route 一帧都没丢');
 
-  // 一路撑到硬上限，再来的 route 才会被丢 —— 但必须是**响的**
-  while (link._queue.length < BLE.QUEUE_HARD_MAX) link.send(clearFrame, 'route', 0);
+  // 放行：超额的那一帧必须**真的写出去**（"让队列涨"不等于把帧藏在队列里）
+  release();
+  const t0 = Date.now();
+  while (link._queue.length > 0 && Date.now() - t0 < 8000) await sleep(20);
+  eq(link._queue.length, 0, `放行后（超额）队列全部排空（耗时 ${Date.now() - t0}ms）`);
+  eq(link.frames_sent, BLE.QUEUE_MAX + 1,
+     `frames_sent = ${BLE.QUEUE_MAX + 1}（含靠超额入队的那一帧，一帧没少）`);
+  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).length, BLE.QUEUE_MAX + 1,
+     `设备侧解出 ${BLE.QUEUE_MAX + 1} 帧 NAV_ROUTE`);
+  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).every(
+       (f) => P.NavRoute.unpack(f.payload).total_points === 0), true,
+     '每一帧都是那个 14 字节的空片（total_points = 0），内容没被搞坏');
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
+
+  // ---- 硬上限：连 QUEUE_HARD_MAX 都到了才丢 route，而且必须是**响的** ----
+  // （这一段刻意不排空：512 帧每帧让出一次事件循环 ≈ 8 秒，没有必要。
+  //   要证明的是"拒收时计数和日志都在"，写出去的能力上面已经证过了。）
+  let release2;
+  const gate2 = new Promise((r) => { release2 = r; });
+  link.rx = {
+    async writeValueWithoutResponse(b) { await gate2; return realRx.writeValueWithoutResponse(b); },
+  };
+  for (let i = link._queue.length; i < BLE.QUEUE_HARD_MAX; i++) link.send(clearFrame, 'route', 0);
   eq(link._queue.length, BLE.QUEUE_HARD_MAX,
      `撑到硬上限 QUEUE_HARD_MAX = ${BLE.QUEUE_HARD_MAX}（= 2 × QUEUE_MAX）`);
   eq(link.send(clearFrame, 'route', 0), false,
@@ -419,19 +441,13 @@ section('3b] 队列里一个 update 都没有时：route 撑大队列，而不�
   ok(logs.some((l) => /⚠️ 丢帧：route/.test(l)),
      `日志里有一条带 ⚠️ 的 route 丢帧记录：${logs.filter((l) => /丢帧/.test(l)).slice(-1)[0] || '（没有）'}`);
   ok(logs.some((l) => /其中 route 1 帧/.test(l)), '日志里带着累计的 route 丢帧数');
-
-  // 放行：超额的那些帧必须**全部真的写出去**（超额不等于可以有帧卡在队列里）
-  release();
-  const t0 = Date.now();
-  while (link._queue.length > 0 && Date.now() - t0 < 15000) await sleep(20);
-  eq(link._queue.length, 0, `放行后超额队列也全部排空（耗时 ${Date.now() - t0}ms）`);
-  eq(link.frames_sent, BLE.QUEUE_HARD_MAX,
-     `frames_sent = ${BLE.QUEUE_HARD_MAX}（撑到硬上限的那些帧一帧没少）`);
-  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).length, BLE.QUEUE_HARD_MAX,
-     `设备侧解出 ${BLE.QUEUE_HARD_MAX} 帧 NAV_ROUTE`);
-  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).every(
-       (f) => P.NavRoute.unpack(f.payload).total_points === 0), true,
-     '每一帧都是那个 14 字节的空片（total_points = 0），内容没被搞坏');
+  eq(link.drop_summary.includes('route 1'), true,
+     `给界面/状态用的 drop_summary 也把它露出来了：${link.drop_summary}`);
+  eq(link.stats.route_frames_dropped, 1, 'stats 快照里同样能读到（界面读的就是这一份）');
+  await link.disconnect();
+  release2();
+  await sleep(50);
+  eq(link._queue.length, 0, '断开后队列干净');
   eq(link.frames_offered, link.frames_sent + link.frames_dropped,
      `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
 }
