@@ -89,6 +89,14 @@
         <span id="map-info" class="val">—</span>
       </div>
       <div class="cell">
+        <span class="cap">循环</span>
+        <span id="loop-info" class="val">—</span>
+      </div>
+      <div class="cell">
+        <span class="cap">屏幕常亮</span>
+        <span id="wake-info" class="val">—</span>
+      </div>
+      <div class="cell">
         <span class="cap">定位</span>
         <span id="gps-state" class="val">等待</span>
       </div>
@@ -107,6 +115,9 @@
     <!-- 底图（Overpass）的详情：抓取中/不可用/来自缓存，都在这一行说清楚。
          公共 Overpass 会整体挂掉，而"等待路网"四个字什么也没说明白 -->
     <p id="map-detail" class="hint" hidden></p>
+    <!-- 屏幕常亮 / 后台限流的详情：切到后台后浏览器会把定时器压到约 1Hz，
+         这一行就是"怎么突然变卡了"的答案（日志默认收起，所以必须常显） -->
+    <p id="loop-detail" class="hint" hidden></p>
   </section>
 
   <!-- 目的地与路线 -->
@@ -257,6 +268,40 @@
     </div>
   </details>
 
+  <!-- 后台运行（只在 APK 里有效）：
+       用户的要求是"骑车时手机揣兜里、屏幕熄灭，设备那块屏继续导航"。
+       浏览器做不到（后台页面被限流到 ~1Hz、还可能被整体冻结），Android 上唯一
+       被系统承认的办法是前台服务 + 常驻通知。
+       ⚠️ 但"进程不被回收"和"WebView 里的 10Hz 循环还在跑"是两件事，
+          后者只能实测 —— 所以这里还有一个探针，读数就是证据。
+       在 PWA 里整块会被 fgs_ui.js 隐藏（原生能力不可用）。 -->
+  <details class="panel opts" id="fgs-block" hidden>
+    <summary>后台运行（APK）/ 后台存活诊断</summary>
+    <div class="btn-row">
+      <button id="fgs-start-btn" type="button">开启后台运行</button>
+      <button id="fgs-stop-btn" type="button" class="ghost">停止</button>
+      <span id="fgs-state" data-state="stopped">未开启</span>
+    </div>
+    <p id="fgs-hint" class="hint">
+      前台服务让系统不回收本进程，这样熄屏、切后台之后导航还能继续推。
+    </p>
+
+    <h2>后台存活探针</h2>
+    <p class="hint">
+      这个探针回答一个本工程里**唯一无法离线验证**的问题：熄屏之后，页面里的
+      JS 定时器还在不在跑？两颗秒针对比着看就够了下结论 ——
+      <b>JS 跳数</b>是页面每 100ms 自增一次（10Hz 循环的代理），
+      <b>原生心跳</b>是前台服务每秒自增一次（证明进程活着）。
+      JS 停而心跳在走，就说明 WebView 被冻了，10Hz 循环必须搬进原生；
+      两个都停，说明前台服务本身没生效（多半是权限或厂商省电策略）。
+    </p>
+    <div class="btn-row">
+      <button id="fgs-probe-btn" type="button" class="ghost">启动探针</button>
+      <button id="fgs-probe-stop" type="button" class="ghost">停止探针</button>
+    </div>
+    <pre id="fgs-probe-out" class="hint">探针未启动</pre>
+  </details>
+
   <!-- 诊断日志：仅在 body.show-log 时显示 -->
   <pre id="log"></pre>
 
@@ -271,12 +316,17 @@
 
 </div>
 
-<!-- 逻辑模块：均为经典脚本（UMD/全局挂载），顺序不可更改 -->
+<!-- 逻辑模块：均为经典脚本（UMD/全局挂载），顺序不可更改。
+     ble_native.js 必须在 ble.js 之前：ble.js 的 BleLink.make_transport() 会在
+     init() 时去查 root.NavPuckBleNative；它的存在与否决定走原生还是 Web Bluetooth。 -->
 <script src="navmath.js"></script>
 <script src="proto.js"></script>
 <script src="route.js"></script>
 <script src="map.js"></script>
+<script src="ble_native.js"></script>
 <script src="ble.js"></script>
+<script src="fgs.js"></script>
+<script src="fgs_ui.js"></script>
 <script src="app.js"></script>
 
 <script>

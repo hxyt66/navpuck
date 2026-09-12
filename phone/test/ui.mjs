@@ -159,9 +159,14 @@ const FAKE_GEOLOCATION = {
 //   addEventListener / writeValueWithoutResponse），
 // 否则测到的是"假接口不全"，而不是 app.js 的真实行为。
 // 上一版就是漏了 getPrimaryService，于是连接停在 connecting 状态。
+//
+// `ui_writes` 把**手机写出去的全部字节**记下来：第 10 节要在这里面找
+// NAV_CLOCK 那一帧（不记下来就只能测"send_clock 被调过"，而"调过"不等于
+// "发出去的字节是对的"）。
+const ui_writes = [];
 const fake_characteristic = () => ({
-  async writeValueWithoutResponse(bytes) { /* 收下就行 */ },
-  async writeValue(bytes) { /* 收下就行 */ },
+  async writeValueWithoutResponse(bytes) { ui_writes.push(Uint8Array.from(bytes)); },
+  async writeValue(bytes) { ui_writes.push(Uint8Array.from(bytes)); },
   async startNotifications() { return this; },
   addEventListener() {},
 });
@@ -238,8 +243,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 section('1] index.html 自身的完整性');
 // ---------------------------------------------------------------------------
 {
-  eq(SCRIPT_SRCS, ['navmath.js', 'proto.js', 'route.js', 'map.js', 'ble.js', 'app.js'],
-     'script 加载顺序与依赖顺序一致（navmath -> proto -> route -> map -> ble -> app）');
+  // ⚠️ 这条断言是"index.html 的 <script> 列表与依赖顺序一致"。加 Android/Capacitor
+  //    那套东西时**必须**同步更新：ble_native.js（原生 BLE 传输，ble.js 会去查
+  //    NavPuckBleNative）、fgs.js（前台服务封装）、fgs_ui.js（后台运行面板）都是
+  //    新增的独立模块，顺序上必须在 ble.js / app.js 之前。
+  //    —— 改这里不是因为代码错了，而是因为这条契约本身就是"当前文件清单"。
+  eq(SCRIPT_SRCS,
+     ['navmath.js', 'proto.js', 'route.js', 'map.js',
+      'ble_native.js', 'ble.js', 'fgs.js', 'fgs_ui.js', 'app.js'],
+     'script 加载顺序与依赖顺序一致（navmath -> proto -> route -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
 
   // 重复 id 会让 getElementById 静默取到第一个，是"界面上有个元素永远不更新"的经典原因
   const seen = new Map();
@@ -917,12 +929,242 @@ section('9] 街道路网底图：状态说得清楚、关掉就真的不发请�
 }
 
 // ---------------------------------------------------------------------------
-section('10] "不支持 Web Bluetooth" 的提示路径');
+section('9b] 屏幕常亮（Wake Lock）与后台限流：状态说得清楚，绝不拖累导航');
+// ---------------------------------------------------------------------------
+//
+// 这一节钉两件事，都是现场反馈"切到后台就特别卡"的直接回答：
+//
+//   1. **屏幕常亮**（Screen Wake Lock）。摩托车上那块屏本来就该常亮，而
+//      "锁屏 / 页面切后台"正是浏览器把定时器压到 ~1Hz 的直接原因。生命周期
+//      三条：导航开始申请、停止导航释放、**页面回到前台必须重新申请**
+//      （浏览器在页面隐藏时一定会把锁收走；不重新要，用户切出去看一眼消息
+//      回来屏幕就再也不常亮了，而界面上完全看不出来）。
+//      三条都不许因为 API 缺失或申请被拒而中断导航。
+//   2. **把症状说出来**：循环周期超过阈值时，状态面板直接写
+//      "页面在后台，帧率已降"，并往日志写一行 —— 用户就不会以为导航坏了。
+//
+// ⚠️ 这一节必须排在第 10 节（NAV_CLOCK，它会点"连接设备"）之前：DOM 桩是
+//    共享的，多挂一个 App 实例的监听器是我们在这里**刻意**避免的事。
+{
+  const app = APP.app;
+
+  ok(typeof APP.ScreenWakeLock === 'function', 'app.js 导出了 ScreenWakeLock（可单测）');
+  ok(HTML_IDS.has('loop-info') && HTML_IDS.has('wake-info') && HTML_IDS.has('loop-detail'),
+     'index.html 里有 loop-info / wake-info / loop-detail（循环与屏幕常亮的状态）');
+
+  // ---- 1) 浏览器**没有** Wake Lock API：说清楚、导航照常 ----
+  //     （前面的第 4/7/8/9 节就是在"没有这个 API"的 navigator 上跑完整条
+  //      导航链路的，所以这条路已经被真实走过了。）
+  const wake = app.wake();
+  eq(wake.supported, false, '这个测试 navigator 上没有 wakeLock（正好是 Safari/旧版 Chrome）');
+  eq(wake.requests, 0, '没有 API 时**一次都不去调** request()（先探测能力，再动手）');
+  ok(app.log_lines.some((l) => /不支持屏幕常亮/.test(l)),
+     '日志里写明了"这个浏览器不支持屏幕常亮"（而不是悄悄什么都不做）');
+
+  // ---- 2) 装上假的 Wake Lock：导航开始申请、停止释放 ----
+  const wake_requests = [];
+  const sentinels = [];
+  const fake_wake_lock = {
+    async request(type) {
+      wake_requests.push(type);
+      const s = {
+        released: false,
+        _cbs: [],
+        addEventListener(ev, cb) { if (ev === 'release') this._cbs.push(cb); },
+        async release() { this.released = true; for (const cb of this._cbs.slice()) cb(); },
+        // 模拟"浏览器自己把锁收走"（页面隐藏时一定会发生）
+        fire_release() { for (const cb of this._cbs.slice()) cb(); },
+      };
+      sentinels.push(s);
+      return s;
+    },
+  };
+  globalThis.navigator.wakeLock = fake_wake_lock;      // 同一个 navigator 对象，现读现用
+  eq(app.wake().supported, true, '装上 API 后立刻就"支持"了（能力是懒判断的，不缓存）');
+
+  app.start_lat = 30.2545;
+  app.start_lon = 120.1350;
+  await app.do_route();
+  await sleep(200);
+  ok(app.nav !== null, '导航起得来（和屏幕常亮完全解耦）');
+  eq(wake_requests.length, 1, '导航开始时申请了一次屏幕常亮');
+  eq(wake_requests[0], 'screen', '申请的类型是 screen（守规范，别传别的东西）');
+  eq(app.wake().state().state, 'held', '状态 = held（真的拿着）');
+  eq(BY_ID.get('wake-info').textContent, '已保持',
+     `状态面板"屏幕常亮"那一格 = 已保持（实得 ${BY_ID.get('wake-info').textContent}）`);
+  eq(BY_ID.get('wake-info').dataset.state, 'ok', '那一格带 data-state=ok（配色用）');
+  ok(app.log_lines.some((l) => /已申请到屏幕常亮/.test(l)), '日志记了一次"已申请到屏幕常亮"');
+
+  // ---- 3) 停止导航：立刻释放（空闲时不该占着屏幕常亮）----
+  app.stop_nav();
+  await sleep(0);
+  eq(sentinels.length >= 1 && sentinels[0].released, true, '停止导航时那把锁**真的释放了**');
+  eq(app.wake().state().state, 'idle', '状态回到 idle');
+  eq(app.wake().state().want, false, '并且记着"现在不该持有"（空闲时不会偷偷再要一把）');
+  eq(BY_ID.get('wake-info').textContent, '空闲', '状态面板回到"空闲"');
+  eq(wake_requests.length, 1, '空闲期间**不再**申请（不导航就不持有屏幕常亮）');
+
+  // ---- 4) 页面隐藏 -> 浏览器收走锁；回到前台 -> **必须重新申请** ----
+  await app.do_route();
+  await sleep(150);
+  eq(wake_requests.length, 2, '第二次导航又申请了一次（每次导航一把新锁）');
+  const held_before_hide = app.wake().state().state;
+
+  DOC.visibilityState = 'hidden';
+  DOC.fire('visibilitychange');
+  eq(app.nav && app.nav.hidden, true, 'Navigator 被告知"页面在后台"（限流文案靠它）');
+  eq(app.wake().state().state, 'released',
+     '页面隐藏时本地认为锁已经没了（浏览器一定会收走，不能自己骗自己）');
+
+  DOC.visibilityState = 'visible';
+  DOC.fire('visibilitychange');
+  await sleep(0);
+  eq(wake_requests.length, 3, '**回到前台重新申请了一把**（这一步最容易漏：漏了屏幕从此不再常亮）');
+  eq(app.wake().state().state, 'held', '回到前台后状态又回到 held');
+  ok(held_before_hide === 'held', '（隐藏之前确实是 held —— 对比才有意义）');
+
+  // ---- 5) 申请被拒（低电量 / 页面不可见）：日志说清楚，导航照常 ----
+  app.wake().on_hidden();                              // 先把手上那把清掉
+  const orig_request = fake_wake_lock.request;
+  fake_wake_lock.request = async () => { throw new Error('NotAllowedError: 电量太低'); };
+  const ok_request = await app.wake().request();
+  eq(ok_request, false, '申请被拒时 request() 返回 false（不抛异常）');
+  eq(app.wake().state().state, 'failed', '状态 = failed（界面写"失败"）');
+  ok(/电量太低/.test(app.wake().state().reason), `原因原样留着：${app.wake().state().reason}`);
+  ok(app.log_lines.some((l) => /屏幕常亮申请被拒/.test(l)),
+     '日志里写明了"申请被拒、导航照常"（不是静默吞掉）');
+  const frames_before_reject = app.nav.frames_sent;
+  await sleep(200);
+  ok(app.nav.frames_sent > frames_before_reject,
+     `锁没拿到也照样发 NAV_UPDATE（${frames_before_reject} -> ${app.nav.frames_sent} 帧）`);
+  fake_wake_lock.request = orig_request;
+
+  // ---- 6) 后台限流：状态面板直接写"页面在后台，帧率已降" + 日志一行 ----
+  //
+  // 真实浏览器里这件事没法在 Node 里复现（没有浏览器、没有真的后台节流），
+  // 所以这里**直接把实测周期喂进去** —— note_loop_gap() 就是 _tick() 里那个
+  // 唯一的判据，喂它 1000ms 与"浏览器把后台标签页压到 1Hz"完全等价。
+  app.nav.stop();                                      // 停掉真实定时器，让喂进去的值稳定
+  const nav = app.nav;
+  nav.set_hidden(true);
+  const slow = nav.note_loop_gap(1000);
+  eq(slow, true, '周期 1000ms 被判为"掉出 10Hz"（阈值 400ms = 10Hz 的 4 倍）');
+  ok(/帧率已降/.test(app.log_lines.join('\n')), '日志里有 [loop] 帧率已降 那一行');
+
+  nav.cycle(0.1);                                      // 走一帧真实的 on_ui
+  eq(BY_ID.get('loop-info').textContent, '页面在后台，帧率已降',
+     `状态面板"循环"那一格就是这句话（实得 ${BY_ID.get('loop-info').textContent}）`);
+  eq(BY_ID.get('loop-info').dataset.state, 'bad', '那一格带 data-state=bad（红）');
+  const loop_detail = BY_ID.get('loop-detail').textContent;
+  ok(BY_ID.get('loop-detail').hidden === false, '详情那一行是**可见的**（日志默认收起，不能只写日志）');
+  ok(/1000 ms/.test(loop_detail) && /切回前台/.test(loop_detail),
+     `详情说清了实测周期和怎么恢复：${loop_detail.slice(0, 70)}…`);
+  ok(/不支持屏幕常亮|申请被拒|屏幕常亮/.test(BY_ID.get('wake-info').textContent + loop_detail),
+     `同一行里也带着屏幕常亮的状态：${BY_ID.get('wake-info').textContent}`);
+
+  // ---- 7) 回到前台：确认循环恢复 10Hz、帧计数继续涨 ----
+  const frames_before_recover = nav.frames_sent;
+  nav.set_hidden(false);
+  eq(nav.note_loop_gap(100), false, '周期回到 100ms（10Hz）后不再是"掉帧"');
+  ok(/已恢复/.test(app.log_lines.join('\n')),
+     '日志里确认了恢复（"已恢复 10Hz"）—— 用户能看出是自己切走了还是真坏了');
+  nav.cycle(0.1);
+  ok(!/页面在后台/.test(BY_ID.get('loop-info').textContent),
+     `恢复后那一格不再是"页面在后台，帧率已降"（实得 ${BY_ID.get('loop-info').textContent}）`);
+  ok(/Hz/.test(BY_ID.get('loop-info').textContent), '恢复后显示实测帧率');
+  ok(nav.frames_sent > frames_before_recover,
+     `帧计数在恢复前后一直在涨（${frames_before_recover} -> ${nav.frames_sent}）`);
+
+  // ---- 8) 收尾：恢复"没有任何 wakeLock"的初始状态，别留给后面的用例 ----
+  app.stop_nav();
+  delete globalThis.navigator.wakeLock;
+  DOC.visibilityState = 'visible';
+  eq(app.wake().state().state, 'idle', '收尾：停止导航后锁是放开的');
+}
+
+// ---------------------------------------------------------------------------
+section('10] NAV_CLOCK：点"连接设备"后真的把手机时间发出去了');
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 这一节必须排在**最后一个用共享 DOM 桩的用例之后**（也就是紧挨着
+//    "不支持 Web Bluetooth"那一节之前）：它会点一次"连接设备"，共享 DOM 桩上
+//    会挂上第二个 App 实例的点击监听器。这个坑和上面第 9 节说的是同一件事。
+//
+// 为什么必须在这里（而不是只测 proto.js）：proto.js 的自测只能证明
+// "给了两个字段能编出对字节"。真正会出错的恰恰是**接线**：
+//   - 忘了在连上时发（设备上就一直 --:--）；
+//   - 时区符号写反（`getTimezoneOffset()` 是"UTC 减本地"，协议要的是反过来）；
+//   - 把毫秒当秒发出去（设备显示 1970 年之后的某个离谱年份）。
+// 这三条都只在"点连接 -> 字节真的写出去"这一整条路上才看得见。
+{
+  const P = require(path.join(PHONE_DIR, 'proto.js'));
+
+  // 清空写入记录，然后走一遍真实的"连接设备"路径。
+  ui_writes.length = 0;
+  const t_before = Math.floor(Date.now() / 1000);
+  BY_ID.get('connect-btn').fire('click');
+  await sleep(60);
+  const t_after = Math.floor(Date.now() / 1000);
+
+  // 在写出去的字节流里找 type == 0x06 的帧（帧头：A5 5A ver type len_lo len_hi）
+  const clockFrames = ui_writes.filter(
+    (b) => b.length >= 8 && b[0] === P.MAGIC0 && b[1] === P.MAGIC1 &&
+           b[3] === P.MsgType.NAV_CLOCK);
+  ok(clockFrames.length >= 1,
+     `点"连接设备"后写出去的字节里有 NAV_CLOCK 帧（共 ${ui_writes.length} 次写、` +
+     `${clockFrames.length} 帧时钟）`);
+  ok(ui_writes.length > 0, '连接后确实有字节写出去（不是只改了界面）');
+
+  if (clockFrames.length >= 1) {
+    const f = clockFrames[0];
+    eq(f[4] | (f[5] << 8), P.NAV_CLOCK_LEN,
+       `NAV_CLOCK 帧的 len 字段 = ${P.NAV_CLOCK_LEN}`);
+    const payload = f.slice(P.HEADER_LEN, P.HEADER_LEN + P.NAV_CLOCK_LEN);
+    const ck = P.NavClock.unpack(payload);
+    ok(ck.epoch_s >= t_before - 2 && ck.epoch_s <= t_after + 2,
+       `epoch 是**秒**而且就是当前时间（${ck.epoch_s}，本机 ${t_before}..${t_after}）` +
+       '——写成毫秒会落到这个区间之外');
+    eq(ck.tz_offset_min, -new Date().getTimezoneOffset(),
+       `时区 = -getTimezoneOffset()（本机 ${-new Date().getTimezoneOffset()} 分钟）` +
+       '——符号写反会让设备上的钟差一整个时区');
+  }
+
+  // ---- tick_clock()：到点才补发，不到点一个字节都不写 ----
+  // 直接调这个方法（挂在 1 秒看门狗上，见 app.js 的说明），
+  // 这样"30 秒补一次"这件事是**确定性的**，不依赖真实定时器。
+  const A = APP.app;
+  ok(typeof A.tick_clock === 'function', 'app.js 有 tick_clock()（补发时钟的入口）');
+
+  ui_writes.length = 0;
+  A._clock_next_ms = Date.now() + 60_000;        // 把"下次该发"推到一分钟之后
+  A.tick_clock();
+  eq(ui_writes.filter((b) => b[3] === P.MsgType.NAV_CLOCK).length, 0,
+     '没到 30 秒时 tick_clock() 一个字节都不写');
+
+  A._clock_next_ms = Date.now() - 1;             // 到点了
+  A.tick_clock();
+  eq(ui_writes.filter((b) => b[3] === P.MsgType.NAV_CLOCK).length, 1,
+     '到点后 tick_clock() 补发 1 帧 NAV_CLOCK');
+  ok(A._clock_next_ms > Date.now(),
+     '发完把"下次该发"推到未来（否则每个 tick 都会重复发）');
+
+  // 断开链路之后 **不能再发**：一个还在往断开链路上写时钟的页面，
+  // 会一直以为自己在"维持设备时间"，而设备那边什么都没收到。
+  BY_ID.get('disconnect-btn').fire('click');
+  await sleep(30);
+  ui_writes.length = 0;
+  A._clock_next_ms = 0;                          // 即使标记成"立刻该发"
+  A.tick_clock();
+  eq(ui_writes.length, 0, '链路断开后 tick_clock() 不再写任何字节');
+}
+
+// ---------------------------------------------------------------------------
+section('11] "不支持 Web Bluetooth" 的提示路径');
 // ---------------------------------------------------------------------------
 // ⚠️ 这一节必须放在最后：它会再新建一个 App 实例，而 DOM 桩是共享的 ——
 //    新实例 init() 会把**它自己的**监听器绑到同一批元素上，之后任何一次
 //    点击/输入都会同时走到两个实例的处理函数（它没有 fix，会把状态面板改回
-//    waiting）。第 9 节已经建过第二个实例了，所以这里更得排在最后 ——
+//    waiting）。第 9、10 节已经建过第二个实例了，所以这里更得排在最后 ——
 //    与其掩盖这个"多实例 + 共享 DOM"的真实坑，不如把用例都排在它前面。
 {
   // document 里没有 'bluetooth' in navigator 时，init() 应该显出 #unsupported

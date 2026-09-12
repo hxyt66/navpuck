@@ -207,6 +207,27 @@ h2 {
 #map-info[data-state="unavailable"] { color: var(--bad); }
 #map-info[data-state="disabled"] { color: var(--muted); }
 
+/* 屏幕常亮 / 循环节拍（和"定位""底图"同一套配色约定）：
+   常亮拿到了、帧率正常是绿；锁被系统收回 / 掉帧是黄；申请失败 / 掉到后台是红；
+   空闲、浏览器不支持是灰。
+   ⚠️ "页面在后台，帧率已降"这句话必须**能看全** —— 它是"为什么突然变卡"的
+   唯一答案。默认的 .val 是 nowrap + 省略号，那句十几个字在手机上半格宽度里
+   会被截断，所以掉帧时单独放宽：字号小一档、允许折行。 */
+#wake-info[data-state="ok"],
+#loop-info[data-state="ok"] { color: var(--ok); }
+#wake-info[data-state="warn"],
+#loop-info[data-state="warn"] { color: var(--warn); }
+#wake-info[data-state="bad"],
+#loop-info[data-state="bad"] { color: var(--bad); }
+#wake-info[data-state="muted"],
+#loop-info[data-state="muted"] { color: var(--muted); }
+
+#loop-info[data-state="bad"] {
+  font-size: .9rem;
+  white-space: normal;
+  line-height: 1.25;
+}
+
 /* ---------- 表单 ---------- */
 
 .fld {

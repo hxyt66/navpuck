@@ -45,6 +45,37 @@
     '街道路网底图已关闭：不再向 Overpass 发任何请求。不影响导航 —— ' +
     '路线、箭头、转向提示和 10Hz 更新都照常。';
 
+  // NAV_CLOCK（设备上的时间）多久重发一次，毫秒。
+  //
+  // 设备**没有电池 RTC**，时间只能由这边推过去（见 set_link_state 里的说明）。
+  // 30 秒是"足够纠正漂移、又不至于浪费带宽"的那个点：ESP32 的晶振日漂移在
+  // **秒**量级，30 秒最多漂几毫秒，只要保证"分钟"永远对就够了。
+  // 这个数和 tools/navigator.py 的 CLOCK_SEND_PERIOD_S = 30.0 是**同一个数**，
+  // 改一边记得改另一边（两端行为要一致，否则"手机好好的、PC 上是 --:--"）。
+  const CLOCK_RESEND_MS = 30000;
+  // 同一个周期，秒为单位 —— Navigator.cycle(dt_s) 用的是秒（与 navigator.py 一致）。
+  const CLOCK_SEND_PERIOD_S = CLOCK_RESEND_MS / 1000.0;
+
+  // -------------------------------------------------------------------------
+  // 后台限流：怎么判定"循环已经没在跑 10Hz 了"
+  // -------------------------------------------------------------------------
+  //
+  // 浏览器对**后台标签页**的定时器有硬性节流：Chrome 把 setInterval 压到大约
+  // 1 秒一次（再叠加"页面被冻结"时干脆一次都不跑）。这不是 bug，也没有 API
+  // 能关掉它 —— 骑手把页面切到后台（或者锁屏看设备）时，设备那边就会从
+  // 10Hz 掉到 ~1Hz，画面明显变卡。
+  //
+  // 我们能做的只有两件事，都在这一版里：
+  //   1. **屏幕常亮**（Screen Wake Lock，见 ScreenWakeLock）：屏幕亮着、
+  //      页面留在前台，浏览器就不会节流。这是唯一"真的有用"的那一条。
+  //   2. **把症状说出来**：一旦实测的循环周期超过阈值，状态面板直接写
+  //      "页面在后台，帧率已降"，并往日志写一行 —— 用户就不会以为导航坏了。
+  //
+  // 阈值取 400ms：10Hz 的正常周期是 100ms，4 倍留足了抖动余量（一次 GC、
+  // 一次布局都可能吃掉几十毫秒），而后台节流的 1000ms 是这个阈值的 2.5 倍，
+  // 所以"偶尔抖一下"和"真的被限流"在数值上分得开。
+  const LOOP_SLOW_MS = 400.0;
+
   // -------------------------------------------------------------------------
   // 小工具
   // -------------------------------------------------------------------------
@@ -523,6 +554,10 @@
       this.last_map_segs = 0;
       this.last_map_pts = 0;
       this.map_view_m = 0.0;
+      // 底图重发计时（秒）。以前它只靠 `(this.map_timer || 0)` 兜底、从不初始化，
+      // 于是"重锚那一轮到底重发没重发"在自测里读不出来（是 undefined）。
+      // 与 navigator.py 的 self.map_timer = 0.0 对齐。
+      this.map_timer = 0.0;
 
       // ---- 滑动窗口路线 ----
       //
@@ -556,11 +591,27 @@
       this.route_resend_t = 0.0;
       this.link_was_up = false;
 
+      // NAV_CLOCK 的重发计时。初值取**满一个周期**（不是 0），为的是第一帧
+      // cycle 就把时间发出去：设备一连上就显示真实时间，而不是先挂 30 秒
+      // 的 --:--。与 tools/navigator.py 的 clock_send_t 初值一致。
+      this.clock_send_t = CLOCK_SEND_PERIOD_S;
+
       this._timer = null;
       this._last_tick_ms = 0;
       this.last_update = null;
       this.stats = { max_cycle_ms: 0, max_gap_ms: 0 };
       this._call_count = 0;
+
+      // ---- 循环周期（判定"页面在后台被浏览器限流"）----
+      //
+      // 这三个量全部由 _tick() 里的真实墙钟差值喂进来（唯一知道"这一帧离上一帧
+      // 多久"的地方）。界面直接读它们把症状说出来，见 App.render_awake_loop()。
+      //   loop_gap_ms  最近一帧的周期（毫秒）
+      //   loop_slow    这一帧是否已经掉出 10Hz（见 LOOP_SLOW_MS）
+      //   hidden       页面是否在后台（由 App 在 visibilitychange 里喂，见 set_hidden()）
+      this.loop_gap_ms = 0.0;
+      this.loop_slow = false;
+      this.hidden = false;
     }
 
     /**
@@ -633,6 +684,82 @@
       this.onLog(`[route] 路线窗口${clear ? '（重锚，先清旧窗口）' : '（兜底重发）'}已下发：` +
                  `锚 ${(this.origin_s / 1000).toFixed(1)}km / ${this.window_pts.length} 点 / ` +
                  `${chunks.length} 片`);
+    }
+
+    /**
+     * 用**手上已有的**路网数据投影一张底图并发出去（同步、不联网）。
+     *
+     * 原来这段代码长在 cycle() 的底图块里（build + 编码 + 记账 + send 挤在一处），
+     * 重锚那条路要复用它，所以单独拆出来 —— **算法一个字没改**，只是把
+     * "什么时候调"和"怎么算"分开：周期性刷新走 refresh() + 这里，重锚走
+     * _resend_map()（不 refresh）。
+     *
+     * @returns {boolean} 真的发出去了一帧
+     */
+    _send_map_now(lat, lon, view_m) {
+      if (this.map_src === null || this.map_src.enabled === false) return false;
+      const m = this.map_src.build(this.origin_lat, this.origin_lon, lat, lon, view_m);
+      if (m.seg_count <= 0) {
+        // ⚠️ 这里**绝不**发空底图：设备收到 seg_count == 0 会把整片路网藏起来
+        //    （见 src/ui/ui_puck.cpp 的 renderMap()），那等于把设备上那张
+        //    "还算能用"的底图擦成白屏。手上的数据覆盖不到这里时，保留原来
+        //    那张、不发任何东西，等下一次抓取成功再换 —— 宁可旧，不可空。
+        return false;
+      }
+      let frame;
+      try {
+        frame = proto.encode_nav_map(m);
+      } catch (e) {
+        // 底图帧超 MAX_PAYLOAD（见 proto.js 里那段说明）：丢掉底图不致命，
+        // 但**绝不能**让它把这一轮的 NAV_UPDATE 一起带崩。
+        this.onLog(`[map] 底图帧编码失败，跳过本次下发：${e}`);
+        return false;
+      }
+      // 只有**真的发出去了**才动这几个读数：last_map_segs 还是"设备上那张图
+      // 有多少段"，界面（和"关掉底图要发空帧清屏"那条路）都靠它。
+      this.map_timer = 0.0;
+      this.last_map_segs = m.seg_count;
+      this.last_map_pts = m.total_pts;
+      this.map_view_m = view_m;
+      this.send(frame, 'map', 3);
+      return true;
+    }
+
+    /**
+     * 重锚（原点挪到骑手当前位置）后的底图重建 + 重发：**同一轮、同步、不联网**。
+     *
+     * ⚠️ 为什么必须"同一轮、且不联网"：
+     *   底图的点和路线窗口**同源** —— 都是相对**当前原点**的米。原点一挪
+     *   （重锚 = 挪 5km），设备再拿新的 pos_east_m/pos_north_m 去减设备上
+     *   那份旧底图，整张图就偏掉 5km：屏幕外，看着就是"底图掉了"。
+     *   而它自己好起来要等**下一次成功的底图下发** —— 最坏是整整一轮刷新预算
+     *   （120 秒，map.js 里 MAP_REFRESH_BUDGET_MS；实测一次 Overpass 查询
+     *    17.6 秒）。
+     *   可是路网数据一个字节都没变，变的只有投影原点，所以这里既不该等、
+     *   也不该发请求：拿内存里那份路网直接重投影一次就行（纯计算）。
+     *
+     * @returns {boolean} 真的重发了一帧（false = 没有可用路网 / 编码失败）
+     */
+    _resend_map(lat, lon, view_m) {
+      const sent = this._send_map_now(lat, lon, view_m);
+      if (sent) {
+        this.onLog(`[map] 重锚：底图已按新原点重建并重发（${this.last_map_segs}段/` +
+                   `${this.last_map_pts}点，未联网）`);
+      } else if (this.map_src !== null && this.map_src.ways &&
+                 this.map_src.ways.length > 0) {
+        // 有数据但覆盖不到新原点：**不发空底图**（那会把设备上那张擦掉），
+        // 留着旧的那张，等下一次抓取。写一行日志，免得"底图怎么又没了"
+        // 变成一句查不出来的抱怨。
+        this.onLog('[map] 重锚：手上的路网覆盖不到新原点，先保留设备上那张' +
+                   '（不发空底图擦掉它），等下一次抓取成功再换');
+      }
+      if (!sent) {
+        // 没重发成 -> 下一轮**立刻**走正常的"刷新 + 重建"这条路（也就是马上
+        // 在新位置发起一次抓取）。不这么做的话，这一轮被跳过的 refresh()
+        // 要等 map_timer 再攒满 0.5 秒才轮到 —— 而这时骑手屏幕上啥也没有。
+        this.map_timer = rt.MAP_SEND_PERIOD_S;
+      }
+      return sent;
     }
 
     /** 弧长 s 处的动作点在**当前窗口**里的下标（没有就返回 NO_TURN）。 */
@@ -731,6 +858,18 @@
 
       this.clock_s += dt_s;
 
+      // ---- 时钟：连上就发，之后每 30 秒补一次 ----
+      //
+      // 和 tools/navigator.py 的 cycle() 逐行对应（初值取满一个周期，
+      // 所以**第一帧 cycle 就把时间发出去**）。
+      // 放在 cycle 里而不是只挂在 App 的 setInterval 上：所有跑 Navigator 的
+      // 入口都会调用 cycle —— 手机页面、集成自测、以后任何新的驱动方式。
+      // 只挂在页面上，"换一个驱动"就等于"设备收不到时间"，而这种漏很难看出来。
+      // 两处都发是**故意**的冗余（14 字节 / 30 秒）：App 那一路管"刚连上"，
+      // 这一路管"循环在跑"，任何一路活着设备就不会显示 --:--。
+      this.clock_send_t += dt_s;
+      if (this.clock_send_t >= CLOCK_SEND_PERIOD_S) this.send_clock();
+
       // ---- 路线：滑动窗口 ----
       //
       // 三种情况要发路线：
@@ -744,15 +883,18 @@
       //      设备认得出来是重传，会原地忽略、连重画都不会触发。
       this.route_resend_t += dt_s;
       const link_up = this._link_up();
+      // 这一轮重锚了吗？底图必须在**同一轮**按新原点重建（见 _resend_map）。
+      let reanchored = false;
       if ((!this.route_sent) ||
           rt.window_needs_reanchor(s, this.origin_s, this.window_end_s,
                                    this.route.total_m)) {
         this._reanchor(lat, lon, s);
         this.route_resend_t = 0.0;
         this._send_window(true);
-        // 原点变了，底图必须**同一轮**跟着换：底图的点也是相对这个原点的，
-        // 落后一轮的话，这半秒里底图会整体偏掉"原点移动量"（5km = 一整屏）。
-        this.map_timer = rt.MAP_SEND_PERIOD_S;
+        // 原点变了（首发也在这里定原点）。这里只记标记，真正的重建放到下面
+        // 底图那一块里做：底图永远不联网、失败也只记一行日志，绝不会把
+        // 同一帧的 NAV_UPDATE 带崩。
+        reanchored = true;
       } else if (this.route_resend_t >= rt.ROUTE_RESEND_PERIOD_S ||
                  (link_up && !this.link_was_up)) {
         this.route_resend_t = 0.0;
@@ -773,25 +915,21 @@
       //       —— 用户看到的就是"Overpass 一挂，设备连箭头都不动了"。
       if (this.map_src !== null && this.map_src.enabled !== false) {
         try {
-          this.map_timer = (this.map_timer || 0) + dt_s;
-          if (this.map_timer >= rt.MAP_SEND_PERIOD_S || Math.abs(want_view_m - this.map_view_m) > 1.0) {
-            this.map_src.refresh(lat, lon, this.clock_s);
-            const m = this.map_src.build(this.origin_lat, this.origin_lon, lat, lon, want_view_m);
-            if (m.seg_count > 0) {
-              this.map_timer = 0.0;
-              this.last_map_segs = m.seg_count;
-              this.last_map_pts = m.total_pts;
-              this.map_view_m = want_view_m;
-              let frame;
-              try {
-                frame = proto.encode_nav_map(m);
-              } catch (e) {
-                // 底图帧超 MAX_PAYLOAD（见 proto.js 里那段说明）：丢掉底图不致命，
-                // 但**绝不能**让它把这一轮的 NAV_UPDATE 一起带崩。
-                this.onLog(`[map] 底图帧编码失败，跳过本次下发：${e}`);
-                frame = null;
-              }
-              if (frame) this.send(frame, 'map', 3);
+          if (reanchored) {
+            // ⚠️ 重锚这一轮**只按新原点重建 + 重发，绝不调用 refresh()**：
+            //    底图坐标和路线窗口同源（相对当前原点）。原点一挪（5km），
+            //    设备再拿新的 pos_east_m/pos_north_m 去减设备上那份旧底图，
+            //    整张图就偏掉 5km —— 屏幕上直接消失，而"下一次成功的底图
+            //    下发"最坏要等满 120 秒的刷新预算（实测一次 Overpass 查询
+            //    就要 17.6 秒），中间这段骑手看到的就是"底图掉了"。
+            //    路网数据一个字节都没变，变的只有投影原点，所以这是纯粹的
+            //    一次重投影：同步做、一个网络请求都不发。
+            this._resend_map(lat, lon, want_view_m);
+          } else {
+            this.map_timer = (this.map_timer || 0) + dt_s;
+            if (this.map_timer >= rt.MAP_SEND_PERIOD_S || Math.abs(want_view_m - this.map_view_m) > 1.0) {
+              this.map_src.refresh(lat, lon, this.clock_s);
+              this._send_map_now(lat, lon, want_view_m);
             }
           }
         } catch (e) {
@@ -859,8 +997,33 @@
         route_origin_km: this.origin_s / 1000.0,
         route_reanchors: this.reanchors,
         route_total_m: this.route.total_m,
+        // 循环节拍：界面靠这三个量把"页面在后台、帧率已降"直接说出来
+        // （见 App.render_awake_loop）。hidden 由 App 喂进来，见 set_hidden()。
+        loop_gap_ms: this.loop_gap_ms,
+        loop_hz: this.loop_gap_ms > 0 ? (1000.0 / this.loop_gap_ms) : 0.0,
+        loop_slow: this.loop_slow,
+        page_hidden: !!this.hidden,
+        frames_sent: this.frames_sent,
       });
       return u;
+    }
+
+    /**
+     * 把**这台手机**的当前时间 + 真实时区推给设备（NAV_CLOCK）。
+     *
+     * 与 tools/navigator.py 的 Navigator.send_clock() 对应。发完把计时清零。
+     * 与 App.send_clock() 的区别只有一个：那个走页面的 send_frame（会检查
+     * ble.connected），这个走 Navigator 自己的 send 回调（集成自测里就是它）。
+     * 两者都保留 —— 见 cycle() 里那段说明。
+     */
+    send_clock() {
+      // ⚠️ 要在**路线之前**排队：BLE 发送队列按优先级稳定排序，而时钟取 1、
+      //    路线分片取 0 —— 路线永远排在前面。这里在意顺序只有一个原因：
+      //    "第一片是空路线"这条约定（设备据此清掉旧窗口）不能被一帧时钟插到
+      //    前面。优先级已经保证了这一点，注释留在这里是提醒下一个人别把时钟
+      //    的优先级调到 0。
+      this.send(proto.encode_nav_clock(proto.now_clock()), 'ctl', 1);
+      this.clock_send_t = 0.0;
     }
 
     /** 当前窗口里离原点最远的那个坐标（米）。诊断用：它必须远小于 32767。 */
@@ -886,8 +1049,9 @@
      * 启动 10Hz 循环。
      *
      * 用 setInterval 而不是 requestAnimationFrame：页面切到后台时 rAF 会停，
-     * 而导航必须继续（骑手会锁屏看设备）。代价是后台可能被浏览器限流到 1Hz ——
-     * 这份 app 需要用户保持屏幕常亮，见 README 的说明。
+     * 而导航必须继续（骑手会锁屏看设备）。代价是后台会被浏览器限流到 ~1Hz ——
+     * 所以这一版加了**屏幕常亮**（ScreenWakeLock：屏幕亮着、页面留在前台就
+     * 不会被节流）和**把症状说出来**（note_loop_gap + 状态面板），见 README。
      */
     start() {
       if (this._timer !== null) return;
@@ -905,12 +1069,58 @@
 
     get running() { return this._timer !== null; }
 
+    /**
+     * 页面可见性（App 在 visibilitychange 里喂进来）。
+     *
+     * Navigator 自己**不碰 document**：集成自测里根本没有 DOM，而"页面在不在
+     * 后台"只有页面知道。喂进来只影响诊断文案（"页面在后台，帧率已降"），
+     * 不参与任何导航计算。
+     */
+    set_hidden(hidden) {
+      this.hidden = !!hidden;
+      return this.hidden;
+    }
+
+    /**
+     * 记一帧的循环周期（毫秒），判定有没有掉出 10Hz。
+     *
+     * 阈值是 LOOP_SLOW_MS（400ms = 10Hz 的 4 倍）。只在**跳变沿**记日志：
+     * 掉下去一次写一行，回到正常再写一行 —— 后台限流时每帧都写会把日志刷爆，
+     * 而那正好是最需要看清别的日志的时候。
+     *
+     * @returns {boolean} 这一帧是否算"掉帧"
+     */
+    note_loop_gap(gap_ms) {
+      this.loop_gap_ms = gap_ms;
+      const slow = gap_ms > LOOP_SLOW_MS;
+      if (slow !== this.loop_slow) {
+        this.loop_slow = slow;
+        const nominal = (this.cfg.rate_hz > 0) ? (1000.0 / this.cfg.rate_hz) : 100.0;
+        if (slow) {
+          // 这句日志就是"用户以为 app 坏了"和"用户知道是浏览器限流"的分界
+          this.onLog(`[loop] 帧率已降：这一帧距上一帧 ${gap_ms.toFixed(0)} ms` +
+                     `（${this.cfg.rate_hz.toFixed(0)}Hz 应为 ${nominal.toFixed(0)} ms）` +
+                     (this.hidden
+                       ? '—— 页面在后台，浏览器把定时器压到了约 1Hz；屏幕常亮 + 保持页面在前台才能避免'
+                       : '—— 页面在前台，是设备卡顿；导航仍然照常') +
+                     `。累计已发 ${this.frames_sent} 帧。`);
+        } else {
+          // 回到前台 / 卡顿过去：确认循环恢复了正常节拍（帧计数在这中间一直没停）
+          this.onLog(`[loop] 已恢复 ${this.cfg.rate_hz.toFixed(0)}Hz：这一帧 ` +
+                     `${gap_ms.toFixed(0)} ms，累计已发 ${this.frames_sent} 帧`);
+        }
+      }
+      return this.loop_slow;
+    }
+
     _tick() {
       const t0 = now_ms();
       const dt = Math.max(0.001, Math.min(1.0, (t0 - this._last_tick_ms) / 1000.0));
       if (this._last_tick_ms > 0) {
         const gap = t0 - this._last_tick_ms;
         if (gap > this.stats.max_gap_ms) this.stats.max_gap_ms = gap;
+        // 每一帧的周期都记一笔（判定后台限流，见 note_loop_gap）
+        this.note_loop_gap(gap);
       }
       this._last_tick_ms = t0;
 
@@ -921,6 +1131,175 @@
       }
       const cms = now_ms() - t0;
       if (cms > this.stats.max_cycle_ms) this.stats.max_cycle_ms = cms;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 屏幕常亮（Screen Wake Lock）
+  // -------------------------------------------------------------------------
+  /**
+   * 让屏幕一直亮着 —— 摩托车上那块显示屏本来就该常亮，而"页面被切到后台 /
+   * 锁屏"正是浏览器把定时器压到 ~1Hz 的直接原因（见文件上部 LOOP_SLOW_MS
+   * 那段说明）。这是后台掉帧这件事唯一"真的有用"的对策：屏幕亮着、页面留在
+   * 前台，浏览器就不会节流。
+   *
+   * 生命周期三条，少一条都会留下"锁拿着不放"或者"回到前台再也不常亮"：
+   *   1. **导航开始**时申请（App.do_route -> request()），**停止导航**时释放
+   *      （App.stop_nav -> release()）。空闲时绝不持有 —— 已经不导航的页面
+   *      还占着屏幕常亮，那是在偷用户的电。
+   *   2. 页面被隐藏时，浏览器**一定会**把锁自动收走（这是规范行为，不是异常），
+   *      所以我们同时也把本地引用清掉（on_hidden），免得自己以为还拿着。
+   *   3. 页面回到前台时**必须重新申请**（on_visible）—— 这一步最容易漏：
+   *      不重新要的话，用户切出去看一眼消息再切回来，屏幕就再也不常亮了，
+   *      而界面上完全看不出来。
+   *
+   * 全程**不允许抛错**：API 不存在（Safari / 旧版 Chrome）、低电量被拒、
+   * 页面不可见时申请被拒 —— 都只写一行日志并返回 false，导航照常。
+   */
+  class ScreenWakeLock {
+    constructor(opts) {
+      const o = opts || {};
+      this.onLog = o.onLog || (() => {});
+      this.onChange = o.onChange || (() => {});
+      // navigator 可以注入（自测用）。**每次现读 this._nav.wakeLock**，不在
+      // 构造时缓存 —— 自测要在同一个 App 上依次换"支持 / 不支持 / 被拒"三种情况。
+      this._nav = (o.navigator !== undefined)
+        ? o.navigator
+        : (typeof navigator !== 'undefined' ? navigator : null);
+      this._sentinel = null;      // wakeLock.request() 返回的那个对象
+      this._pending = null;       // "正在要"的那个 promise（防重复申请，见 _acquire）
+      this._want = false;         // "现在在导航、应该持有这把锁"
+      this._state = 'idle';       // idle | held | released | failed | unsupported
+      this._reason = '';
+      this.requests = 0;          // 诊断/自测：真的调了几次 request()
+      this.releases = 0;
+    }
+
+    /** 这个浏览器有没有 Screen Wake Lock API（懒判断：自测会中途换掉它）。 */
+    get supported() {
+      return !!(this._nav && this._nav.wakeLock &&
+                typeof this._nav.wakeLock.request === 'function');
+    }
+
+    /** 给界面看的一份快照（界面只读它，不碰内部字段）。 */
+    state() {
+      return {
+        state: this._state,
+        reason: this._reason,
+        supported: this.supported,
+        want: this._want,
+        requests: this.requests,
+        releases: this.releases,
+      };
+    }
+
+    /**
+     * 开始导航：申请屏幕常亮。
+     * @returns {Promise<boolean>} 拿到了没有（拿不到**也不影响导航**）
+     */
+    async request() {
+      this._want = true;
+      return this._acquire();
+    }
+
+    /** 停止导航：放开屏幕常亮（空闲时不该占着它）。 */
+    async release() {
+      this._want = false;
+      const s = this._sentinel;
+      this._sentinel = null;
+      this._state = 'idle';
+      this._reason = '';
+      this.releases += 1;
+      this.onChange(this.state());
+      if (s && typeof s.release === 'function') {
+        try {
+          await s.release();
+        } catch (e) {
+          this.onLog(`[wake] 释放屏幕常亮失败（忽略）：${e}`);
+        }
+      }
+      return true;
+    }
+
+    /** 页面被隐藏：浏览器保证会把锁收走，本地引用一起清掉。 */
+    on_hidden() {
+      if (this._sentinel === null) return false;
+      this._sentinel = null;
+      if (this._want) {
+        this._state = 'released';
+        this._reason = '页面在后台时浏览器一定会收回屏幕常亮锁';
+      }
+      this.onChange(this.state());
+      return true;
+    }
+
+    /** 页面回到前台：还在导航就重新申请一把（不重新要 = 屏幕从此不再常亮）。 */
+    async on_visible() {
+      if (!this._want) return false;          // 没在导航，别顺手把锁拿上
+      if (this._sentinel !== null) return true;
+      return this._acquire();
+    }
+
+    async _acquire() {
+      if (!this.supported) {
+        // 没有这个 API 也要说清楚：屏幕上那一格写"不支持"，别再让人以为常亮生效了
+        if (this._state !== 'unsupported') {
+          this._state = 'unsupported';
+          this._reason = '这个浏览器没有 Screen Wake Lock API';
+          this.onLog('[wake] 这个浏览器不支持屏幕常亮（Screen Wake Lock）：' +
+                     '导航照常，但请自己保持屏幕常亮（锁屏/切后台会让帧率掉到 ~1Hz）');
+          this.onChange(this.state());
+        }
+        return false;
+      }
+      if (this._sentinel !== null) return true;
+      // ⚠️ 已经在要了就别再要一次。`wakeLock.request()` 是异步的，而"同一轮里被
+      //    叫两次"在真机上真的会发生（页面 init 两次 → visibilitychange 有两个
+      //    监听器）。发两个请求的后果不是"多要一把"这么轻：后一个 sentinel 会
+      //    覆盖掉前一个的引用，**那一把锁就永远释放不掉了**（页面会一直占着
+      //    屏幕常亮，用户却看不到任何原因）。
+      if (this._pending !== null) return this._pending;
+      this._pending = this._acquire_once();
+      try {
+        return await this._pending;
+      } finally {
+        this._pending = null;
+      }
+    }
+
+    async _acquire_once() {
+      this.requests += 1;
+      try {
+        const s = await this._nav.wakeLock.request('screen');
+        this._sentinel = s;
+        this._state = 'held';
+        this._reason = '';
+        // 锁被系统/浏览器收走时也会走这里（页面被隐藏、电量策略变化……）。
+        // ⚠️ 我们自己调 release() 时也会触发它，所以先比对身份再处理。
+        if (s && typeof s.addEventListener === 'function') {
+          s.addEventListener('release', () => {
+            if (this._sentinel !== s) return;      // 主动释放的那次，忽略
+            this._sentinel = null;
+            this._state = this._want ? 'released' : 'idle';
+            this._reason = '屏幕常亮锁被浏览器收回';
+            this.onLog('[wake] 屏幕常亮锁被浏览器收回（页面在后台时一定会发生）：' +
+                       '回到前台会自动重新申请，导航不受影响');
+            this.onChange(this.state());
+          });
+        }
+        this.onLog('[wake] 已申请到屏幕常亮：导航期间屏幕不会自己熄灭');
+        this.onChange(this.state());
+        return true;
+      } catch (e) {
+        // 低电量、页面不可见、权限策略……都走这里。**绝不能**让它影响导航。
+        this._sentinel = null;
+        this._state = 'failed';
+        this._reason = String(e && e.message ? e.message : e);
+        this.onLog(`[wake] 屏幕常亮申请被拒（导航照常，屏幕可能会自己熄灭）：` +
+                   `${this._reason}`);
+        this.onChange(this.state());
+        return false;
+      }
     }
   }
 
@@ -944,6 +1323,15 @@
       this.log_lines = [];
       this.map_enabled = true;  // "显示街道路网底图"（init 时从存储里恢复）
       this.map_source = null;   // 懒创建的 OsmMapSource（缓存/退避/状态都在它身上）
+      // 屏幕常亮（Screen Wake Lock）的持有者：懒创建，见 wake()
+      this._wake = null;
+      // 上一次画进状态面板的"循环/屏幕常亮"快照（只在变化时重画，见
+      // render_awake_loop；on_ui 是每帧都跑的，别在里面白拼字符串）
+      this._awake_last = '';
+      // NAV_CLOCK 的补发状态与"只记一次日志"标志（见 tick_clock / send_clock）。
+      // `_clock_next_ms = 0` 表示"下一次 tick 立刻发"，连上时就是这样置的。
+      this._clock_next_ms = 0;
+      this._clock_logged = false;
 
       // 起点/终点：默认用内置演示航线（西湖），这样没 GPS 也能验证链路
       const demo = rt.DEMO_ROUTE;
@@ -989,6 +1377,70 @@
       if (db) db.disabled = (state === 'idle');
       if (state === 'up') this.toast('设备已连接');
       if (state === 'down') this.toast('链路断开', 5000);
+
+      // ---- 时钟：连上就发一次，之后由那个 1 秒看门狗 tick 每 30 秒补一次 ----
+      //
+      // 设备是 ESP32-S3，**没有电池 RTC**（断电即失），也不可能开 WiFi 走 NTP
+      // （它跑 BLE 跟这台手机连，WiFi 和 BLE 抢同一个射频），所以时间只能由
+      // 这边推过去：协议是 NAV_CLOCK(0x06)，6 字节。
+      // 设备端只存 (UTC 秒, 收到时的 millis())，之后靠毫秒计数器自己走 ——
+      // 所以这 30 秒里链路断不断都不影响它走时，这个间隔只用来纠正晶振漂移
+      // （ESP32 的日漂移在**秒**量级，30 秒最多几毫秒，保证"分钟"永远对）。
+      //
+      // ⚠️ 必须**同时**挂在 connect 和定时补发上，缺一不可：
+      //    只挂 connect —— 设备中途复位（烧录/上电抖动）后就一直显示 --:--，
+      //                   而手机这边完全看不出来；
+      //    只挂定时器 —— 页面刚连上、离下一次 tick 还有 29 秒，那半分钟里
+      //                   主页上的时间是 --:--。
+      //
+      // ⚠️ 补发**不用 setInterval**，而是搭在 init() 里那个已经存在的 1 秒
+      //    看门狗上（tick_clock）。理由是一次实测出来的坑：setInterval 在
+      //    "断开连接"和"页面销毁"这两条路上都必须记得 clear，漏一条就是一个
+      //    永不停止的定时器 —— 它会在链路早就断了之后继续往一个死对象上写，
+      //    而且**自测里会串到别的用例上**（某个用例的假设备突然多收一帧时钟，
+      //    断言 NAV_ROUTE 分片数就开始莫名其妙地不对）。
+      //    搭在已有的 tick 上还有一个好处：30 秒 = 30 个 tick，确定性可测。
+      if (state === 'up') {
+        this._clock_next_ms = 0;      // 让下一次 tick 立刻补发一次
+        this.send_clock();
+      } else {
+        // 断开就把"下次该发"的时刻清掉：留着它，重连之后第一次 tick 会立刻
+        // 发一次（这没问题），但真正的理由是别让状态跨链路生命周期残留。
+        this._clock_next_ms = 0;
+      }
+    }
+
+    /**
+     * 每 1 秒调一次（挂在 init() 的看门狗定时器上）：到点就把手机时间推给设备。
+     *
+     * 只在**链路是 up 的时候**发 —— send_frame 自己也会判一次，但在这里就
+     * 判掉可以让"没连上时不做任何事"一眼可见。
+     */
+    tick_clock() {
+      if (!this.ble || !this.ble.connected) return;
+      const now = Date.now();
+      if (this._clock_next_ms !== 0 && now < this._clock_next_ms) return;
+      this._clock_next_ms = now + CLOCK_RESEND_MS;
+      this.send_clock();
+    }
+
+    /** 把**手机**的当前时间 + 真实时区推给设备（NAV_CLOCK）。 */
+    send_clock() {
+      // proto.now_clock() 里已经处理好那个最容易写反的符号：
+      //   new Date().getTimezoneOffset() 北京是 **-480**（"UTC 减本地"），
+      //   协议要的是"本地相对 UTC"-> 取负 = +480。
+      // 写反的后果是设备上的钟差**一整个时区**，而屏幕上看起来完全正常。
+      const frame = proto.encode_nav_clock(proto.now_clock());
+      const ok = this.send_frame(frame, 'ctl', 1);
+      // 只记第一次（不每 30 秒刷一行日志，日志面板就那么高）
+      if (!this._clock_logged) {
+        this._clock_logged = true;
+        const c = proto.now_clock();
+        this.log(`[clock] 已下发设备时间 ${new Date(c.epoch_s * 1000).toLocaleString()}` +
+                 `（时区 ${c.tz_offset_min >= 0 ? '+' : ''}${c.tz_offset_min} 分钟）` +
+                 `${ok ? '' : '（链路未就绪，下一次重试）'}`);
+      }
+      return ok;
     }
 
     set_status(s) {
@@ -1095,6 +1547,138 @@
       if (msg) this.log(`[gps] ${msg}`);
     }
 
+    // -- 屏幕常亮 / 后台限流 --------------------------------------------------
+    /**
+     * 屏幕常亮的持有者（懒创建 + 全局唯一）。
+     *
+     * 懒创建的原因和底图源一样：不导航时根本用不上它，而 App 在 Node 自测里
+     * 也会被构造（那里没有 navigator.wakeLock）。所有入口都走这一个方法，
+     * 免得出现"两个 ScreenWakeLock 各持一把锁"。
+     */
+    wake() {
+      if (this._wake) return this._wake;
+      try {
+        this._wake = new ScreenWakeLock({
+          onLog: (l) => this.log(l),
+          // 锁的状态一变就立刻重画那一格（否则要等下一帧 on_ui，最多 100ms，
+          // 看着像点了没反应；不导航时更要靠它 —— 那时根本没有 on_ui）
+          onChange: () => this.render_awake_loop(this._ui_last),
+        });
+      } catch (e) {
+        this._wake = null;
+        this.log(`[wake] 屏幕常亮模块建不起来：${e}（导航不受影响）`);
+      }
+      return this._wake;
+    }
+
+    /** 页面现在是不是在后台（Node 自测里没有 document，一律当作在前台）。 */
+    page_hidden() {
+      return (typeof document !== 'undefined' && document.visibilityState === 'hidden');
+    }
+
+    /**
+     * 画"屏幕常亮"和"循环"两格，以及底下那行说明。
+     *
+     * 这是这一版给"切到后台就变卡"这件事的**可见**部分：用户看到的是
+     * "页面在后台，帧率已降"，而不是"导航莫名其妙卡住了"。文案分三种情况：
+     *   - 真的掉出 10Hz 且页面在后台：那四个字 + 为什么会这样 + 怎么恢复；
+     *   - 掉出 10Hz 但页面在前台：是这台设备卡（GC / 别的页面抢 CPU）；
+     *   - 没掉帧：显示实测 Hz。
+     * 屏幕常亮那一格单独说锁的状态（已保持 / 未保持 / 不支持 / 失败 / 已释放）。
+     *
+     * ⚠️ 由 on_ui **每帧**调用（10Hz），所以：
+     *   - 只在算出来的快照**变了**的时候才碰 DOM（见 this._awake_last）；
+     *   - 不在这里做任何重活（字符串拼接本身很便宜，但每帧写 DOM 不是）。
+     *
+     * @param {object|null} d Navigator 的 onUi 快照（没有就只用本机状态）
+     */
+    render_awake_loop(d) {
+      const loop_el = $('loop-info');
+      const wake_el = $('wake-info');
+      const detail_el = $('loop-detail');
+      if (!loop_el && !wake_el && !detail_el) return;
+
+      const nav = this.nav;
+      if (d) this._ui_last = d;
+      const snap = (d || this._ui_last || null);
+      const w = this._wake ? this._wake.state() : { state: 'idle', supported: false, reason: '' };
+
+      // ---- 屏幕常亮那一格 ----
+      let wake_short = '空闲';
+      let wake_state = 'idle';
+      switch (w.state) {
+        case 'held': wake_short = '已保持'; wake_state = 'ok'; break;
+        case 'released': wake_short = '已释放'; wake_state = 'warn'; break;
+        case 'failed': wake_short = '失败'; wake_state = 'bad'; break;
+        case 'unsupported': wake_short = '不支持'; wake_state = 'muted'; break;
+        default: wake_short = this.page_hidden() ? '已释放' : '空闲'; wake_state = 'muted'; break;
+      }
+
+      // ---- 循环那一格 ----
+      const navigating = !!nav;
+      const hidden = this.page_hidden() || !!(snap && snap.page_hidden);
+      // 没在导航时"掉帧"没有意义（停止后根本没有循环在跑）——
+      // 那两格要如实写"— / 空闲"，而不是留着上一次的数
+      const slow = navigating && !!(snap && snap.loop_slow);
+      const gap_ms = navigating && snap && snap.loop_gap_ms ? snap.loop_gap_ms : 0.0;
+      const hz = gap_ms > 0 ? (1000.0 / gap_ms) : 0.0;
+      let loop_short = '—';
+      let loop_state = 'muted';
+      if (!navigating) {
+        loop_short = '—';
+      } else if (slow) {
+        loop_short = hidden ? '页面在后台，帧率已降' : '帧率不足';
+        loop_state = 'bad';
+      } else {
+        // 整数 Hz：定时器抖动会让小数位每帧都变（9.8/10.2…），而这个函数是
+        // 每帧都调的 —— 显示整数才不会为了"10.0 → 9.9"每帧白写一次 DOM
+        loop_short = `${hz.toFixed(0)} Hz`;
+        loop_state = 'ok';
+      }
+
+      // ---- 底下那行说明：只在有话说的时候出现 ----
+      let detail = '';
+      if (snap && slow && hidden) {
+        // 这一句就是"用户以为 app 坏了"和"用户知道是浏览器在限流"的分界
+        detail = `页面在后台，帧率已降：这一帧距上一帧 ${gap_ms.toFixed(0)} ms` +
+          `（10Hz 应为 100 ms）。浏览器把后台标签页的定时器压到了约 1 秒一次，` +
+          `设备因此大约每秒才收到一帧。这不是导航坏了 —— 把页面切回前台会立刻` +
+          `恢复到 10Hz（已累计发出 ${snap.frames_sent || 0} 帧），屏幕常亮${wake_short}。`;
+      } else if (snap && slow) {
+        detail = `循环没跑满 10Hz：这一帧距上一帧 ${gap_ms.toFixed(0)} ms` +
+          `（应为 100 ms）。页面在前台，说明是这台设备本身卡顿（别的页面抢 CPU、` +
+          `定位/地图开销等），导航仍然照常，已累计发出 ${snap.frames_sent || 0} 帧。`;
+      } else if (w.state === 'failed') {
+        detail = `屏幕常亮没拿到（${w.reason || '原因未知'}）：导航完全不受影响，` +
+          `但屏幕可能会自己熄灭 —— 请手动保持屏幕常亮，切后台/锁屏会让帧率掉到约 1Hz。`;
+      } else if (w.state === 'unsupported') {
+        detail = '这个浏览器不支持屏幕常亮（Screen Wake Lock）：导航照常，' +
+          '请手动保持屏幕常亮 —— 锁屏或切到后台时浏览器会把帧率压到约 1Hz。';
+      } else if (hidden && w.want) {
+        detail = '页面在后台：浏览器会收走屏幕常亮锁、并把定时器压到约 1Hz；' +
+          '回到前台会自动重新申请常亮锁并恢复 10Hz。';
+      }
+
+      // 只在**变了**的时候碰 DOM（这个函数每帧都被调用，见上面的说明）
+      const stamp = [loop_short, wake_short, detail, loop_state, wake_state].join('\u0000');
+      if (stamp === this._awake_last) return;
+      this._awake_last = stamp;
+
+      if (loop_el) {
+        loop_el.textContent = loop_short;
+        loop_el.dataset.state = loop_state;
+      }
+      if (wake_el) {
+        wake_el.textContent = wake_short;
+        wake_el.dataset.state = wake_state;
+      }
+      if (detail_el) {
+        detail_el.textContent = detail;
+        detail_el.hidden = !detail;
+        detail_el.classList.toggle('warn', slow);
+      }
+    }
+
     on_ui(d) {
       const u = d.update;
       const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
@@ -1108,10 +1692,19 @@
       set('eta', `${u.eta_min} min`);
       const frames = $('frames');
       if (frames) {
+        // "已发 / 丢"这一格：丢帧是允许的（update 过时了没意义），但**丢 route
+        // 帧绝不允许静默** —— ble.js 里 route_frames_dropped 的不变量是 0，
+        // 一旦非 0 就把那部分显式写到这一格上（正常时一个字符都不多）。
+        // 逐帧的丢帧原因在 ble.js 的日志里（onLog -> 日志面板）。
         frames.textContent = this.ble
-          ? `${this.ble.frames_sent} / ${this.ble.frames_dropped}丢`
+          ? `${this.ble.frames_sent} / ${this.ble.frames_dropped}丢` +
+            (this.ble.route_frames_dropped > 0
+              ? `（route ${this.ble.route_frames_dropped}）` : '')
           : String(this.nav ? this.nav.frames_sent : 0);
       }
+      // 屏幕常亮 + 循环节拍：用户能一眼看出"屏幕是不是被保持常亮"以及
+      // "帧率是不是掉了"（见 render_awake_loop，它内部只在变化时碰 DOM）
+      this.render_awake_loop(d);
       // ---- 底图：一个短状态 + 一行常显的详情 ----
       //
       // 以前这里只写"等待路网…"，于是 Overpass 整体挂掉时用户看到的就是永远
@@ -1685,6 +2278,12 @@
       })), 'meta', 2);
 
       this.nav.start();
+      this.nav.set_hidden(this.page_hidden());
+      // 屏幕常亮：**导航开始**时申请（这是"保持 10Hz"唯一真正有用的手段，
+      // 见 ScreenWakeLock 那段说明）。request() 自己吞掉所有错误并只写日志，
+      // 所以这里不需要 await、更不需要 catch —— 拿不到也绝不能挡住导航。
+      this.wake().request();
+      this.render_awake_loop(this._ui_last);
       this.toast('导航已启动');
       this.log('[nav] 10Hz 循环已启动');
     }
@@ -1700,19 +2299,44 @@
         this.nav = null;
         this.log('[nav] 循环已停止');
       }
+      // 停止导航 = 不再需要屏幕常亮：立刻放开（空闲时占着它是在偷用户的电）。
+      // 这里同样**不 await**：release() 内部也不允许抛错。
+      this.wake().release();
+      this.render_awake_loop(this._ui_last);
     }
 
     // -- 启动 --------------------------------------------------------------
     init() {
-      // 不支持的浏览器：给出明确提示而不是让按钮静默失效
-      if (!('bluetooth' in navigator)) {
+      // 不支持的浏览器：给出明确提示而不是让按钮静默失效。
+      //
+      // ⚠️ 判据不能只看 navigator.bluetooth：APK 里（Android WebView）这个 API
+      //    **存在但不可用**（没有设备选择器、没有权限代理，requestDevice() 必失败）。
+      //    所以在原生环境里要问"原生插件在不在"。两条都不在才报不支持。
+      const native_ble = !!(root.NavPuckBle && root.NavPuckBle.BleLink
+                            && root.NavPuckBle.BleLink.native_available(root));
+      if (!native_ble && !('bluetooth' in navigator)) {
         const u = $('unsupported');
         if (u) u.hidden = false;
         this.log('⚠️ 这个浏览器没有 navigator.bluetooth：需要用 Android Chrome，' +
                  '并且页面必须在 localhost 或 HTTPS 下打开。');
       }
+      if (native_ble) {
+        this.log('[ble] 检测到原生 BLE 插件：本次使用原生链路（WebView 里的 Web Bluetooth 不可用）');
+      }
+
+      // ⚠️ 原生传输对象必须在这里就造好：BLE 走原生时 navigator.bluetooth
+      //    一个字节都不会碰（见 ble.js 文件头"两条传输路径"）。
+      //    不在原生环境时 make_transport() 返回 null，BleLink 走原来的
+      //    Web Bluetooth 路径 —— 这就是 PWA 那条路还活着的原因。
+      const ble_transport = (root.NavPuckBle && root.NavPuckBle.BleLink)
+        ? root.NavPuckBle.BleLink.make_transport({
+            window: root,
+            onLog: (l) => this.log(l),
+          })
+        : null;
 
       this.ble = new root.NavPuckBle.BleLink({
+        transport: ble_transport,
         onState: (s, info) => this.set_link_state(s, info),
         onStatus: (st) => this.set_status(st),
         onLog: (l) => this.log(l),
@@ -1881,6 +2505,19 @@
         document.body.classList.toggle('show-log', !!$('opt-log').checked);
       });
 
+      // ---- 后台运行（前台服务）/ 后台存活探针 ----
+      //
+      // 整块界面接线在 phone/fgs_ui.js 里（原生诊断，与导航无关；
+      // 放那边是为了不和正在改这个文件的其它改动互相踩）。这里只调用一次。
+      // 在 PWA 里它什么都不做：NavPuckFgs 的 available() 为 false，
+      // 整块 <details id="fgs-block"> 直接隐藏，行为与加它之前一模一样。
+      this.fgs = (root.NavPuckFgsUi && root.NavPuckFgsUi.setup)
+        ? root.NavPuckFgsUi.setup(this)
+        : null;
+      if (!root.NavPuckFgsUi) {
+        this.log('[fgs] fgs_ui.js 未加载：后台运行面板不可用（不影响导航）');
+      }
+
       // ---- 街道路网底图开关 ----
       //
       // 恢复上次的选择（手机上的 PWA 每次打开都重新勾一遍很烦；而 Overpass
@@ -1909,14 +2546,31 @@
         });
       }
 
-      // ---- 后台恢复：BLE 断了/页面被冻结之后要把状态重新对齐 ----
+      // ---- 后台/前台切换 ----
+      //
+      // 三件事必须一起做，缺一件就会出现"看着正常、其实已经不对"的状态：
+      //   1. 告诉 Navigator 现在在不在后台 —— 它靠这个把"页面在后台，帧率已降"
+      //      这句话说出来（这就是用户最需要的那句解释）。
+      //   2. **屏幕常亮锁**：页面被隐藏时浏览器一定会把它收走，回到前台
+      //      **必须重新申请**（不重新要 = 用户切出去看一眼消息，屏幕从此不再
+      //      常亮，而界面上看不出来）。
+      //   3. BLE 断了/被冻结之后把链路重新对齐（老逻辑，保留）。
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') {
+        const hidden = this.page_hidden();
+        if (this.nav) this.nav.set_hidden(hidden);
+        if (hidden) {
+          this.log('[app] 页面到后台：浏览器会把定时器压到约 1Hz（帧率会掉），' +
+                   '屏幕常亮锁也会被收回；切回前台自动恢复');
+          this.wake().on_hidden();
+        } else {
           this.log('[app] 页面回到前台');
+          // 重新申请屏幕常亮锁（只在还在导航时才会真的去要，见 on_visible）
+          this.wake().on_visible();
           if (this.ble && this.ble.device && !this.ble.connected && !this.ble._manual_close) {
             this.ble.reconnect().catch((e) => this.log(`[ble] 重连失败：${e}`));
           }
         }
+        this.render_awake_loop(this._ui_last);
       });
 
       // 会话恢复时自动重新定位（用户上一次授权过就不用再点）
@@ -1924,9 +2578,13 @@
         this.geo.start(this.mounted);
       }
 
-      // 看门狗：解析器停在残帧里超过 1.5 秒就复位（见 ble.js 的说明）
+      // 看门狗：解析器停在残帧里超过 1.5 秒就复位（见 ble.js 的说明）。
+      // NAV_CLOCK 的每 30 秒补发也搭在这一个 tick 上（tick_clock）——
+      // 理由见 set_link_state 里那段说明：多一个 setInterval 就多一条
+      // "忘了 clear" 的路，而它一旦漏了就是自测里都看不见的串扰。
       setInterval(() => {
         if (this.ble) this.ble.tick_watchdog();
+        this.tick_clock();
       }, 1000);
 
       this.set_link_state('idle', {});
@@ -1968,7 +2626,8 @@
     }
   }
 
-  root.NavPuckApp = { App, Navigator, GeoSource, SimSource, RouteSimSource, heading_unusable, app };
+  root.NavPuckApp = { App, Navigator, GeoSource, SimSource, RouteSimSource,
+                      ScreenWakeLock, heading_unusable, app };
 
   // CommonJS 导出：只在 phone/test/ 的 Node 自测里用到。
   //

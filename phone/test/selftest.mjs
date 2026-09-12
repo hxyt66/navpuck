@@ -679,6 +679,199 @@ section('5] 解码器健壮性（脏数据 / 重同步）');
 }
 
 // ---------------------------------------------------------------------------
+section('5b] 任意写边界：BLE 怎么写都不许丢帧（含 14 字节空片）');
+// ---------------------------------------------------------------------------
+//
+// 这一节是"设备偶尔收不到空片"那件悬案的**验收**，也是上一版错误解释的证伪。
+//
+// 上一版在 integration.mjs 里写着：14 字节的空片和下一帧的前半截被切进同一批
+// 写，设备的解析器紧接着把下一帧的 A5 5A 当成长度字段（0x5AA5 = 23205 > 1536）
+// 于是失步、整帧作废 —— 结论是"空片丢了是切字节必然的代价，不是 bug"。
+//
+// **那个解释不成立。** 两个解析器（phone/proto.js 与 lib/navcore/nav_proto.cpp）
+// 都是**逐字节状态机**：状态里只有"这一帧已经吃了几个字节"，与"这批一次写了
+// 多少字节"完全无关。所以下面把**每一个**切分点都喂一遍：
+//   (a) 一次喂完             (b) 一个字节一次
+//   (c) 所有二段切分点       (d) 空片两侧的每一个位置（含把 14 字节从中间劈开）
+//   (e) 512 字节的写窗口（ble.js 真实的分片形状）
+// 每一种切法都必须解出**逐字节相同**的帧序列（不是"帧数差不多"），而且
+// resyncs / crc_errors 必须是 0 —— 只要有一次把 A5 5A 读成长度字段，
+// resyncs 就会非 0。
+//
+// 真正的丢帧原因在 ble.js 自己的队列记账（_drain() 用下标删帧，删掉了 await
+// 期间被优先级排序插到队首的空片），已在 integration.mjs 第 4 节和 ble.js 的
+// _drain() 注释里写明。
+//
+// C++ 侧不是"读代码得出的结论"，而是真编译跑过（w64devkit，2026-09）：
+//     g++ -std=gnu++11 -I include -I lib/navcore -DNAVPUCK_HOST_TEST=1 \
+//         <harness>.cpp lib/navcore/nav_proto.cpp
+//   同一份 4147 字节的流 + 同一套切分矩阵，输出与 JS 侧**逐字节相同**：
+//     two_way_bad 0 of 4146 / empty_neighborhood_bad 0 of 210 /
+//     frames_ok=8 crc_errors=0 resyncs=0 / 每条切法的帧序列一致。
+//   为了让"没有主机编译器"的机器也能守住这条结论，下面把 C++ 的 push()
+//   逐行转写了一份（cpp_digest），并要求它在**所有**切法上与真解析器一致。
+{
+  // ---- 一份"真实 BLE 写序列"：与 app.js._send_window(true) 同形 ----
+  // 1 片空片（清旧窗口）+ 4 片分片 + 时钟 + 更新 + 文本，全部接在一条流里，
+  // 因为设备收到的就是一条连续字节流（帧边界由它自己找）。
+  const pts = [];
+  for (let i = 0; i <= 1000; i++) pts.push([i * 10, i * 2]);
+  const frames = [
+    P.encode_nav_route(P.route_chunks([])[0]),
+    ...P.route_chunks(pts).map((c) => P.encode_nav_route(c)),
+    P.encode_nav_clock(new P.NavClock({ epoch_s: 1789226827, tz_offset_min: 480 })),
+    P.encode_nav_update(new P.NavUpdate({ heading_cdeg: 9000, speed_kmh_x10: 487 })),
+    P.encode_nav_text(P.TextKind.ROAD_NAME, '中山路'),
+  ];
+  const wire = new Uint8Array(frames.reduce((a, f) => a + f.length, 0));
+  { let o = 0; for (const f of frames) { wire.set(f, o); o += f.length; } }
+
+  // 空片的字节是**固定的**：8 字节开销 + 6 字节分片头（total=0, start=0, n=0, flags=1）
+  const CLEAR_LEN = P.OVERHEAD + P.NAV_ROUTE_HEADER_LEN;
+  eq(CLEAR_LEN, 14, '空片帧长 = 14 字节（8 开销 + 6 分片头）');
+  eq(frames[0].length, CLEAR_LEN, '第一帧就是那个 14 字节的空片');
+  eq(P._hex(frames[0]), 'a55a010406000000000000017982',
+     '空片的 14 个字节逐字节固定（a5 5a 01 04 | 06 00 | 00 00 00 00 00 01 | 79 82）');
+  eq([...frames.map((f) => f.length)], [14, 1034, 1034, 1034, 958, 14, 40, 19],
+     '这一串的帧长：空片 14 / 3×1034 / 958 / 时钟 14 / 更新 40 / 文本 19');
+
+  // 期望的"帧序列摘要"：type/载荷长度，顺序敏感 —— 这就是逐帧比对的基准
+  const want = frames.map((f) => `${f[3]}/${f[4] | (f[5] << 8)}`).join(',');
+
+  /** 用某种切法喂真解析器，返回摘要 + 解析器计数。 */
+  function js_digest(chunks) {
+    const p = new P.FrameParser();
+    const out = [];
+    for (const c of chunks) for (const fr of p.feed(c)) out.push(`${fr.type}/${fr.payload.length}`);
+    return { s: out.join(','), crc: p.crc_errors, resync: p.resyncs, mid: p.is_mid_frame() };
+  }
+
+  /**
+   * lib/navcore/nav_proto.cpp 的 FrameParser::push()（第 336-403 行）的逐行转写。
+   *
+   * 只为了让"任意切分点都不丢帧"这条结论在没有主机编译器的机器上也能守住：
+   * 真 C++ 已经编译跑过一遍（见本节开头），这里把它变成一条常驻断言。
+   * 转写是**照抄**：状态机、len > MAX_PAYLOAD 的重同步、CRC 覆盖面
+   * [2, 6+len)、以及"先 CRC 后版本"的判定顺序，都不做任何"顺手优化"。
+   */
+  function cpp_digest(chunks) {
+    const MAGIC0 = P.MAGIC0, MAGIC1 = P.MAGIC1, MAX = P.MAX_PAYLOAD, HL = P.HEADER_LEN;
+    let state = 0, idx = 0, len = 0;                 // 0=Magic0 1=Magic1 2=Header 3=Payload 4=Crc
+    const buf = new Uint8Array(HL + MAX + P.CRC_LEN);
+    const out = [];
+    let frames_ok = 0, crc_errors = 0, resyncs = 0, bad_version = 0;
+    for (const ch of chunks) {
+      for (const b of ch) {
+        if (state === 0) {
+          if (b === MAGIC0) { buf[0] = b; state = 1; }
+          continue;
+        }
+        if (state === 1) {
+          if (b === MAGIC1) { buf[1] = b; idx = 2; state = 2; }
+          else if (b !== MAGIC0) { resyncs += 1; state = 0; }  // 0xA5 0xA5 也能重新同步
+          continue;
+        }
+        if (state === 2) {
+          buf[idx++] = b;
+          if (idx < HL) continue;
+          len = buf[4] | (buf[5] << 8);
+          if (len > MAX) { resyncs += 1; state = 0; continue; }
+          idx = HL;
+          state = len === 0 ? 4 : 3;
+          continue;
+        }
+        if (state === 3) {
+          buf[idx++] = b;
+          if (idx < HL + len) continue;
+          state = 4;
+          continue;
+        }
+        buf[idx++] = b;
+        if (idx < HL + len + P.CRC_LEN) continue;
+        state = 0;
+        const expect = buf[HL + len] | (buf[HL + len + 1] << 8);
+        const got = P.crc16(buf.slice(2, HL + len));
+        if (expect !== got) { crc_errors += 1; continue; }
+        if (buf[2] !== P.VERSION) { bad_version += 1; continue; }
+        frames_ok += 1;
+        out.push(`${buf[3]}/${len}`);
+      }
+    }
+    return { s: out.join(','), crc: crc_errors, resync: resyncs, mid: state !== 0, frames_ok };
+  }
+
+  // (a) 一次喂完
+  const a_js = js_digest([wire]);
+  eq(a_js.s, want, `整块喂入解出全部 ${frames.length} 帧（含 14 字节空片）`);
+  eq([a_js.crc, a_js.resync, a_js.mid], [0, 0, false], '整块喂入：零 CRC 错、零重同步、不在帧中间');
+  eq(cpp_digest([wire]).s, want, 'C++ 转写：整块喂入同样解出全部 8 帧');
+  // 空片必须被解成"total_points = 0 且带 last"的那一片（设备据此清旧窗口）
+  const emptyFrame = new P.FrameParser().feed(wire.subarray(0, CLEAR_LEN))[0];
+  const emptyRoute = P.NavRoute.unpack(emptyFrame.payload);
+  eq([emptyFrame.type, emptyRoute.total_points, emptyRoute.count, emptyRoute.is_last_chunk()],
+     [P.MsgType.NAV_ROUTE, 0, 0, true],
+     '空片被解成 NAV_ROUTE + total_points = 0 + last（设备据此清掉旧窗口）');
+
+  // (b) 一个字节一次 —— 多段切分的极端情形
+  const bytes1 = [];
+  for (let i = 0; i < wire.length; i++) bytes1.push(wire.subarray(i, i + 1));
+  const b_js = js_digest(bytes1);
+  eq(b_js.s, want, `一字节一次喂入（${wire.length} 次 feed）解出同一串帧`);
+  eq([b_js.crc, b_js.resync], [0, 0], '一字节一次喂入：零 CRC 错、零重同步');
+  eq(cpp_digest(bytes1).s, want, 'C++ 转写：一字节一次喂入同样一帧不丢');
+
+  // (c) **所有**二段切分点
+  let bad_js = 0, bad_cpp = 0, crc_sum = 0, resync_sum = 0;
+  for (let i = 1; i < wire.length; i++) {
+    const cs = [wire.subarray(0, i), wire.subarray(i)];
+    const d = js_digest(cs);
+    if (d.s !== want) bad_js += 1;
+    crc_sum += d.crc; resync_sum += d.resync;
+    if (cpp_digest(cs).s !== want) bad_cpp += 1;
+  }
+  eq(bad_js, 0, `全部 ${wire.length - 1} 个二段切分点：真解析器一帧不丢、顺序不变`);
+  eq(bad_cpp, 0, `全部 ${wire.length - 1} 个二段切分点：C++ 转写一帧不丢`);
+  eq([crc_sum, resync_sum], [0, 0],
+     '所有切分点加起来 CRC 错 0 / 重同步 0（"把 A5 5A 读成长度字段"的失步一次都没发生）');
+
+  // (d) 空片两侧：三段切法，切点把 14 字节的每一个位置都劈开
+  let bad_neigh = 0, total_neigh = 0;
+  for (let a = 0; a <= CLEAR_LEN; a++) {
+    for (let b = a; b <= CLEAR_LEN + 6; b++) {
+      total_neigh += 1;
+      const cs = [wire.subarray(0, a), wire.subarray(a, b), wire.subarray(b)];
+      if (js_digest(cs).s !== want) bad_neigh += 1;
+      if (cpp_digest(cs).s !== want) bad_neigh += 1;
+    }
+  }
+  eq(bad_neigh, 0,
+     `空片前后 ${total_neigh * 2} 种三段切法（含把空片劈成 1+13 … 13+1）全部解出同一串帧`);
+
+  // (e) 512 字节写窗口 —— ble.js 试探成功后的真实写边界
+  const w512 = [];
+  for (let i = 0; i < wire.length; i += 512) w512.push(wire.subarray(i, Math.min(i + 512, wire.length)));
+  const e_js = js_digest(w512);
+  eq(e_js.s, want, `512 字节写窗口（${w512.map((c) => c.length).join('/')}）解出同一串帧`);
+  eq(cpp_digest(w512).s, want, 'C++ 转写：512 字节写窗口同样一致');
+  // 20 字节写窗口（MTU 23 退档后的形状）也必须一致
+  const w20 = [];
+  for (let i = 0; i < wire.length; i += 20) w20.push(wire.subarray(i, Math.min(i + 20, wire.length)));
+  eq(js_digest(w20).s, want, '20 字节写窗口（退档到 MTU 23）解出同一串帧');
+  eq(cpp_digest(w20).s, want, 'C++ 转写：20 字节写窗口同样一致');
+
+  // 顺带钉住"失步之后不会自愈"这件事在 C++ 转写里也一样（两边语义必须同构）：
+  // 单帧末尾截断 2 字节后紧跟同一帧，两边都必须丢这一帧。
+  const u = P.encode_nav_update(new P.NavUpdate({ heading_cdeg: 9000 }));
+  const j1 = new P.FrameParser(); j1.feed(u.subarray(0, u.length - 2));
+  const mid_after_partial = j1.is_mid_frame();   // 必须在喂第二帧**之前**取
+  const j2 = j1.feed(u);
+  const c1 = cpp_digest([u.subarray(0, u.length - 2)]);
+  const c2 = cpp_digest([u.subarray(0, u.length - 2), u]);
+  eq([mid_after_partial, j2.length], [true, 0], 'JS：半截帧后紧跟新帧 -> 新帧被 CRC 拦下（不会自愈）');
+  eq([c1.mid, c1.s, c2.s], [true, '', ''], 'C++ 转写：同样停在帧中间、同样丢帧（两边同构）');
+}
+
+// ---------------------------------------------------------------------------
 section('6] 边界值往返');
 // ---------------------------------------------------------------------------
 {

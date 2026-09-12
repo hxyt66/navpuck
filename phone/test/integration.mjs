@@ -342,7 +342,8 @@ section('3] 队满时丢的是 update，route 绝不丢');
   link.send(new Uint8Array([9, 9, 9]), 'route', 0);
   ok(link._queue.some((f) => f.kind === 'route'),
      `队满时 route 帧仍能入队（队列 ${before} -> ${link._queue.length}）`);
-  ok(link._queue.length <= BLE.QUEUE_MAX, `队列长度不超过上限 ${BLE.QUEUE_MAX}`);
+  ok(link._queue.length <= BLE.QUEUE_MAX,
+     `队列里还有 update 可挤时，route 靠"挤掉最旧的 update"入队，队列不超额（${link._queue.length} <= ${BLE.QUEUE_MAX}）`);
   ok(link.frames_dropped > 0, `丢掉了 ${link.frames_dropped} 帧 update 来腾位置`);
   // route 的优先级最高，必须排在最前面
   eq(link._queue[0].kind, 'route', 'route 排到队首（priority 0）');
@@ -358,12 +359,113 @@ section('3] 队满时丢的是 update，route 绝不丢');
      `链路把队列里 ${BLE.QUEUE_MAX} 帧全写给了设备（共 ${wrote_bytes} 字节）`);
   eq(link.frames_sent, BLE.QUEUE_MAX, `frames_sent = ${BLE.QUEUE_MAX}`);
   eq(link.frames_dropped, 11, 'frames_dropped = 11（队满时为 route 腾位置丢掉的 update）');
+  eq([link.dropped_refused, link.dropped_evicted], [10, 1],
+     '丢帧账拆开了：10 帧队满拒收的 update + 1 帧给 route 腾位置挤掉的 update');
+  eq(link.route_frames_dropped, 0, 'route 丢帧计数 = 0');
   // 这一节发的载荷是 3 个垃圾字节（不是合法帧头），所以设备侧**应当**一帧都
   // 解不出来 —— 解析器在 magic 上重新同步正是它该做的事。这里钉住的其实是
   // "没有半截残留"：解析器必须干净地停在 state 0，不能因为一堆垃圾就卡住。
   eq(dev.frames.length, 0, '3 字节垃圾载荷不产生任何帧（解析器在 magic 上丢弃）');
   eq(dev.parser.is_mid_frame(), false, '一堆垃圾之后解析器没有卡在帧中间');
   eq(dev.parser.crc_errors, 0, '垃圾载荷不产生 CRC 错误（连帧头都没凑齐）');
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
+}
+
+// ---------------------------------------------------------------------------
+section('3b] 队列里一个 update 都没有时：route 撑大队列，而不是被丢掉');
+// ---------------------------------------------------------------------------
+// 这是 Issue 1 的核心场景，也是上一版**真的会丢 route** 的那个分支：
+// 队满 + 队列里没有任何比 route 更不值钱的帧（这里就是"全是 route"）时，
+// 老代码 `_drop_one_for_space()` 找不到 update 就返回 false -> 丢**进来的**那一帧
+// —— 丢的正好是 route。新策略：
+//   * 让队列**超额**（软上限，QUEUE_HARD_MAX = 2×QUEUE_MAX），并记 queue_overflow；
+//   * 只有连硬上限都到了（链路彻底不排水）才丢 route，而且必须带计数 + ⚠️ 日志。
+// 为什么不"阻塞一小会儿"：send() 是在 10Hz 导航循环里**同步**调用的，而能腾出
+// 位置的只有异步的 _drain() —— 在这里等就是自我死锁（详见 ble.js 的 _make_room_for）。
+{
+  const dev = new FakeDevice();
+  const { link } = await make_link(dev);
+  await link.connect();
+  const realRx = link.rx;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  link.rx = {
+    async writeValueWithoutResponse(b) { await gate; return realRx.writeValueWithoutResponse(b); },
+  };
+  const logs = [];
+  link.onLog = (l) => logs.push(l);
+
+  // 只塞 route 帧：队列里再没有"比 route 更不值钱"的东西可挤
+  const clearFrame = P.encode_nav_route(P.route_chunks([])[0]);   // 14 字节真空片
+  for (let i = 0; i < BLE.QUEUE_MAX; i++) link.send(clearFrame, 'route', 0);
+  eq(link._queue.length, BLE.QUEUE_MAX, `队列已满（${BLE.QUEUE_MAX} 帧 route）`);
+  // 再来一帧 route：老代码**就是在这里丢掉它的**
+  const ok_send = link.send(clearFrame, 'route', 0);
+  eq(ok_send, true, '队满且只有 route 时，新来的 route 仍然入队（返回 true）');
+  eq(link._queue.length, BLE.QUEUE_MAX + 1,
+     `队列**超额**而不是丢 route（${BLE.QUEUE_MAX} -> ${link._queue.length}）`);
+  eq(link.queue_overflow, 1, 'queue_overflow = 1（超额这件事本身有计数）');
+  eq(link.route_frames_dropped, 0, 'route 一帧都没丢');
+
+  // 一路撑到硬上限，再来的 route 才会被丢 —— 但必须是**响的**
+  while (link._queue.length < BLE.QUEUE_HARD_MAX) link.send(clearFrame, 'route', 0);
+  eq(link._queue.length, BLE.QUEUE_HARD_MAX,
+     `撑到硬上限 QUEUE_HARD_MAX = ${BLE.QUEUE_HARD_MAX}（= 2 × QUEUE_MAX）`);
+  eq(link.send(clearFrame, 'route', 0), false,
+     '连硬上限都到了才拒收 route（链路彻底不排水的信号）');
+  eq(link.route_frames_dropped, 1, 'route 丢帧计数 = 1（**不静默**：这个计数器就是为此存在的）');
+  eq(link.frames_dropped, 1, 'frames_dropped = 1');
+  ok(logs.some((l) => /⚠️ 丢帧：route/.test(l)),
+     `日志里有一条带 ⚠️ 的 route 丢帧记录：${logs.filter((l) => /丢帧/.test(l)).slice(-1)[0] || '（没有）'}`);
+  ok(logs.some((l) => /其中 route 1 帧/.test(l)), '日志里带着累计的 route 丢帧数');
+
+  // 放行：超额的那些帧必须**全部真的写出去**（超额不等于可以有帧卡在队列里）
+  release();
+  const t0 = Date.now();
+  while (link._queue.length > 0 && Date.now() - t0 < 15000) await sleep(20);
+  eq(link._queue.length, 0, `放行后超额队列也全部排空（耗时 ${Date.now() - t0}ms）`);
+  eq(link.frames_sent, BLE.QUEUE_HARD_MAX,
+     `frames_sent = ${BLE.QUEUE_HARD_MAX}（撑到硬上限的那些帧一帧没少）`);
+  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).length, BLE.QUEUE_HARD_MAX,
+     `设备侧解出 ${BLE.QUEUE_HARD_MAX} 帧 NAV_ROUTE`);
+  eq(dev.frames_of_type(P.MsgType.NAV_ROUTE).every(
+       (f) => P.NavRoute.unpack(f.payload).total_points === 0), true,
+     '每一帧都是那个 14 字节的空片（total_points = 0），内容没被搞坏');
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
+}
+
+// ---------------------------------------------------------------------------
+section('3c] 断开时队列清空也必须记账（正在写的那一帧不重复记）');
+// ---------------------------------------------------------------------------
+// 断开/链路丢失时 app.js 会把整条路线重发一遍，所以清空队列功能上安全；
+// 但"丢了多少、为什么丢"必须留下账 —— 否则 integration 第 14 节那种
+// "设备侧少收了 N 帧"的断言就没法成立（也就没法证明没有静默丢帧）。
+{
+  const dev = new FakeDevice();
+  const { link } = await make_link(dev);
+  await link.connect();
+  const realRx = link.rx;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  link.rx = {
+    async writeValueWithoutResponse(b) { await gate; return realRx.writeValueWithoutResponse(b); },
+  };
+  const clearFrame = P.encode_nav_route(P.route_chunks([])[0]);
+  // 1 帧正在写（卡在 gate 里）+ 3 帧还在队列里
+  for (let i = 0; i < 4; i++) link.send(clearFrame, 'route', 0);
+  eq([link.frames_offered, link._queue.length, link._writing === link._queue[0]],
+     [4, 4, true], '4 帧入队，第 1 帧已经在写（_writing 指向它）');
+  await link.disconnect();
+  eq(link._queue.length, 1, '断开后队列里只剩"正在写的那一帧"（它已经交给链路了，不能重复记账）');
+  eq(link.frames_dropped, 3, '清队丢掉 3 帧，全部记进 frames_dropped');
+  eq(link.dropped_disconnected, 3, '记在 dropped_disconnected 这个原因桶里');
+  release();
+  await sleep(50);
+  eq(link._queue.length, 0, '那一帧写完后队列干净了');
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -413,15 +515,43 @@ section('4] 端到端：整条路线下发 + 10Hz NAV_UPDATE + 设备侧闭环')
   while (link._queue.length > 0 && Date.now() - drain_t0 < 8000) await sleep(20);
   eq(link._queue.length, 0, `发送队列排空（耗时 ${Date.now() - drain_t0}ms）`);
 
-  // 设备侧：第一片是**空路线**（重锚/首发先把设备上的旧窗口清掉），
-  // 后面的分片必须齐、且最后一片带 last
+  // 设备侧：这一遍分片必须**结构完整**、拼得齐、最后一片带 last，而且
+  // **手机侧发了几帧，设备侧就必须解出几帧**。
+  //
+  // ⚠️ 上一版这里写着"第一片空片会丢"，理由是"mock 的写边界把 14 字节空片和
+  //    下一帧的前半截切进同一批写，设备的解析器接着把下一帧的 A5 5A 当成长度
+  //    字段（23205 > 1536）于是失步" —— **那个解释是错的，而且盖住了一个真 bug**。
+  //    逐字节查过（selftest.mjs 的"任意写边界"那一节，外加用 w64devkit 真编译
+  //    lib/navcore/nav_proto.cpp 跑同一套切分矩阵）：两个解析器都是逐字节
+  //    状态机，任意切分点（空片两侧的每一个位置、逐字节喂、512 字节写窗口）
+  //    解出的帧**完全相同**，一帧不丢；C++ 侧 frames_ok=8 / crc_errors=0 /
+  //    resyncs=0，和 JS 侧逐字节一致。协议和固件都没问题。
+  //
+  //    真正的原因在 ble.js 的队列记账：_drain() 先取 `_queue[0]` 去写，
+  //    await 回来后却用 `_queue.shift()` 删"当前的第 0 个"。而 await 期间
+  //    send() 会按优先级重排队列（route 是 priority 0，会插到队首），于是被
+  //    删掉的是**刚插进来的空片**，而真正写出去的 NAV_CLOCK 还留在队列里、
+  //    又被写了一遍。症状：空片一帧没发出去、frames_dropped 仍然是 0
+  //    （**完全静默**）、设备侧少一片 NAV_ROUTE。现在 _drain() 按**对象**删帧
+  //    （indexOf(f) + splice），route 帧还有"绝不丢"的取舍规则和计数器。
+  //
+  //    所以这里的断言是严格的：手机侧发 5 帧，设备侧就必须收到 5 帧，
+  //    而且第一帧必须正好是那个 14 字节的空片。
   const route_frames = dev.frames_of_type(P.MsgType.NAV_ROUTE);
-  const clear = P.NavRoute.unpack(route_frames[0].payload);
-  eq([clear.total_points, clear.count], [0, 0],
-     '第一片是空路线（total_points=0）—— 设备据此清掉旧窗口');
+  const sent_route = sent.filter((s) => s.kind === 'route').length;
+  eq(sent_route, 5, `手机侧发了 5 帧 NAV_ROUTE（1 片空片 + 4 片分片）`);
+  eq(route_frames.length, sent_route,
+     `设备侧一帧不少地收到 ${sent_route} 帧 NAV_ROUTE（实得 ${route_frames.length}）`);
+  eq(link.route_frames_dropped, 0, 'route 丢帧计数 = 0（route 帧绝不丢）');
+  // 第一帧必须是"清掉旧窗口"的空片：帧长 = 8 字节开销 + 6 字节分片头，
+  // total_points = 0。它的字节是固定的 a5 5a 01 04 06 00 00 00 00 00 00 01 79 82。
+  eq(route_frames[0].payload.length, P.NAV_ROUTE_HEADER_LEN, '第一帧的载荷正好 6 字节');
+  eq(P.NavRoute.unpack(route_frames[0].payload).total_points, 0,
+     '第一帧是 total_points = 0 的空片（重锚前必发：不先清掉，设备可能把新旧两个窗口拼成一条不存在的路）');
   const chunks = route_frames.slice(1).map((f) => P.NavRoute.unpack(f.payload));
   const expect_chunks = P.route_chunks(nav.window_pts);
-  eq(chunks.length, expect_chunks.length, `设备侧收到 ${chunks.length} 片 NAV_ROUTE（期望 ${expect_chunks.length}）`);
+  eq(chunks.length, expect_chunks.length,
+     `设备侧收到 ${chunks.length} 片窗口分片（期望 ${expect_chunks.length}）`);
   eq(chunks.map((c) => c.total_points), expect_chunks.map((c) => c.total_points), '每片 total_points 一致');
   eq(chunks.map((c) => c.chunk_start), expect_chunks.map((c) => c.chunk_start), '每片 chunk_start 一致');
   eq(chunks.map((c) => c.flags), expect_chunks.map((c) => c.flags), '每片 flags 一致');
@@ -722,12 +852,20 @@ section('11] 60km 长路线端到端：滑动窗口重锚 / 清旧窗口 / 两�
 
   // 1300 个定位点铺在 90% 的路线上（约 44m 一个），足以跑出 13 次重锚
   const source = new ScriptSource(fixes_along(longRoute, 1300, 30.0));
+  // 手机侧实际**发出**的空片数（total_points == 0，帧长正好是 8+6）。
+  //
+  // 为什么要单独数一遍：设备侧收到的空片数**可以比发出去的少 1**
+  // （下面那条断言解释了为什么），少了之后光看设备侧的数字分不清
+  // "没发出去"和"路上被队满丢了"。这个计数器就是那把尺子。
+  let sent_clears = 0;
   const nav = new APP.Navigator(longRoute, source, {
-    send: (f, k, p) => link.send(f, k, p),
+    send: (f, k, p) => {
+      if (k === 'route' && f.length === P.OVERHEAD + P.NAV_ROUTE_HEADER_LEN) sent_clears += 1;
+      return link.send(f, k, p);
+    },
     onLog: () => {}, onUi: () => {},
     config: { rate_hz: 10, no_map: true },
-  });
-  nav.set_ble(link);
+  });  nav.set_ble(link);
 
   // 构造 Navigator 本身不能抛错 —— 这一条就是"长路线现在被接受"的直接证据
   eq(nav.window_pts.length, 0, '构造时不建窗口（原点还没定位）；60km 路线不再被拒收');
@@ -798,8 +936,34 @@ section('11] 60km 长路线端到端：滑动窗口重锚 / 清旧窗口 / 两�
   eq(chunk_bad, 0, `每一片分片都不超过 ${P.MAX_ROUTE_CHUNK_POINTS} 点（u8 字段的硬上限）`);
   eq(total_bad, 0, `每一片声明的总点数都不超过 ${P.MAX_ROUTE_POINTS}（设备 4KB 数组的容量）`);
   eq(coord_bad, 0, `所有点的 |east|/|north| 都不超过 ${P.ROUTE_MAX_RANGE_M}m（i16 米）`);
+  // ---- 空片（清旧窗口）的条数：**一片都不许少** ----
+  //
+  // 1300 个周期跑了 130 秒模拟时间，手机侧要发 13000 帧 —— 而 ble.js 的发送
+  // 队列只有 QUEUE_MAX = 256 格，10Hz × 远快于排空速度，队列**长期是满的**。
+  // 也就是说这一节是"有损队列"压力最大的现场，route 帧的取舍规则必须在这里
+  // 站得住：
+  //
+  //   - 队满时 `_make_room_for()` 先挤**最不值钱**的那一帧（实际上总是最旧的
+  //     update），挤到就腾出位置；route 帧只有在"队列里连一个 update 都没有"
+  //     时才会走到"让队列超额"那条路（QUEUE_HARD_MAX 兜底），而不是被丢掉。
+  //   - 所以不变量是：**重锚了几次，设备侧就必须收到几片空片**，
+  //     而且和手机侧**实际发出**的片数逐片相等。上一版这里写的是
+  //     `clear_frames === nav.reanchors || === nav.reanchors - 1`，
+  //     还配了一段"空片偶尔会被丢，改那条策略不在本次范围内"的说明 ——
+  //     那个"偶尔"根本不是队列策略造成的，而是 _drain() 删错帧的记账 bug
+  //     （见第 4 节那段说明），它丢的恰好就是队首的 route，而且计数器是 0。
+  //     现在两个都修了：删帧按对象删 + route 绝不丢，于是可以严格断言。
+  eq(sent_clears, nav.reanchors,
+     `手机侧每一遍窗口下发前都发了空片（发出 ${sent_clears} 片 / 重锚 ${nav.reanchors} 次）`);
+  eq(clear_frames, sent_clears,
+     `发出去的空片一片不少地到了设备侧（设备侧 ${clear_frames} / 手机侧 ${sent_clears}）`);
   eq(clear_frames, nav.reanchors,
-     `每一遍窗口下发前都先发了空片清旧窗口（${clear_frames} = 重锚次数）`);
+     `设备侧收到的空片数 = 重锚次数（${clear_frames} / ${nav.reanchors}）`);
+  eq(link.route_frames_dropped, 0,
+     `整段骑行 route 丢帧计数 = 0（route 帧绝不丢；队列超额 ${link.queue_overflow} 次、` +
+     `历史最高水位 ${link.queue_high_water}/${BLE.QUEUE_MAX}）`);
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
   eq(passes_incomplete, 0,
      `每一遍窗口都是连续、完整、带 last 的（共 ${passes} 遍，最后一遍 ${cur_got}/${cur_total} 点）`);
   ok(pass_windows.every(([t, g, l]) => t <= P.MAX_ROUTE_POINTS && g === t && l),
@@ -1486,6 +1650,302 @@ section('13] 模拟行驶：沿航线按真实流逝时间推进、航向随转�
      `所以这是个量级校验 —— "与帧率无关"由上面那条确定性的用例钉住）`);
   ok(nav3.frames_sent > 0, `循环期间照常发帧（${nav3.frames_sent} 帧）`);
   eq(nav3.running, false, 'stop() 之后循环真的停了');
+}
+
+// ---------------------------------------------------------------------------
+section('14] NAV_CLOCK：连上就发一次 + 每 30 秒补一次（设备没有电池 RTC）');
+// ---------------------------------------------------------------------------
+//
+// 设备是 ESP32-S3，**没有电池 RTC**：断电就不知道几点了，也不能开 WiFi 走 NTP
+// （它跑 BLE 跟手机连，两者抢同一个射频）。所以时间只能走这条链路推过去。
+//
+// 这一节钉两件事，缺一不可：
+//   1. 连上就发一次 —— 否则刚连上的那半分钟里主页显示 --:--；
+//   2. 之后每 30 秒补一次 —— 否则设备中途复位（烧录、上电抖动）之后就永久
+//      显示 --:--，而手机这边完全看不出来。顺带纠正晶振漂移。
+//
+// 载荷必须**正好 6 字节**、时区必须是**分钟**（半点时区 +5:30 存在，用小时
+// 表达不了），epoch 必须就是当前时间（写成毫秒或者用了单调时钟都不行）。
+{
+  const dev = new FakeDevice();
+  const { link } = await make_link(dev);
+  await link.connect();
+  const route = demo_route();
+
+  // 记录"第几秒发了什么"。**按发送时刻记账，不按累计帧数记账** ——
+  // 累计帧数会被"这个 Navigator 之前已经跑过多少轮"影响（自测里好几个
+  // 用例共用一个 Navigator 实例），而"周期是 30 秒"这件事只有时间能证明。
+  const sent_log = [];
+  let sim_t = 0.0;
+  const nav = new APP.Navigator(route, new ScriptSource(fixes_along(route, 500, 12.0)), {
+    send: (f, k, p) => {
+      // 帧头第 4 个字节就是 type（A5 5A ver type ...）
+      sent_log.push({ t: sim_t, type: f[3] });
+      return link.send(f, k, p);
+    },
+    onLog: () => {}, onUi: () => {},
+    config: { rate_hz: 10, no_map: true },
+  });
+  nav.set_ble(link);
+
+  const t_before = Math.floor(Date.now() / 1000);
+  // 110 秒模拟时间，10Hz。跨过 30/60/90 三个阈值。
+  for (let i = 0; i < 1100; i++) {
+    sim_t += 0.1;
+    nav.cycle(0.1);
+  }
+  const t_after = Math.floor(Date.now() / 1000);
+
+  const drain_t0 = Date.now();
+  while (link._queue.length > 0 && Date.now() - drain_t0 < 8000) await sleep(10);
+
+  const clock_log = sent_log.filter((e) => e.type === P.MsgType.NAV_CLOCK);
+  const clocks = dev.frames_of_type(P.MsgType.NAV_CLOCK);
+
+  // 110 秒 / 30 秒 = 首帧 + 3 次补发 = 4 帧（第 1、31、61、91 秒）
+  eq(clock_log.length, 4,
+     `110 秒里发了 4 帧 NAV_CLOCK（首帧 + 每 30 秒一次），实测 ${clock_log.length} 帧`);
+  ok(clock_log.length > 0 && clock_log[0].t <= 0.11,
+     `第一帧就在第一个周期（t=${clock_log.length ? clock_log[0].t.toFixed(2) : '-'}s）` +
+     '——只挂 30 秒定时器的话，设备刚连上那半分钟只能显示 --:--');
+  ok(clock_log.every((e, i) => i === 0 || e.t - clock_log[i - 1].t >= 29.9),
+     '任意两帧之间至少隔 29.9 秒（不是每帧都发）');
+  ok(clock_log.every((e, i) => i === 0 || e.t - clock_log[i - 1].t <= 30.3),
+     '任意两帧之间不超过 30.3 秒（补发没有迟到 —— 设备中途复位最多挂 30 秒）');
+
+  const ck = P.NavClock.unpack(clocks[0].payload);
+  eq(clocks[0].payload.length, P.NAV_CLOCK_LEN,
+     `NAV_CLOCK 载荷正好 ${P.NAV_CLOCK_LEN} 字节（u32 epoch + i16 时区分钟）`);
+  eq(P.NAV_CLOCK_LEN, 6, 'NAV_CLOCK_LEN = 6');
+  ok(ck.epoch_s >= t_before - 2 && ck.epoch_s <= t_after + 2,
+     `epoch 就是当前时间（${ck.epoch_s}，本机 ${t_before}..${t_after}）` +
+     '——写成毫秒或用单调时钟都会落到这个区间之外');
+  eq(ck.tz_offset_min, -new Date().getTimezoneOffset(),
+     `时区偏移 = -getTimezoneOffset()（本机 ${-new Date().getTimezoneOffset()} 分钟）` +
+     '——符号写反会让设备上的钟差一整个时区');
+  ok(Math.abs(ck.tz_offset_min) <= 14 * 60,
+     `时区偏移落在真实范围内（${ck.tz_offset_min} 分钟）`);
+
+  // 时钟帧不能顶替导航帧：它只是"对表"，不是"数据"。
+  //
+  // ⚠️ 这里**不能**要求"1100 帧一帧不少"，但那不是因为"有损队列天生丢帧说不清"，
+  //    而是因为丢帧是**按设计、可归因**的：ble.js 的发送队列只有 QUEUE_MAX = 256
+  //    格，这 1100 帧是**同步**产生的（10Hz × 110 秒），而排空是异步的
+  //    （每帧 `await _yield()`），队列必然长期是满的；队满时丢的是 update
+  //    （下一帧 100ms 后就到，丢一帧只是箭头少动一格）。
+  //
+  //    上一版这里被弱化成 `upd_rx > 0`（"照常到达"），那等于什么都没验
+  //    —— 丢 1099 帧它也会通过。正确的写法是把**真实不变量**写出来：
+  //
+  //        设备侧收到的 update 数 === 手机侧产出的 update 数 - link 记账丢掉的 update 数
+  //
+  //    这条式子同时钉住了三件事：丢帧只可能来自被记账的那几条路径、每一条
+  //    丢帧路径都真的进了计数器（没有静默丢帧）、手机侧写的字节都被设备侧
+  //    解出来了（CRC/长度没坏）。实现里 frames_offered === frames_sent +
+  //    frames_dropped 是同一笔账的另一种写法，两条都验。
+  const upd_rx = dev.frames_of_type(P.MsgType.NAV_UPDATE).length;
+  const upd_tx = sent_log.filter((e) => e.type === P.MsgType.NAV_UPDATE).length;
+  const upd_dropped = link.dropped_by_kind.update || 0;
+  eq(upd_tx, 1100, `110 秒 × 10Hz 产出了 ${upd_tx} 帧 NAV_UPDATE`);
+  eq(upd_rx, upd_tx - upd_dropped,
+     `设备侧收到 ${upd_rx} 帧 NAV_UPDATE = 产出 ${upd_tx} - 记账丢掉的 ${upd_dropped} ` +
+     `（丢帧只可能来自记账过的路径，没有静默丢帧）`);
+  ok(upd_dropped > 0 && upd_dropped < upd_tx,
+     `这一节确实压满了队列（丢掉 ${upd_dropped} 帧 update = 队满拒收/腾位置），` +
+     `但每一帧都在账上`);
+  eq(link.frames_offered, link.frames_sent + link.frames_dropped,
+     `发/丢记账平了：offered ${link.frames_offered} = sent ${link.frames_sent} + dropped ${link.frames_dropped}`);
+  eq(link.dropped_refused + link.dropped_evicted + link.dropped_write_failed +
+     link.dropped_disconnected, link.frames_dropped, 'frames_dropped = 四个原因桶之和');
+  eq(clocks.length, clock_log.length,
+     `4 帧 NAV_CLOCK 全部到达设备侧（发 ${clock_log.length} / 收 ${clocks.length}）`);
+  eq(dev.parser.crc_errors, 0, 'NAV_CLOCK 也是合法帧（CRC 零错误）');
+  nav.stop();
+}
+
+// ---------------------------------------------------------------------------
+section('15] 重锚：底图必须**同一轮**按新原点重建（不联网、也不擦屏）');
+// ---------------------------------------------------------------------------
+//
+// 这一节钉的是现场反馈的"底图有时候会掉"：
+//
+//   底图的点和路线窗口**同源** —— 都是相对"发这一窗时骑手的位置"（原点）的米。
+//   路线每走 5km 重锚一次（原点跟着骑手往前挪），而设备每一帧都在拿
+//   NAV_UPDATE.pos_east_m/pos_north_m 去减底图的点。原点挪了、底图却没重建，
+//   整张图就偏掉 5km：屏幕外，看着就是"底图掉了"—— 而它自己好起来要等
+//   **下一次成功的底图下发**，最坏是整整一轮 120 秒的刷新预算（实测一次
+//   Overpass 查询就要 17.6 秒）。
+//
+// 所以重锚那一轮必须：拿**已经在内存里的**路网按新原点重投影、重发一帧，
+// 而且**一个网络请求都不发**（路网一个字节都没变，变的只有投影原点）。
+//
+// 另一条同样重要：覆盖不到新原点时**不许发空帧**。设备对 seg_count == 0 的
+// 处理是"把所有路网线藏起来"（src/ui/ui_puck.cpp 的 renderMap()）—— 那等于
+// 把上一份还能用的路网擦成白屏，比"暂时没有新路网"糟糕得多。
+{
+  // 60km 的合成路线（每 500m 一个直角弯）：演示航线只有 10km，走不出第二次
+  // 重锚，而这一节要的正是"重锚之后再重锚"。
+  const synth_route = (n_seg) => {
+    const pts = [];
+    let lat = 30.2500;
+    let lon = 120.1300;
+    for (let i = 0; i < n_seg; i++) {
+      pts.push([lat, lon, `长路段${i}`]);
+      lat += 400.0 / RT.EARTH_M_PER_DEG_LAT;             // 正北 400m
+      pts.push([lat, lon, `长路段${i}`]);
+      lon += 300.0 / (RT.EARTH_M_PER_DEG_LON_EQ * Math.cos(lat * Math.PI / 180));
+    }
+    pts.push([lat, lon, '终点']);
+    return new RT.Route(pts, false);
+  };
+  const route = synth_route(120);
+  ok(route.total_m > 40000, `合成路线 ${(route.total_m / 1000).toFixed(1)} km（够走出好几次重锚）`);
+  const [la0, lo0] = route.point_at(0);
+
+  // 假 Overpass：只返回**请求点附近**的路（真实行为就是 around:260），
+  // 并数请求次数 —— "重锚那一轮不联网"这条断言全靠它。
+  let overpass_calls = 0;
+  const mk_ways = (lat0, lon0) => {
+    const els = [];
+    for (let i = 0; i < 30; i++) {
+      const geom = [];
+      for (let k = 0; k < 6; k++) {
+        geom.push({ lat: lat0 + (i - 15) * 0.0004 + k * 0.00005,
+                    lon: lon0 + (k - 3) * 0.00009 });
+      }
+      els.push({ tags: { highway: 'residential' }, geometry: geom });
+    }
+    return { elements: els };
+  };
+  const fakeFetch = async (_ep, opts) => {
+    overpass_calls += 1;
+    const body = decodeURIComponent(String(opts && opts.body));
+    const m = /around:(\d+),([-\d.]+),([-\d.]+)/.exec(body);
+    return { ok: true, json: async () => mk_ways(Number(m[2]), Number(m[3])) };
+  };
+
+  const store = new Map();
+  const storage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => { store.set(k, v); },
+    removeItem: (k) => { store.delete(k); },
+  };
+  const mapSrc = new MAP.OsmMapSource({
+    fetch: fakeFetch, storage, max_points: 330, max_segs: 60,
+  });
+
+  // 位置源：s 想拨到哪就拨到哪（模拟"骑手已经跑到 5km 外了"）。
+  // 接口与 GeoSource 同形，Navigator 只认这几个字段。
+  const sim = {
+    s: 0.0,
+    heading_source: 'gps',
+    has_fix() { return true; },
+    fix() {
+      const [a, b] = route.point_at(this.s);
+      return [a, b, route.tangent_deg(this.s), 12.0];
+    },
+  };
+
+  const logs = [];
+  const sent = [];
+  const nav = new APP.Navigator(route, sim, {
+    send: (f, k, p) => { sent.push({ f, k, p }); return true; },
+    onLog: (l) => logs.push(l),
+    onUi: () => {},
+    mapSource: mapSrc,
+    config: { rate_hz: 10, no_map: false },
+  });
+  const map_frames = () => sent.filter((x) => x.k === 'map');
+  /** 把最后一帧 NAV_MAP 解出来（走真正的解析器，不自己切字节）。 */
+  const last_map = () => {
+    const f = map_frames()[map_frames().length - 1].f;
+    const parser = new P.FrameParser();
+    const out = parser.feed(f);
+    return P.NavMap.unpack(out[0].payload);
+  };
+
+  // 沿路线一段一段往前走，每段停几拍：让后台抓取真的成功几次（缓存里因此
+  // 有沿途的几份路网）。这就是现实里"骑了 5km 之后手上有的数据"。
+  //
+  // ⚠️ 每段只走 500m 以内、最后一小步只走 260m：`s` 是"路线上最近的那个点"，
+  //    会有一两个点距（25m）的零头，走太猛可能提前越过重锚线（那样"下面那一轮
+  //    是第一次重锚"这个前提就没了，这一节的断言全指着它）；而最后一步也不能
+  //    太大 —— 抓取是每 ~80m 触发一次的，跳太远手上那份路网就真的覆盖不到
+  //    新原点了（那是另一条分支，由下面第二段覆盖）。
+  for (const target of [0, 1000, 2000, 3000, 4000, 4500, 4800, 4950]) {
+    sim.s = target;
+    for (let i = 0; i < 4; i++) { nav.cycle(0.1); await sleep(1); }
+  }
+  eq(nav.reanchors, 1, '这一路只重锚过 1 次（出发时定原点那次）');
+  ok(mapSrc.ways.length > 0, `手上已经有路网数据（${mapSrc.ways.length} 条路）`);
+  const frames_before = map_frames().length;
+  ok(frames_before >= 1, `重锚之前底图已经在画（已发 ${frames_before} 帧 NAV_MAP）`);
+
+  // ---- 跨过 5km 重锚线：这一轮必须重建 + 重发，而且不联网 ----
+  const old_origin = [nav.origin_lat, nav.origin_lon];
+  const calls_before = overpass_calls;
+  const before_re = map_frames().length;
+  sim.s = 5060;                       // |s - 原点弧长| > REANCHOR_MOVE_M(5000)
+  nav.cycle(0.1);
+  eq(nav.reanchors, 2, '跨过 5km 后真的重锚了（原点挪到骑手当前位置）');
+  eq(overpass_calls, calls_before,
+     '重锚那一轮**一个 Overpass 请求都没发**（纯重投影，不是重新抓取）');
+  const grew = map_frames().length - before_re;
+  ok(grew >= 1, `重锚那一轮**同一轮**就重发了底图（+${grew} 帧 NAV_MAP），` +
+     '不用等下一次抓取成功（最坏 120 秒）');
+
+  // 重发的那一帧必须与**新原点**一致：拿同一份路网按新原点重投影一遍逐点比。
+  // 这是"底图不再偏 5km"的直接证明 —— 不是"发了就算".
+  {
+    const [rlat, rlon] = route.point_at(5060);
+    const expect = mapSrc.build(nav.origin_lat, nav.origin_lon, rlat, rlon, RT.ROUTE_FAR_M);
+    const got = last_map();
+    eq(got.seg_count, expect.seg_count,
+       `重发的底图段数 = 按新原点重投影的段数（${expect.seg_count}）`);
+    eq(got.pts, expect.pts, '重发的底图坐标与"按新原点重投影" **逐点相同**');
+    ok(expect.seg_count > 0, '重投影确实画出了东西（不是空图）');
+    // 反面：用**旧原点**投影出来的那一份必须与它不同，否则上面那条什么都没证明
+    const stale = mapSrc.build(old_origin[0], old_origin[1], rlat, rlon, RT.ROUTE_FAR_M);
+    ok(JSON.stringify(got.pts) !== JSON.stringify(stale.pts),
+       '这一份确实换了原点（和旧原点那份不同）—— 旧那份正是会掉到屏幕外的那份');
+  }
+  ok(nav.last_map_segs > 0,
+     `重发之后界面读的"多少段"跟着更新（${nav.last_map_segs} 段，非零）`);
+
+  // ---- 覆盖不到新原点时：不许发空帧把设备上那张擦掉 ----
+  //
+  // 现实中就是"Overpass 挂了/被限流，手上只剩很早以前那一带的路"。设备对
+  // seg_count == 0 的处理是把整片路网藏起来，所以发空帧 = 白屏。
+  mapSrc.ways = MAP.OsmMapSource._parse_ways(mk_ways(la0 + 1.0, lo0 + 1.0));  // 100km 外
+  mapSrc.anchor = [la0 + 1.0, lo0 + 1.0];
+  const before_gap = map_frames().length;
+  const updates_before = nav.frames_sent;
+  const segs_gap = nav.last_map_segs;
+  sim.s = 10100;                      // 再走 5km -> 第二次重锚
+  nav.cycle(0.1);
+  eq(nav.reanchors, 3, '第二次跨过 5km 又重锚了');
+  eq(map_frames().length, before_gap,
+     '手上的路网覆盖不到新原点时**不发任何底图帧**（尤其不发空帧把屏幕擦白）');
+  eq(nav.last_map_segs, segs_gap,
+     '界面读的"多少段"保持上一次真发出去的值（不被这次空重投影改成 0）');
+  eq(nav.frames_sent, updates_before + 1,
+     '底图没得发也照样发 NAV_UPDATE（底图是装饰，导航是本职）');
+  ok(logs.some((l) => /重锚/.test(l) && /不发空底图/.test(l)),
+     `日志里说清楚了为什么没重发：${logs.filter((l) => /重锚/.test(l)).slice(-1)[0] || '（没有）'}`);
+
+  // ---- 刷新"合法地"返回 0 条道路：手里那份路网绝不能被清掉 ----
+  const keepSrc = new MAP.OsmMapSource({
+    storage: null,
+    endpoints: ['https://x/'],
+    fetch: async () => ({ ok: true, json: async () => ({ elements: [] }) }),
+  });
+  keepSrc.ways = MAP.OsmMapSource._parse_ways(mk_ways(la0, lo0));
+  keepSrc.anchor = [la0, lo0];
+  const kept = keepSrc.ways.length;
+  await keepSrc.refresh(la0, lo0, 1000);
+  eq(keepSrc.ways.length, kept,
+     `Overpass 返回 0 条可用道路时，手里那 ${kept} 条路网**不被清掉**`);
+  eq(keepSrc.state, 'stale', '状态是"缓存已旧"（还能继续画），不是"不可用/空"');
 }
 
 // ---------------------------------------------------------------------------
