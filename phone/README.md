@@ -24,6 +24,9 @@ phone/
 ├── route.js                ★ 航线/加密/路口识别/OSRM（navigator.py 的 Route 类移植）
 ├── map.js                  ★ Overpass 路网 + 缓存 + 正北投影（OsmMapSource 的移植）
 ├── ble.js                  ★ Web Bluetooth：NUS、分片试探、队列、重连、看门狗
+├── ble_native.js           ★ 原生（Capacitor）传输：扫描/连接/MTU/**自适应分片**（APK 走这条）
+├── crashlog.js             崩溃黑匣子：危险操作前同步落盘 + 下次启动显示"上次异常结束"
+├── fgs.js / fgs_ui.js      前台服务 / 后台存活探针 / 原生节拍器（只在 APK 里有效）
 ├── sw.js                   Service Worker（只缓存同源静态资源）
 ├── manifest.webmanifest    PWA 清单
 ├── icon.svg                图标（maskable）
@@ -342,6 +345,16 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
 
 - **实际协商出来的 ATT MTU**，以及 512 分片到底能不能用。设备侧对切分点不敏感，
   所以最坏情况是"退到 20，慢但正确"。
+  > ⚠️ **v12 更新（真机已确认一半）**：APK（原生路径）这边**不能再按 `MTU − 3` 分片** ——
+  > 真机 MTU 517 时 `517 − 3 = 514` 会被 Android 框架的硬上限 **512** 拒掉，
+  > 而且那条异常是**同步抛在插件线程上**的（JS 接不住 ⇒ 进程直接死，dropbox 里有完整栈）。
+  > 所以 `ble_native.js` 现在的上界是 `min(MTU − 3, 512)`，并且**从 20 字节起步**、
+  > 只在连续成功之后才升一档（学到的值跨启动落盘）。上面的
+  > `512 → 244 → … → 20` 那条阶梯是 **PWA（Web Bluetooth）** 那条路的，
+  > `ble.js` 一个字节都没改。详见 `docs/android.md` 第 9 节。
+  > "512 分片到底能不能用"现在由自测回答了一半：**发出去的每一片都不会超过 512**
+  > （`phone/test/native.cjs` 第 15 节的模糊测试），另一半（这块板子/这台手机能吃到多大）
+  > 由 App 里的自适应升档在真机上自己试，读数在「选项 → 高级 / BLE 分片」。
 - **真机吞吐**。`docs/ble.md` 第 3 节的表是估算。1.4KB 的底图在 MTU 23 下
   约 3 秒 —— 如果实测这么慢，先看页面 `已发/丢弃`，必要时把
   `map.js` 的 `max_points` 调小。
