@@ -90,10 +90,21 @@ const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
  *      reject("Permission denied.")。桩以前永远 resolve，于是
  *      "initialize 被拒 → 界面只显示链路断开"这条路从来没被覆盖。
  *
+ *   3. **写载荷的字段名和编码必须和真插件一样严。**（这一版新加的，见
+ *      _accept_write / hex_to_u8 上面那段长注释。）旧桩直接读
+ *      `args.value.buffer` 当 DataView 用 —— 也就是说它**比真插件宽容**：
+ *      真插件底层只认字符串（BluetoothLe.kt:674/698 `call.getString("value", null)`
+ *      -> reject("Value required.")），而旧桩收 DataView、收数字数组、收什么
+ *      都行。于是"ble_native.js 把 DataView 当写载荷传下去"这个真机上
+ *      100% 写不出去（而且每片都写不出去）的 bug，在 148 项全绿的自测里
+ *      安然无恙地活了下来。桩不能再比真插件宽容了。
+ *
  * 其他刻意与真插件一致的地方：
  *   - requestLEScan 之后由 onScanResult 逐条推广播（allowDuplicates=true 时每条都推）；
  *   - isEnabled 返回 {value}；getConnectedDevices 返回 {devices:[...]}；
- *   - writeWithoutResponse / write 都要 {deviceId, service, characteristic, value}；
+ *   - writeWithoutResponse / write 都要 {deviceId, service, characteristic, value}，
+ *     且 value 必须是**十六进制字符串**（每字节两位、无分隔符，和
+ *     bleClient.js:231/248 的 dataViewToHexString() 完全一致）；
  *   - getMtu 返回 {value}；addListener('onNotification', cb) 推 {value: DataView}；
  *   - disconnect 时推 onDisconnected 回调。
  */
@@ -239,12 +250,60 @@ class FakePlugin {
   async write(args) { this._rec('write', args); this._accept_write(args); }
 
   _accept_write(args) {
-    const u8 = new Uint8Array(args.value.buffer, args.value.byteOffset, args.value.byteLength);
+    const u8 = this._decode_write_value(args && args.value);
     if (u8.length > this.fail_writes_above) {
       throw new Error(`单次写 ${u8.length} 字节被设备拒绝`);
     }
     this.write_sizes.push(u8.length);
     for (const b of u8) this.writes.push(b);
+  }
+
+  /**
+   * 真插件底层对写载荷的要求，逐条照抄（这就是本文件存在的主要理由）。
+   *
+   * 真插件这一侧（@capacitor-community/bluetooth-le 8.3.0）：
+   *   · android/.../BluetoothLe.kt:674（write）与 :698（writeWithoutResponse）：
+   *       val value = call.getString("value", null)
+   *       if (value == null) { call.reject("Value required."); return }
+   *     — 字段名是 **value**；writeDescriptor 在 :742 同样。
+   *   · Capacitor 的 PluginCall.getString(key, def) 是
+   *       `data.opt(key) instanceof String ? 值 : def`
+   *     （本次用 javap 核对过 @capacitor/android 的 PluginCall.class 字节码）。
+   *     所以传 DataView / 数组 / 对象都会变成默认值 null -> "Value required."。
+   *   · value 的**内容**再由 Conversion.kt:28-39 stringToBytes() 还原：
+   *     长度必须为偶数，每两个字符一个字节，用 Character.digit(c,16) 解
+   *     （大小写都吃；非十六进制字符直接抛 "Invalid Hexadecimal Character"）。
+   *
+   * 一句话：**只接受十六进制字符串，其他一律 reject("Value required.")**。
+   * 这跟"某一档 MTU 写不通"是两回事 —— 它和长度无关，所以任何分片大小
+   * 都会失败。桩必须复刻这一点，否则这个 bug 又能从自测里溜过去。
+   */
+  _decode_write_value(value) {
+    if (typeof value !== 'string') {
+      // 真插件到这一步拿到的是 null，报的就是这句话；把实得类型附在后面，
+      // 让失败信息本身就说清楚"传下去的是什么"（DataView / object / ...）。
+      const got = (value === null || value === undefined)
+        ? String(value)
+        : (typeof value === 'object' ? (value.constructor && value.constructor.name) || 'object'
+                                     : typeof value);
+      throw new Error(`Value required.（桩：写载荷必须是十六进制字符串，实得 ${got}）`);
+    }
+    if (value.length % 2 !== 0) {
+      // Conversion.kt:32 的 require(...)：真插件会抛这个
+      throw new Error(`Input string must have an even length, not ${value.length}`);
+    }
+    const out = new Uint8Array(value.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      const pair = value.substring(i * 2, i * 2 + 2);
+      const hi = parseInt(pair[0], 16);
+      const lo = parseInt(pair[1], 16);
+      if (Number.isNaN(hi) || Number.isNaN(lo)) {
+        // Conversion.kt:41-50 的 toDigit/hexToByte
+        throw new Error(`Invalid Hexadecimal Character: ${pair}`);
+      }
+      out[i] = (hi << 4) + lo;
+    }
+    return out;
   }
 
   /** 把一段上行字节推给页面（等价于设备的 TX 通知）。 */
@@ -385,7 +444,14 @@ section('3] 分片写：按 MTU 分片，字节序与设备看到的完全一致
   // 造一个 1400 字节的载荷（真实 NAV_MAP 的量级）
   const payload = new Uint8Array(1400);
   for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
-  await t.write_frame(payload);
+  // ⚠️ 这里接住异常只是为了**让这一节把后面的断言跑完**（一个不通过的用例
+  //    应该把问题都说清楚，而不是在第一条就整个中止）。真插件契约下写载荷
+  //    不对是必然失败的 —— 那件事由第 11b 节点名。
+  try {
+    await t.write_frame(payload);
+  } catch (e) {
+    ok(false, `传输层写帧不该失败：${e}`);
+  }
 
   eq(plugin.write_sizes, [244, 244, 244, 244, 244, 180],
      '1400 字节 = 5×244 + 180（6 个写操作）');
@@ -832,6 +898,137 @@ section('11] 下行：原生路径 send() 的字节必须真的写到传输上�
   await sleep(50);
   eq(plugin.writes.length, 0, '断开后 queue 被清空，一个字节都没写出去');
   eq(link.dropped_disconnected, 1, '而且这一帧如实记进了 dropped_disconnected');
+}
+
+// ---------------------------------------------------------------------------
+// 11b] 写载荷的**编码契约**：native 只认十六进制字符串
+// ---------------------------------------------------------------------------
+//
+// 这一节钉的是真机上"扫到、连上、MTU=517、通知也订阅了，然后**每一片**都
+// 写失败：Error: Value required.，一路降到 20 字节仍然失败"那件事的根因。
+//
+// 现场日志长得像"链路质量差、MTU 谈不下来"，其实和 MTU 一点关系都没有：
+// ble_native.js 把 `value: DataView` 传给了**底层**插件，而底层
+// （BluetoothLe.kt:674/698）只接受字符串 —— DataView 过 JSON 之后是 `{}`，
+// `call.getString("value", null)` 拿到 null，于是 reject("Value required.")。
+// 分片大小换成多少都一样，所以降档阶梯注定白跑。
+//
+// 这里刻意用**最贴近现场**的方式复现：真的 NavUpdate 帧、真的 BleLink、
+// 真的走 ble.js 的 _write_frame -> transport.write_frame。桩按真插件的契约
+// 拒收（见 FakePlugin._decode_write_value），所以只要有人把
+// `value: u8_to_hex_string(chunk)` 改回 `value: u8_to_data_view(chunk)`，
+// 这一节立刻红。
+section('11b] 写载荷契约：整帧 NAV_UPDATE 必须以十六进制字符串分片送出');
+{
+  // ── 11b-1) 整帧 NAV_UPDATE（现场那条"到不了设备"的帧）────────────────
+  const plugin = new FakePlugin({ mtu: 247 });
+  const t = mk_transport(plugin);
+  const logs = [];
+  const link = new BLE.BleLink({ transport: t, onLog: (l) => logs.push(l), onFrame: () => {} });
+  await link.connect();
+
+  const update = new proto.NavUpdate({
+    rel_bearing_cdeg: -4500, abs_bearing_cdeg: 27000, dist_next_cm: 123456,
+    dist_dest_m: 4321, speed_kmh_x10: 187, eta_min: 42, turn: 2,
+    flags: proto.NavFlags.LINK_UP, progress_pct: 63, heading_cdeg: 27100,
+    pos_east_m: -1234, pos_north_m: 5678, next_turn_index: 7, view_range_dm: 950,
+  });
+  const frame = proto.encode_nav_update(update);
+  eq(frame.length, proto.HEADER_LEN + proto.NAV_UPDATE_LEN + proto.CRC_LEN,
+     `NAV_UPDATE 整帧 = 头 ${proto.HEADER_LEN} + 载荷 ${proto.NAV_UPDATE_LEN} + CRC ${proto.CRC_LEN}` +
+     ` = ${proto.HEADER_LEN + proto.NAV_UPDATE_LEN + proto.CRC_LEN} 字节`);
+
+  const okwrite = await link._write_frame(frame);
+  ok(okwrite, '整帧 NAV_UPDATE 写成功（旧代码在这一步就是 Value required.）');
+  eq(plugin.writes.length, frame.length,
+     `设备侧收到的字节数 == 帧长（${plugin.writes.length}/${frame.length}，一片不丢不多）`);
+  eq(Buffer.from(plugin.writes).toString('hex'), Buffer.from(frame).toString('hex'),
+     '收到的字节流与原始帧**逐字节**相同（十六进制编解码没有错位/大小写问题）');
+
+  // 写下去的那个参数长什么样：字段名 value、类型 string、内容是十六进制
+  const w = plugin.calls.find((c) => c.method === 'writeWithoutResponse');
+  ok(!!w, '走的是 writeWithoutResponse');
+  eq(w.args.value, Buffer.from(frame).toString('hex').toUpperCase(),
+     'args.value 是十六进制字符串（每字节两位、无分隔符），不是 DataView');
+  eq(typeof w.args.value, 'string', 'args.value 的类型就是 string（native 的 getString 只认这个）');
+  ok(!/^\[object|^\{/.test(String(w.args.value)), 'value 不是被 JSON 压成 "[object ...]" 或 "{}"');
+
+  // 设备侧到底能不能解出来 —— 这才是"字节真的到了"的证据
+  const dev = new proto.FrameParser();
+  const got = dev.feed(Uint8Array.from(plugin.writes));
+  eq(got.length, 1, '设备侧 FrameParser 从收到的字节流里解出 1 帧');
+  if (got.length === 1) {
+    eq(got[0].type, proto.MsgType.NAV_UPDATE, '帧类型 = NAV_UPDATE（0x01）');
+    const back = proto.NavUpdate.unpack(got[0].payload);
+    eq(back.rel_bearing_cdeg, -4500, '相对方位角（负值）原样到达');
+    eq(back.dist_next_cm, 123456, '到下一转向的距离原样到达');
+    eq(back.pos_east_m, -1234, '东向坐标（负值、i16 边界）原样到达');
+    eq(back.next_turn_index, 7, '转向序号原样到达');
+    eq(back.view_range_dm, 950, '视野半径原样到达');
+  }
+
+  // 补零不能省：0x05 必须是 "05" 而不是 "5"，否则从这一字节起全部错位。
+  eq(NATIVE._u8_to_hex_string(Uint8Array.from([0x00, 0x05, 0xab, 0xff])), '0005ABFF',
+     '每字节固定两位（0x05 -> "05"）：少一位会让 native 侧整串错位且不报错');
+
+  // ── 11b-2) 分片必须按 MTU-3 走，而且第一片就成 ──────────────────────────
+  // 现场那台设备谈成的是 MTU 517 -> 514 字节/片。1.4KB 底图应该 3 片，
+  // 而不是 20 字节的 70 片（那正是"降档阶梯一路走到黑"的样子）。
+  const plugin2 = new FakePlugin({ mtu: 517 });
+  const t2 = mk_transport(plugin2);
+  const logs2 = [];
+  const link2 = new BLE.BleLink({ transport: t2, onLog: (l) => logs2.push(l), onFrame: () => {} });
+  await link2.connect();
+
+  eq(t2.transport_mtu, 517, 'MTU 路径仍然被使用：协商到 517');
+  eq(link2.chunk_size, 514, 'ble.js 起步分片 = MTU-3 = 514（不是 PWA 那个 512）');
+
+  const map = new Uint8Array(1400);
+  for (let i = 0; i < map.length; i++) map[i] = (i * 7) & 0xff;
+  ok(await link2._write_frame(map), '1400 字节的帧一次写成功');
+  eq(plugin2.write_sizes, [514, 514, 372],
+     '1400 = 514 + 514 + 372（3 个写操作；旧代码在这里会降到 20 字节 = 70 片）');
+  eq(link2.downgrades, 0, '**一次都没降档**（第一片就成 —— 这才是 MTU 路径的意义）');
+  eq(link2.write_failures, 0, '写失败次数 = 0');
+  eq(link2.chunk_size, 514, '分片大小保持 514');
+  let same2 = true;
+  for (let i = 0; i < map.length; i++) if (plugin2.writes[i] !== map[i]) same2 = false;
+  eq(plugin2.writes.length, 1400, '写出去的字节总数 = 帧长度');
+  ok(same2, '3 片拼起来的字节流与原始帧逐字节相同');
+  ok(!logs2.some((l) => /写失败|降到|程序错误/.test(l)),
+     '日志里没有"写失败/降到/程序错误"（真机上不该再刷那条误导性的降档阶梯）');
+
+  // 有些平台/老插件没有 writeWithoutResponse：退路必须是 write()，且载荷同一套契约
+  const plugin3 = new FakePlugin({ mtu: 247 });
+  plugin3.writeWithoutResponse = undefined;      // 遮住原型上的，模拟老插件
+  const t3 = mk_transport(plugin3);
+  const link3 = new BLE.BleLink({ transport: t3, onLog: () => {}, onFrame: () => {} });
+  await link3.connect();
+  ok(await link3._write_frame(frame), '没有 writeWithoutResponse 时退回 write() 也能写成');
+  eq(plugin3.at('write') >= 0, true, 'write() 真的被调用了');
+  eq(Buffer.from(plugin3.writes).toString('hex'), Buffer.from(frame).toString('hex'),
+     '退路下字节一样完整（两条路共用同一个编码契约）');
+
+  // ── 11b-3) 首片就失败 = 程序错误，日志必须这么说 ─────────────────────────
+  // 降档阶梯本身要保留（小分片也可能因为外设接收环满而失败），但不能让它
+  // 读起来像"每个 MTU 都连不通"。首片（= 协商 MTU-3）第一次就被拒，
+  // 物理上说不通，那是代码/契约问题，必须被点名。
+  const plugin4 = new FakePlugin({ mtu: 247, fail_writes_above: 16 });
+  const t4 = mk_transport(plugin4);
+  const logs4 = [];
+  t4.log = (l) => logs4.push(l);
+  const link4 = new BLE.BleLink({ transport: t4, onLog: (l) => logs4.push(l), onFrame: () => {} });
+  await link4.connect();
+  const ok4 = await link4._write_frame(new Uint8Array(300));
+  ok(!ok4, '一直失败到底时 _write_frame 返回 false（行为与降档前一模一样）');
+  ok(logs4.some((l) => /程序错误/.test(l)),
+     '首片（244 = MTU-3）失败被明确说成**程序错误**，不是链路问题');
+  eq(logs4.filter((l) => /程序错误/.test(l)).length, 1,
+     '"程序错误"只解释一次（APK 里每秒发帧，不能刷屏把现场信息挤掉）');
+  ok(logs4.some((l) => /降到 185/.test(l)), '降档阶梯仍然保留（兜底逻辑没被删掉）');
+  const i_bug = logs4.findIndex((l) => /程序错误/.test(l));
+  const i_ladder = logs4.findIndex((l) => /降到/.test(l));
+  ok(i_bug >= 0 && i_ladder > i_bug, '先把"这是程序错误"说清楚，再说降档（不会让人以为阶梯在修问题）');
 }
 
 // ---------------------------------------------------------------------------

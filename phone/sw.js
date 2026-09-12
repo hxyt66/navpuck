@@ -55,8 +55,16 @@
  *           并加了「重试扫描」。
  *        ⚠️ 第七次同样的坑：不 bump，手机上还是那份"点连接只报没找到设备"的
  *        index.html + app.js + ble_native.js —— 而这一版修的正是它。
+ *    v10：修真机上"扫到、连上、MTU=517、通知也订阅了，然后**每一片**都写失败：
+ *        Error: Value required.，一路降到 20 字节仍然失败"（只动 ble_native.js）。
+ *        根因：原生插件底层只接受**十六进制字符串**的 value，而旧代码传的是
+ *        DataView —— 过 Capacitor 桥之后变成 `{}`，native 的 getString("value")
+ *        拿到 null 就 reject("Value required.")。与分片大小无关，所以降档阶梯
+ *        注定白跑（详见 docs/android.md 3.7）。
+ *        ⚠️ 第八次同样的坑：不 bump，手机上还是那份"每个 MTU 都写不通"的
+ *        ble_native.js —— 服务端日志会继续把程序错误演成链路问题。
  */
-const CACHE = 'navpuck-phone-v9';
+const CACHE = 'navpuck-phone-v10';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [

@@ -249,6 +249,8 @@
 
       this._notify_handle = null;
       this._manual_close = false;
+      /** "首片就写失败 = 程序错误"这条日志只解释一次（见 _note_write_failure）。 */
+      this._prog_error_reported = false;
 
       /** 收到通知时把 DataView 转成 Uint8Array。 */
       this._on_notify_ev = (result) => {
@@ -713,13 +715,60 @@
     /**
      * 写一整帧。按当前分片大小切，一片一片 await。
      *
+     * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     * ⚠️ 这里唯一能传的载荷形式是**十六进制字符串**（不是 DataView！）
+     * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     * 这一版真机上"每一片都写失败：Value required."的根因就在这一行。
+     * 插件有两层，我们拿到的是**底层**那层（cap.Plugins.BluetoothLe），
+     * 底层只认字符串；DataView 的自动转换是**高层** BleClient 做的：
+     *
+     *   · 高层 dist/esm/bleClient.js:221-236 `write()` 与
+     *     238-253 `writeWithoutResponse()` —— 两者**完全一致**：
+     *         writeValue = dataViewToHexString(value);      // 仅 native 分支
+     *         await BluetoothLe.writeWithoutResponse(
+     *             Object.assign({ deviceId, service, characteristic,
+     *                             value: writeValue }, options));
+     *     即字段名就是 **`value`**（**不是** `writeValue`；`writeValue` 只是
+     *     它内部的局部变量），编码是 conversion.js:53-63 的
+     *     `dataViewToHexString()` —— 每字节两位小写十六进制、**无分隔符**
+     *     （例：`[0x0a,0x1b]` -> `"0a1b"`）。写特征值和写描述符（268-286）
+     *     用的是同一套。
+     *   · 底层 android/.../BluetoothLe.kt:674 `val value = call.getString("value", null)`
+     *     （write）与 :698（writeWithoutResponse），拿不到字符串就
+     *     reject("Value required.")（:675-678 / :699-702）。writeDescriptor
+     *     同理，在 :742-746。
+     *   · 到底什么才算"拿不到字符串"：Capacitor 的 PluginCall.getString(key,def)
+     *     是 `data.opt(key)`，然后 `instanceof String ? 值 : def`（本次用
+     *     javap 逐条核对过 @capacitor/android 的 PluginCall.class 字节码）。
+     *     而 JSON.stringify(new DataView(...)) === "{}"（DataView 没有 toJSON），
+     *     所以旧代码传过去的 `value: DataView` 到了 native 侧就是一个**空对象**，
+     *     instanceof String 为假 -> 返回默认值 null -> "Value required."。
+     *     这与分片大小无关，所以 512/244/…/20 全都会失败 —— 日志里那条
+     *     "每个 MTU 都写不通"的降档阶梯完全是这个类型错误的假象。
+     *   · 字节最终由 Conversion.kt:28-39 `stringToBytes()` 还原：要求**偶数长度**、
+     *     两个字符一个字节、`Character.digit(c,16)` 解（大小写都吃）。
+     *     所以 u8_to_hex_string() 必须每字节补足两位（0x05 -> "05"），
+     *     否则长度一变，后面的字节全部错位。
+     *
+     * 为什么不用高层 BleClient（虽然它"帮你转换"）：
+     *   1) 这里拿到的是 `cap.Plugins.BluetoothLe`（ble_native.js 的 pick_plugin()），
+     *      它就是**插件自己 registerPlugin('BluetoothLe') 注册的那个底层代理**
+     *      （dist/esm/plugin.js:2）；BleClient 是 dist/esm 里的 **ESM 模块**，
+     *      而 phone/ 这几个文件是直接 <script> 加载的 UMD 经典脚本，没有打包器 ——
+     *      引入它等于为了一个十行的十六进制转换把构建链整个改掉；
+     *   2) BleClient 的每个方法都走它自己的串行队列（dist/esm/queue.js），
+     *      和我们这边"一片一片 await"的顺序语义叠在一起没有收益，只有风险。
+     *   选底层 + 自己按同一个约定编码，是改动最小、且能对着 native 源码逐行
+     *   核对的那条路；编码实现和 bleClient.js 的 dataViewToHexString 是等价算法。
+     *
      * 失败一律**抛异常**，让 ble.js 的 _write_frame 走它既有的
      * "整帧作废 + 降档重试"逻辑 —— 分帧正确性只有一处实现（ble.js），
      * 这里不重复一遍，免得两边策略漂移。
      */
-    async write_frame(bytes) {
+    async write_frame(bytes, chunk_size) {
       const p = this.plugin;
-      const size = this.chunk_size_hint || 512;
+      // 用 ble.js 传来的分片（它才是降档策略的权威），没有就用自己的 MTU 提示。
+      const size = chunk_size || this.chunk_size_hint || 512;
       if (!this.connected || !this.device_id) throw new Error('原生链路未连接');
 
       for (let i = 0; i < bytes.length; i += size) {
@@ -728,17 +777,47 @@
           deviceId: this.device_id,
           service: NUS_SERVICE,
           characteristic: NUS_RX,
-          value: u8_to_data_view(chunk),
+          value: u8_to_hex_string(chunk),   // 见上面那段：native 只认十六进制字符串
         };
         // Write Without Response 是首选：设备 RX 两个属性都支持（docs/ble.md），
         // 而 with-response 每个分片都要等一个 ATT 确认，1.4KB 底图会慢好几倍。
-        if (typeof p.writeWithoutResponse === 'function') {
-          await p.writeWithoutResponse(args);
-        } else {
-          await p.write(args);
+        try {
+          if (typeof p.writeWithoutResponse === 'function') {
+            await p.writeWithoutResponse(args);
+          } else {
+            await p.write(args);
+          }
+        } catch (e) {
+          // 第一次尝试就失败 = 程序错误，不是链路问题：把它说清楚，
+          // 别让降档阶梯读起来像"每个 MTU 都连不通"（见 _note_write_failure）。
+          this._note_write_failure(e, chunk.length, size);
+          throw e;
         }
       }
       return true;
+    }
+
+    /**
+     * 写失败发生在**第一次尝试**（也就是 MTU 允许的最大分片）时，那不是链路问题，
+     * 是代码/契约问题 —— 必须这么说，否则日志会误导人去查信号、查距离、查设备。
+     *
+     * 真正的降档理由只有一种：**小分片也可能失败**（外设接收环满、链路抖动），
+     * 那时 flaky 的是链路，阶梯有意义。而"最大分片第一次就被拒"在物理上说不通：
+     * 我们才刚刚按协商好的 MTU-3 分片成功连上并订阅了通知。
+     *
+     * 只解释一次（_prog_error_reported）：APK 里每秒都在发帧，重复刷屏会把
+     * 真正的现场信息挤掉。
+     */
+    _note_write_failure(e, chunk_len, size) {
+      const max = Math.max(CHUNK_FALLBACK, (this.transport_mtu || 0) - 3);
+      const at_max = (size >= max) && (this.transport_mtu || 0) >= 23;
+      if (!at_max || this._prog_error_reported) return;
+      this._prog_error_reported = true;
+      this.log(
+        `⛔ 原生 BLE：写第一片（${chunk_len} 字节 = 协商 MTU ${this.transport_mtu} - 3）就被拒：${e}。` +
+        `这不是"链路/信号/MTU 不好"—— 是**程序错误**（最可能是写参数的字段名或编码不对：` +
+        `native 侧只接受十六进制字符串的 value，见 write_frame 上的注释）。` +
+        `下面的降档重试只是兜底，必不会成功；请连同这一行一起报上来。`);
     }
 
     /** 主动重连（用户按"重连"，或页面回到前台时补一刀）。 */
@@ -785,9 +864,34 @@
     return base64_to_u8(String(v));
   }
 
-  /** 送出去的值：DataView 是插件文档里认可的写法。 */
+  /**
+   * ⚠️ DataView **只能用于收**（通知回来的是 DataView/Uint8Array，见 data_view_to_u8）。
+   * 送出去的值必须是下面那个十六进制字符串 —— 原因写在 write_frame 的注释里
+   * （旧代码在这里把 DataView 当写载荷传下去，真机上就是 "Value required."）。
+   */
   function u8_to_data_view(u8) {
     return new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  }
+
+  /** 十六进制字符表（大写，与插件 native 侧 Conversion.kt 的 HEX_LOOKUP_TABLE 一致）。 */
+  const HEX_CHARS = '0123456789ABCDEF';
+
+  /**
+   * Uint8Array -> 十六进制字符串，每字节**补齐两位**、无分隔符。
+   *
+   * 等价于插件高层的 conversion.js:53-63 `dataViewToHexString()`（那一个用小写，
+   * 但 native 的 `Character.digit(c,16)` 大小写都认，见 Conversion.kt:41-50）。
+   * 补零是**必须**的：`stringToBytes()` 按"每两个字符一个字节"切
+   * （Conversion.kt:32-38），少一位就从这里开始全部错位 —— 而且不会报错，
+   * 只会把乱码写进设备，是比"写失败"更难查的一种失败。
+   */
+  function u8_to_hex_string(u8) {
+    const out = new Array(u8.length);
+    for (let i = 0; i < u8.length; i++) {
+      const b = u8[i];
+      out[i] = HEX_CHARS[(b >> 4) & 0x0f] + HEX_CHARS[b & 0x0f];
+    }
+    return out.join('');
   }
 
   /**
@@ -828,6 +932,7 @@
     NativeTransport,
     _base64_to_u8: base64_to_u8,
     _data_view_to_u8: data_view_to_u8,
+    _u8_to_hex_string: u8_to_hex_string,
     _perm_get: perm_get,
     _perm_dump: perm_dump,
     _pick_device: pick_device,

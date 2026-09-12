@@ -1327,6 +1327,41 @@ section('11.5] NAV_CLOCK 走**原生**（APK）那条路：点连接后设备真
   const NATIVE = require(path.join(PHONE_DIR, 'ble_native.js'));
   const PN = require(path.join(PHONE_DIR, 'proto.js'));
 
+  /**
+   * 十六进制字符串 -> Uint8Array。
+   *
+   * 真插件底层收的就是这个（`BluetoothLe.kt:674/698` 的 `call.getString("value", null)`
+   * 再交给 `Conversion.kt:28-39` 的 `stringToBytes()`：偶数长度、每两个字符一字节、
+   * `Character.digit(c,16)` 解）。桩按同一个契约解 —— **桩不能比真插件宽容**，
+   * 否则"传下去的东西类型不对"这类 bug 会在全绿的自测里活下来（这次就发生了）。
+   *
+   * 契约不符时**必须抛**，不能悄悄收下：
+   *   · 不是字符串 -> 真插件报 `Value required.`（DataView 过桥变成 `{}`，getString 返回 null）；
+   *   · 长度奇数 / 有非十六进制字符 -> 真插件在 `stringToBytes()` 里抛。
+   */
+  function hex_to_u8(value) {
+    if (typeof value !== 'string') {
+      const got = (value && typeof value === 'object')
+        ? (value.constructor && value.constructor.name) || 'object'
+        : typeof value;
+      throw new Error(`Value required.（写载荷必须是十六进制字符串，实得 ${got}）`);
+    }
+    if (value.length % 2 !== 0) {
+      throw new Error(`Input string must have an even length, not ${value.length}`);
+    }
+    const out = new Uint8Array(value.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      const pair = value.substring(i * 2, i * 2 + 2);
+      const hi = parseInt(pair[0], 16);
+      const lo = parseInt(pair[1], 16);
+      if (Number.isNaN(hi) || Number.isNaN(lo)) {
+        throw new Error(`Invalid Hexadecimal Character: ${pair}`);
+      }
+      out[i] = (hi << 4) + lo;
+    }
+    return out;
+  }
+
   // 假插件：只实现 ble_native.js 真正会调的那几个方法。
   // `device_writes` = 设备侧**真实收到**的字节（分片按顺序拼起来）。
   const device_writes = [];
@@ -1343,7 +1378,19 @@ section('11.5] NAV_CLOCK 走**原生**（APK）那条路：点连接后设备真
     async discoverServices() {},
     async startNotifications() {},
     async writeWithoutResponse(args) {
-      const u8 = new Uint8Array(args.value.buffer, args.value.byteOffset, args.value.byteLength);
+      // ⚠️ 写载荷的契约是**十六进制字符串**（键名 `value:`），不是 DataView。
+      //
+      // 这里以前写的是 `new Uint8Array(args.value.buffer, args.value.byteOffset, …)`
+      // —— 也就是假设载荷是 DataView。那个假设是**错的**：插件底层
+      // （BluetoothLe.kt:674/698）是 `call.getString("value", null)`，拿不到字符串就
+      // reject("Value required.")；而 DataView 过 Capacitor 的桥会被
+      // `JSON.stringify` 压成 `{}`，于是真机上**每一片**都写失败（和分片大小无关，
+      // 所以降档阶梯一路降到 20 字节也没用）。
+      //
+      // 这个桩以前"给什么收什么"，比真插件宽容，于是那一版真机 bug 在本套自测里
+      // 一片全绿。现在按真插件契约解（与 phone/test/native.cjs 的
+      // `_decode_write_value()` 同一套规则：每字节两位、无分隔符）。
+      const u8 = hex_to_u8(args.value);
       for (const b of u8) device_writes.push(b);
     },
     async disconnect() { this.connected = false; },
