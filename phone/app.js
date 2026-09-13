@@ -2112,8 +2112,13 @@
         this.mapview = new mvmod.MapView(cv, {
           // ① 同步：OsmMapSource 手上那份（离线瓦片优先、Overpass 兜底）
           ways: () => self.mapview_ways(),
-          // ② 异步、**只读本地**：本地瓦片（内存 + IndexedDB）
+          // ② 异步、**先本地、缺的排下载**：地图自己按视野取瓦片 ——
+          //    没有这一条，用户不先开始导航就永远只能看到一张空地图。
+          load_area: (lat, lon, r) => self.mapview_load_area(lat, lon, r),
+          // ③ 异步、**只读本地**：明确离线（navigator.onLine === false）时用它，
+          //    一个请求都不发（飞行模式/隧道里不该白费电和白等超时）。
           load_local: (lat, lon, r) => self.mapview_load_local(lat, lon, r),
+          online: () => self.is_online(),
           pos: () => self.mapview_pos(),
           route: () => self._mv_route,
           // 还没有定位时的初始中心：内置演示航线的起点。不这么做的话，
@@ -2128,9 +2133,67 @@
         return null;
       }
       this.mapview.attach(cv);
+      // ⭐ 瓦片到货要能立刻上屏：store 的 on_change 原来是 map.js 独占的
+      //    （它只置一个 tiles_dirty，而那个标志**只有导航循环在跑**时才有人消费）。
+      //    地图这一层必须自己接一份，否则"不导航时地图永远停在第一帧"。
+      this.mapview_watch_tiles(this.map_source_instance());
       this.log('[mapview] 地图已就绪：拖动平移、双指/滚轮缩放、' +
-               '「回到当前位置」回到跟随（数据只来自已缓存的离线瓦片）');
+               '「回到当前位置」回到跟随（路网优先用已缓存的离线瓦片，缺的会在后台补）');
       return this.mapview;
+    }
+
+    /** 有没有网：地图据此决定走"排下载"还是"只读本地"。 */
+    is_online() {
+      if (typeof navigator !== 'undefined' && navigator && navigator.onLine === false) {
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * 把 `TileStore.on_change` 接到地图上（**幂等**）。
+     *
+     * ⚠️ 必须**链式**接，不能直接覆盖：map.js 自己也挂了 on_change
+     *    （`this.tiles_dirty = true`，导航循环靠它重建底图）。覆盖掉它的症状是
+     *    "导航中底图不再跟着新瓦片更新"，而且完全看不出来是哪一步弄坏的。
+     */
+    mapview_watch_tiles(ms) {
+      if (!ms || !ms.tiles || ms.tiles._navpuck_mv_watched) return false;
+      const prev = ms.tiles.on_change;
+      const self = this;
+      ms.tiles.on_change = function (store) {
+        try { if (prev) prev(store); } catch (_e) { /* map.js 那边出错不该拖累地图 */ }
+        try {
+          if (self.mapview) self.mapview.on_tiles_changed(store || ms.tiles);
+        } catch (_e) { /* 地图重画失败也不影响导航 */ }
+      };
+      ms.tiles._navpuck_mv_watched = true;
+      return true;
+    }
+
+    /**
+     * 地图要的这一带路网：**先本地、缺的排下载**（`TileStore.load_area`）。
+     *
+     * 它和 `mapview_load_local` 只差一件事：`load_area` 会把缺的块**排进下载
+     * 队列**（后台、有并发上限和失败冷却）。没有它，用户不先开始导航就只能看到
+     * 一张空地图 —— 瓦片原来只在导航过程中由 map.js 下载。
+     *
+     * ⚠️ 它**不会等下载完**：立刻返回"手上已经有的那部分"，所以画图那一帧永远
+     *    不等网络；块到了通过 on_change 通知地图重画。
+     */
+    mapview_load_area(lat, lon, radius_m) {
+      if (!this.map_enabled) return null;
+      const ms = this.map_source_instance();
+      if (!ms || !ms.tiles) return null;
+      this.mapview_watch_tiles(ms);
+      try {
+        if (typeof ms.tiles.load_area === 'function') {
+          return ms.tiles.load_area(lat, lon, radius_m);
+        }
+      } catch (e) {
+        this.log(`[mapview] 这一带取数出错（地图继续画已有的）：${e}`);
+      }
+      return this.mapview_load_local(lat, lon, radius_m);
     }
 
     /**
@@ -2151,11 +2214,11 @@
      * 从**本地瓦片**里取一片路网（内存 + IndexedDB，**完全离线**）。
      *
      * ⚠️ 用的是 `TileStore.local_area()`：它只读本地、不排下载、不碰 fetch
-     *    （见 tiles.js 里那段说明）。所以这一条路径在飞行模式下也照样出数据 ——
-     *    这正是用户要的"没网也能看到当前位置一带的路网"。
+     *    （见 tiles.js 里那段说明）。所以这一条路径在飞行模式下也照样出数据，
+     *    而且**一个请求都不发** —— 明确离线时地图走的就是它（见 mapview_load_area）。
      *
      * 它同时覆盖了"还没开始导航"这个场景：导航循环不跑的时候没有人去调
-     * OsmMapSource.refresh()，地图就自己从本地瓦片里把这一带读出来。
+     * OsmMapSource.refresh()，地图就自己把这一带读出来。
      */
     mapview_load_local(lat, lon, radius_m) {
       if (!this.map_enabled) return null;

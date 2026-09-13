@@ -262,6 +262,90 @@ function fake_db(table) {
   };
 }
 
+/**
+ * 一个**真的会让 TileStore 走完整下载路径**的假站点（分列索引 + .npt 文件）。
+ *
+ * ⚠️ 只给 .npt 是不够的：`load_area()` 会先取 `index.json` 和
+ *    `index/<z>/<x>.json`，取不到就把每一块都判成"上游没有"（absent）——
+ *    **于是永远不会发瓦片请求**，测试就变成了"什么都没发生也通过"。
+ *    所以这里必须照真实布局造索引（和 tools/make_tiles.py 的输出一致）。
+ */
+function fake_site(z, ids, base, delay_ms) {
+  const b = base || 'https://t/';
+  const delay = Number.isFinite(delay_ms) ? delay_ms : 0;
+  const files = {};
+  const cols = new Map();
+  for (const id of ids) {
+    const p = String(id).split('/');
+    const x = Number(p[1]), y = Number(p[2]);
+    if (!cols.has(x)) cols.set(x, []);
+    cols.get(x).push(y);
+  }
+  const xs = Array.from(cols.keys()).sort((a, c) => a - c);
+  let ymin = Infinity, ymax = -Infinity;
+  for (const ys of cols.values()) {
+    for (const y of ys) { if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+  }
+  files[`${b}index.json`] = JSON.stringify({
+    v: 1, fmt: 'npt1', z: z, unit: 'dm', n: ids.length,
+    xr: xs.length ? [xs[0], xs[xs.length - 1]] : [0, 0],
+    yr: xs.length ? [ymin, ymax] : [0, 0], cdir: 'index',
+  });
+  for (const [x, ys] of cols) {
+    files[`${b}index/${z}/${x}.json`] = JSON.stringify({ x: x, y: ys.sort((a, c) => a - c) });
+  }
+  const log = [];
+  const f = async (url) => {
+    log.push(String(url));
+    // 可以给一个假的网络时延：不加这个的话"请求发出去"和"瓦片到货"会挤在同一个
+    // 微任务批次里，测试就没法分开断言"第一帧取了一次"和"到货后又读了一次"。
+    if (delay > 0) await sleep(delay);
+    const hit = files[String(url)];
+    if (hit === undefined) {
+      return { ok: false, status: 404,
+               async arrayBuffer() { return new ArrayBuffer(0); },
+               async text() { return 'Not Found'; } };
+    }
+    if (typeof hit === 'string') {
+      return { ok: true, status: 200, async text() { return hit; },
+               async arrayBuffer() { return new TextEncoder().encode(hit).buffer; } };
+    }
+    return { ok: true, status: 200, async text() { return ''; },
+             async arrayBuffer() { return hit; } };
+  };
+  f.log = log;
+  f.files = files;
+  return f;
+}
+
+/** 等 TileStore 的后台下载队列安静下来（下载是 fire-and-forget 的）。 */
+async function settle(store, rounds) {
+  for (let i = 0; i < (rounds === undefined ? 60 : rounds); i += 1) {
+    await sleep(2);
+    const s = store.stats();
+    if (s.pending === 0 && s.inflight === 0) return;
+  }
+}
+
+/**
+ * 轮询等一个条件成立（最多 ms 毫秒）。
+ *
+ * ⚠️ 为什么不能只用 settle()：`settle` 看的是**下载队列**，而 `load_area` 在
+ *    排队之前还要先取索引/列（假站点有 8ms 时延），那段时间队列是空的 ——
+ *    settle 会立刻返回，测试于是在"什么都没下"的状态下断言。
+ */
+async function wait_for(fn, ms) {
+  const t0 = Date.now();
+  const limit = ms === undefined ? 1000 : ms;
+  while ((Date.now() - t0) < limit) {
+    let v = false;
+    try { v = !!fn(); } catch (_e) { v = false; }
+    if (v) return true;
+    await sleep(5);
+  }
+  return false;
+}
+
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -335,10 +419,12 @@ section('1] 地图真的被接进 index.html / sw.js / style.css');
   // 不然手机上（缓存优先）永远吃不到这一版。
   const assets = [...SW.matchAll(/^\s*'([a-z_]+\.js)',?$/gm)].map((m) => m[1]);
   ok(assets.includes('mapview.js'), 'sw.js 的预缓存清单里有 mapview.js');
-  // ⚠️ 这个版本号每加一个被预缓存的文件就要 +1（v15 加 mapview.js，v16 加 search.js）。
+  // ⚠️ 这个版本号每加一个被预缓存的文件就要 +1（v15 加 mapview.js，v16 加 search.js，
+  //    v17 修 tiles.js 的 pack_z bug —— 那次改了文件却忘了 bump，SW 继续发旧副本，
+  //    修复在包里但从没执行过，真机症状和"没修"一模一样）。
   //    故意写死在这里：忘了 bump，手机上的 PWA 会一直吃旧副本。
-  ok(/const CACHE = 'navpuck-phone-v16'/.test(SW),
-     'sw.js 的缓存版本号已经 bump 到 v16（不然手机上的 PWA 吃的是旧副本）');
+  ok(/const CACHE = 'navpuck-phone-v17'/.test(SW),
+     'sw.js 的缓存版本号已经 bump 到 v17（不然手机上的 PWA 吃的是旧副本）');
   const needed = scripts.filter((s) => s !== 'mapview.js');
   eq(needed.filter((s) => !assets.includes(s)), [],
      'index.html 里的每个 <script> 都在 sw.js 的预缓存清单里');
@@ -828,6 +914,246 @@ await (async () => {
 })();
 
 // ---------------------------------------------------------------------------
+// 4b) 地图按视野取瓦片：**真的发请求** / 拖动不刷屏 / 离线一个都不发
+// ---------------------------------------------------------------------------
+//
+// 这一节补的是真机上的第二个问题：**地图是空的**。
+// 不是 bug 而是设计缺口 —— 瓦片原来只在**导航过程中**由 map.js 下载，所以用户
+// 打开 App 看到的是一张空地图，除非他先开始导航。而用户的原话是
+// "我要在手机端 app 看到地图"，空地图不算。
+//
+// 现在：视野停稳（三道闸门）-> `load_area`（先本地、缺的**排下载**）
+//       -> 到一块 -> store.on_change -> `on_tiles_changed` -> 重画。
+// 这一节同时钉住三条边界：**真的发请求**、**拖动时只发一次**、**离线一个都不发**。
+await (async () => {
+  const Z = 14;
+  const LAT = 30.2545, LON = 120.1350;
+  const HERE = TL.tile_of(LAT, LON, Z);
+  const ids = [];
+
+  /**
+   * 把"视图中心"换算成**某一块瓦片**里的分米偏移。
+   *
+   * ⚠️ 必须这么写：.npt 里的坐标是**相对瓦片中心**的，而瓦片中心离视图中心
+   *    可能有 1 公里（z14 一块 2 公里宽）。直接把线段画在"瓦片中心 ±300 米"，
+   *    在 z15 的 240px 视野（半宽只有 ~570 米）里**大概率落在视野外被裁掉** ——
+   *    断言就会变成"没画线"，而其实只是线段在屏幕外（我第一版就是这么假红的）。
+   */
+  function dm_at(z, x, y, lat, lon) {
+    const c = TL.tile_center(z, x, y);
+    const kx = TL.EARTH_M_PER_DEG_LON_EQ * Math.cos(c[0] * Math.PI / 180);
+    return [Math.round((lon - c[1]) * kx * 10), Math.round((lat - c[0]) * TL.EARTH_M_PER_DEG_LAT * 10)];
+  }
+
+  /** 以视图中心为中心的一个十字（保证一定在视野里）。 */
+  function cross_at(z, x, y) {
+    const [dx, dy] = dm_at(z, x, y, LAT, LON);
+    return [[0, [dx - 3000, dy, dx + 3000, dy]],
+            [6, [dx, dy - 3000, dx, dy + 3000]]];
+  }
+
+  const site_files = {};
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      const id = TL.tile_id(Z, HERE.x + dx, HERE.y + dy);
+      ids.push(id);
+      site_files[`https://t/${id}.npt`] = mk_tile(Z, HERE.x + dx, HERE.y + dy,
+                                                   cross_at(Z, HERE.x + dx, HERE.y + dy));
+    }
+  }
+
+  /** 造一个"联网"的地图视图 + 假站点。wire=true 时模拟 app.js 的 on_change 接线。 */
+  function mk_online(cfg) {
+    const o = cfg || {};
+    const site = fake_site(Z, ids, undefined, o.delay_ms === undefined ? 8 : o.delay_ms);
+    Object.assign(site.files, site_files);
+    const store = new TL.TileStore({
+      fetch: site, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: null, now: () => 1000, now_ms: o.now_ms || (() => 1000000),
+    });
+    const ctx = new RecCtx();
+    const mv = new MV.MapView(null, {
+      ctx: ctx, w: 240, h: 240, center: [LAT, LON], zoom: 15,
+      now_ms: o.now_ms || (() => 1000000),
+      online: () => o.online === undefined ? true : !!o.online,
+      load_area: (a, b, r) => store.load_area(a, b, r),
+      load_local: (a, b, r) => store.local_area(a, b, r),
+    });
+    mv.view = MV.make_view({ lat: LAT, lon: LON, zoom: 15, w: 240, h: 240 });
+    // 真机上这一段是 app.js 的 mapview_watch_tiles()：store 下好一块就通知地图
+    if (o.wire) store.on_change = () => mv.on_tiles_changed(store);
+    return { site, store, mv, ctx };
+  }
+
+  // ---- 4b-1) 联网：视野停稳 -> 真的去取瓦片，到货后画得出来 ----
+  {
+    let clock = 1000000;
+    const { site, store, mv, ctx } = mk_online({ now_ms: () => clock, wire: true });
+    const area_calls = [];
+    const real_load = mv.load_area;
+    mv.load_area = (a, b, r) => { area_calls.push([a, b, r]); return real_load(a, b, r); };
+
+    mv.tick(true);                       // 第一帧：排下载
+    // ⚠️ 顺序要紧：**画**是同步的，而**取数**是微任务（Promise.resolve().then）。
+    //    所以"第一帧只有一个底色+装饰"必须在 await 之前断言。
+    eq(ctx.count('moveTo'), 4, '第一帧还没有瓦片：只有比例尺/指北那 4 笔装饰');
+    await sleep(1);                      // 让微任务里的"发起取数"跑起来
+    eq(area_calls.length, 1, '⭐ 第一帧就按视野调了一次 load_area（取瓦片那条路）');
+    ok(area_calls[0][2] > 300 && area_calls[0][2] < 4000,
+       `要的半径是"视野对角半径 + 余量"（实得 ${area_calls[0][2].toFixed(0)} 米）`);
+    eq(mv.area_loads, 1, 'area_loads 记了 1 次（走的是联网那条路）');
+
+    ok(await wait_for(() => mv.local_loads >= 1, 2000), '第一次取数落地（索引 -> 列 -> 瓦片三跳）');
+    eq(mv.local.network, true, '结果里标了 network=true（这一轮用的是联网那条路）');
+    await settle(store);
+    ok(site.log.some((u) => /\.npt$/.test(u)),
+       `⭐ 真的发了瓦片请求（${site.log.filter((u) => /\.npt$/.test(u)).length} 个 .npt）`);
+    ok(site.log.some((u) => /index\.json$/.test(u)), '也取了头部索引（否则不知道该下哪几块）');
+    ok(await wait_for(() => mv.local.have > 0, 3000), `本地拿到 ${mv.local.have} 块`);
+    ok(await wait_for(() => area_calls.length >= 2, 2000),
+       '⭐ 瓦片到货之后又读了一次（on_change -> 越过闸门）—— 新块就是这么立刻上屏的');
+    ok(ctx.road_path().lineTo > 0,
+       `⭐ 地图上真的画出了线：${ctx.road_path().moveTo} 段 / ${ctx.road_path().lineTo} 条线`);
+    eq(mv.stats.source, 'local', '数据来源是本地瓦片');
+  }
+
+  // ---- 4b-2) 节流：停下不动时连打 50 帧，一次都不多发；小步拖动也不刷屏 ----
+  {
+    let clock = 1000000;
+    const { site, store, mv } = mk_online({ now_ms: () => clock, wire: true });
+    let area_calls = 0;
+    const real_load = mv.load_area;
+    mv.load_area = (a, b, r) => { area_calls += 1; return real_load(a, b, r); };
+
+    // 先把"开局那一轮"跑完（首帧 + 到货后越过闸门那次），再开始数节流
+    mv.tick(true);
+    await wait_for(() => mv.local.have > 0, 3000);
+    await settle(store);
+    ok(area_calls >= 1, `（前置）开局取过 ${area_calls} 次，本地已有 ${mv.local.have} 块`);
+    area_calls = 0;
+    const after_first = site.log.length;
+
+    for (let i = 0; i < 50; i += 1) mv.tick(true);
+    await sleep(5);
+    eq(area_calls, 0, '原地连打 50 帧：一次都没有多取（位置没动、时间没走、范围没变）');
+
+    // 拖动：每次 10 米（累计 100 米，**没到 120 米的闸门**）-> 一次都不该多发
+    for (let i = 0; i < 10; i += 1) {
+      mv.view = MV.pan_by(mv.view, 0, -10 / mv.view.mpp);
+      mv.tick(true);
+      await sleep(2);
+    }
+    eq(area_calls, 0,
+       '⭐ 连续小步拖动（累计 100 米 < 120 米闸门）：一次都没有多发请求');
+    eq(site.log.length, after_first, '网络请求数也没变');
+
+    // 再挪 60 米（累计 160 > 120）-> 允许再取一次
+    mv.view = MV.pan_by(mv.view, 0, -60 / mv.view.mpp);
+    mv.tick(true);
+    await sleep(5);
+    eq(area_calls, 1, '拖出 120 米以外 -> 允许再取一次（闸门是"或"关系）');
+    await settle(store);
+
+    // 时间闸门：停着不动，时钟走了 2 秒 -> 允许再取（瓦片可能被别的路径更新了）
+    area_calls = 0;
+    clock += 2000;
+    mv.tick(true);
+    await sleep(5);
+    eq(area_calls, 1, `过了 ${MV.LOCAL_MIN_PERIOD_MS}ms 允许再取一次`);
+  }
+
+  // ---- 4b-3) 瓦片到货 -> 触发重画（on_tiles_changed 只允许**越过闸门读一次**）----
+  {
+    let clock = 1000000;
+    // ⚠️ 这一节刻意**不接** on_change：要手工调一次，才能数清"越过闸门读了几次"
+    const { site, store, mv, ctx } = mk_online({ now_ms: () => clock, wire: false });
+    mv.tick(true);
+    ok(await wait_for(() => mv.local_loads >= 1, 2000), '（前置）第一次取数落地');
+    await settle(store);
+    await wait_for(() => store.stats().done + store.stats().packs > 0, 2000);
+    const frames_before = mv.stats.frames;
+    const loads_before = mv.local_loads;
+    mv.on_tiles_changed(store);          // app.js 就是这么接的（store.on_change）
+    await sleep(10);
+    eq(mv.stats.frames > frames_before, true, '到货之后真的重画了一帧');
+    eq(mv.local_loads, loads_before + 1,
+       '⭐ 到货时越过闸门多读了一次本地（不越的话新块最坏要等 1.5 秒才上屏）');
+    eq(mv._area_dirty, false, '标记用掉就清掉（一次性，不会变成每帧都读）');
+    const loads_after = mv.local_loads;
+    for (let i = 0; i < 20; i += 1) mv.tick(true);
+    await sleep(10);
+    eq(mv.local_loads, loads_after,
+       '⭐ 之后连打 20 帧不再多读（没有"读 -> tick -> 再读"的自激循环）');
+  }
+
+  // ---- 4b-4) 明确离线（navigator.onLine === false）：一个请求都不发，照样画 ----
+  {
+    // 本地预置几块（走 fake_db 的只读路径），网络一次都不许碰
+    const table = {};
+    for (const id of ids) {
+      const p = id.split('/');
+      table[id] = mk_tile(Z, Number(p[1]), Number(p[2]), cross_at(Z, Number(p[1]), Number(p[2])));
+    }
+    const site = fake_site(Z, ids);      // 有索引、有 .npt —— 一旦被调就会记下来
+    Object.assign(site.files, site_files);
+    const store = new TL.TileStore({
+      fetch: site, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: null, now: () => 1000, now_ms: () => 1000000,
+    });
+    store.db = fake_db(table);
+    const ctx = new RecCtx();
+    const mv = new MV.MapView(null, {
+      ctx: ctx, w: 240, h: 240, center: [LAT, LON], zoom: 15,
+      now_ms: () => 1000000,
+      online: () => false,                                   // ⭐ 明确离线
+      load_area: (a, b, r) => store.load_area(a, b, r),      // 不许被调到
+      load_local: (a, b, r) => store.local_area(a, b, r),
+    });
+    mv.view = MV.make_view({ lat: LAT, lon: LON, zoom: 15, w: 240, h: 240 });
+    mv.tick(true);
+    await sleep(30);
+    mv.tick(true);
+    eq(mv.local.offline, true, '结果里标了 offline=true');
+    eq(mv.area_loads, 0, '⭐ 离线时**一次都没有**走联网那条路');
+    eq(site.log.length, 0, '⭐ 离线时**一个网络请求都没有**（不是"发了但失败了"）');
+    eq(mv.local.have > 0, true, `离线也读到了 ${mv.local.have} 块本地瓦片`);
+    ok(ctx.road_path().lineTo > 0,
+       `⭐ 离线照样画得出路网（${ctx.road_path().lineTo} 条线）—— 这就是"没网也能看地图"`);
+    ok(ctx.texts().some((s) => /离线/.test(s)), '角标上写着"离线"（用户知道这是缓存里的）');
+  }
+
+  // ---- 4b-5) 联网但网络全挂：不崩、不发疯（冷却 + absent 记账兜住）----
+  {
+    let calls = 0;
+    const dead = async () => { calls += 1; throw new TypeError('没网'); };
+    const store = new TL.TileStore({
+      fetch: dead, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: null, now: () => 1000, now_ms: () => 1000000,
+    });
+    const ctx = new RecCtx();
+    const mv = new MV.MapView(null, {
+      ctx: ctx, w: 240, h: 240, center: [LAT, LON], zoom: 15,
+      now_ms: () => 1000000, online: () => true,
+      load_area: (a, b, r) => store.load_area(a, b, r),
+    });
+    mv.view = MV.make_view({ lat: LAT, lon: LON, zoom: 15, w: 240, h: 240 });
+    let threw = false;
+    try {
+      for (let i = 0; i < 30; i += 1) { mv.tick(true); await sleep(2); }
+    } catch (e) { threw = true; }
+    ok(!threw, '网络全挂时连打 30 帧不会抛异常');
+    await settle(store);
+    const c1 = calls;
+    for (let i = 0; i < 30; i += 1) { mv.tick(true); await sleep(2); }
+    await settle(store);
+    ok(calls <= c1 + 4,
+       `网络全挂时请求不会无限重试（第一批 ${c1} 次，之后 30 帧只多了 ${calls - c1} 次）`);
+    eq(mv.stats.source, 'none', '拿不到数据时来源是 none（界面会写"暂无路网"或"下载中"）');
+    ok(ctx.count('fillRect') > 0, '拿不到数据也照画底色（不会白屏/崩溃）');
+  }
+})();
+
+// ---------------------------------------------------------------------------
 // 5) 手势：拖动 / 双指 / 滚轮 / 双击 / 回到当前位置
 // ---------------------------------------------------------------------------
 section('5] 手势（合成 Pointer 事件，走的是 attach() 里那条真实路径）');
@@ -1113,11 +1439,38 @@ section('7] 渲染内容（记录型 ctx：图层、分组、抽稀、裁剪）'
   {
     const st = mv.status();
     for (const k of ['state', 'short', 'detail', 'source', 'zoom', 'mpp', 'follow',
-                     'segs', 'drawn_segs', 'pts', 'local_have', 'local_need']) {
+                     'segs', 'drawn_segs', 'pts', 'local_have', 'local_need',
+                     'downloading', 'offline']) {
       ok(Object.prototype.hasOwnProperty.call(st, k), `status() 里有字段 ${k}`);
     }
     eq(st.source, 'local', '数据来源标记为 local');
     ok(/m\/像素/.test(st.detail), '详情里有"米/像素"（说明当前尺度）');
+  }
+
+  // 正在下载时状态必须是"下载中"（"还没下载"和"没有覆盖"是两件事）
+  {
+    const c5 = new RecCtx();
+    const mv5 = new MV.MapView(null, { w: 240, h: 240, ctx: c5, now_ms: () => 1000000 });
+    mv5.view = MV.make_view({ lat: 30, lon: 120, zoom: 15, w: 240, h: 240 });
+    mv5.draw(c5, { view: mv5.view, ways: [], route: null, pos: null, source: 'none',
+                   local: { ways: [], have: 0, need: 4, coverage: 'unknown',
+                            downloading: 3, offline: false, network: true } });
+    mv5.stats.source = 'none';
+    eq(mv5.status().state, 'downloading', '正在下 3 块时状态是 downloading');
+    eq(mv5.status().short, '下载中 3', '短状态写成"下载中 3"（用户知道等一下就好）');
+    ok(/正在下 3 块/.test(mv5.status().detail), '详情里也有"正在下 3 块"');
+    ok(c5.texts().some((s) => /正在下载 3 块/.test(s)), '角标上也写了"正在下载 N 块…"');
+
+    // 上游明确没有 -> "暂无路网"（不是"下载中"，别让用户白等）
+    const c6 = new RecCtx();
+    const mv6 = new MV.MapView(null, { w: 240, h: 240, ctx: c6, now_ms: () => 1000000 });
+    mv6.view = MV.make_view({ lat: 30, lon: 120, zoom: 15, w: 240, h: 240 });
+    mv6.draw(c6, { view: mv6.view, ways: [], route: null, pos: null, source: 'none',
+                   local: { ways: [], have: 0, need: 4, coverage: 'none',
+                            downloading: 0, offline: false, network: true } });
+    mv6.stats.source = 'none';
+    eq(mv6.status().state, 'empty', '上游说没有时状态是 empty（不是 downloading）');
+    eq(mv6.status().short, '暂无路网', '短状态是"暂无路网"');
   }
 }
 
@@ -1335,6 +1688,63 @@ await (async () => {
   app.map_enabled = false;
   eq(await app.mapview_load_local(30, 120, 100), null, '底图关掉时连本地瓦片也不读');
   app.map_enabled = true;
+
+  // ---- ⭐ 联网那条路：走 TileStore.load_area（**缺的会排下载**）----
+  {
+    let area_args = null;
+    const area_ways = [[0, [[30.0, 120.0], [30.003, 120.003]]]];
+    let on_change_prev = 0;
+    const tiles = {
+      on_change: null,
+      local_area(lat, lon, r) { return Promise.resolve({ ways: local_ways, have: ['a'], need: ['a', 'b'] }); },
+      load_area(lat, lon, r) {
+        area_args = [lat, lon, r];
+        return Promise.resolve({ ways: area_ways, have: ['a'], need: ['a', 'b'],
+                                 coverage: 'partial', downloading: 1, reason: '瓦片正在下载' });
+      },
+    };
+    app.map_source = { ways: [], set_enabled() {}, tiles: tiles };
+    const got_a = await app.mapview_load_area(30.0, 120.0, 900);
+    eq(area_args, [30.0, 120.0, 900],
+       '⭐ mapview_load_area 走的是 TileStore.load_area（联网那条路，缺的块会排队）');
+    eq(got_a.ways, area_ways, '取回的路网原样返回');
+    eq(got_a.downloading, 1, '结果里带着"新排了几块"（界面据此写"下载中"）');
+
+    // ⭐ on_change 必须**链式**接：map.js 自己也挂了一个（tiles_dirty），
+    //    覆盖掉它 = 导航中底图不再跟着新瓦片更新，而且完全看不出来。
+    tiles.on_change = () => { on_change_prev += 1; };      // 假装这是 map.js 的
+    eq(app.mapview_watch_tiles(app.map_source), true, 'mapview_watch_tiles 接上了');
+    eq(app.mapview_watch_tiles(app.map_source), false, '幂等：第二次不再重复包一层');
+    let mv_tiles_hits = 0;
+    const real_on_tiles = mv.on_tiles_changed.bind(mv);
+    mv.on_tiles_changed = (st) => { mv_tiles_hits += 1; return real_on_tiles(st); };
+    tiles.on_change(tiles);
+    eq(on_change_prev, 1, '⭐ map.js 原来那个 on_change 照样被调到（没有被覆盖掉）');
+    eq(mv_tiles_hits, 1, '⭐ 地图那一份也被调到了（两边都要）');
+    mv.on_tiles_changed = real_on_tiles;
+
+    // 离线开关
+    const desc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    try {
+      Object.defineProperty(globalThis, 'navigator',
+        { configurable: true, writable: true, value: { onLine: false } });
+      eq(app.is_online(), false, 'navigator.onLine === false -> is_online() = false');
+      Object.defineProperty(globalThis, 'navigator',
+        { configurable: true, writable: true, value: { onLine: true } });
+      eq(app.is_online(), true, 'navigator.onLine === true -> is_online() = true');
+      Object.defineProperty(globalThis, 'navigator',
+        { configurable: true, writable: true, value: {} });
+      eq(app.is_online(), true, '拿不到 onLine（老环境）时当作有网（多试一次不亏）');
+    } finally {
+      if (desc) Object.defineProperty(globalThis, 'navigator', desc);
+      else delete globalThis.navigator;
+    }
+
+    // 底图关掉时联网这条路也不许走
+    app.map_enabled = false;
+    eq(await app.mapview_load_area(30, 120, 100), null, '底图关掉时不走联网那条路');
+    app.map_enabled = true;
+  }
 
   // ---- 画一帧：状态写进 DOM，路网真的画出来 ----
   app.map_source = { ways: live_ways, set_enabled() {}, tiles: null };

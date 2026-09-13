@@ -46,22 +46,35 @@
  * ===========================================================================
  * 数据从哪来（**离线优先，这一层一个字节都不联网**）
  * ===========================================================================
- * 这个类**自己不下载任何东西**。它只从两个地方取路网：
+ * 数据从哪来（**先本地，缺的才排下载** —— 但地图本身永远不等网络）
+ * ===========================================================================
+ *  ① `opts.ways()` —— 同步提供者，每帧调。app.js 接的是
+ *     `OsmMapSource.ways`（那份数据本身已经是"离线瓦片优先、Overpass 兜底"
+ *     的产物，见 map.js 文件头）。形状和瓦片一致：`[[rank,[[lat,lon],...]],...]`。
+ *  ② `opts.load_area(lat, lon, radius_m)` —— 异步提供者，**联网那条路**。
+ *     app.js 接的是 `TileStore.load_area()`（见 tiles.js）：它**先**从内存 +
+ *     IndexedDB 把这一带已经有的路网拼出来，**再**把缺的块排进下载队列
+ *     （后台、有并发上限、有冷却），所以"缺块"这件事不会让这一帧空着。
+ *  ③ `opts.load_local(lat, lon, radius_m)` —— 异步提供者，**只读本地**
+ *     （`TileStore.local_area()`）。明确离线时用它，**一个请求都不发**。
  *
- *   ① `opts.ways()` —— 同步提供者，每帧调。app.js 接的是
- *      `OsmMapSource.ways`（那份数据本身已经是"离线瓦片优先、Overpass 兜底"
- *      的产物，见 map.js 文件头）。形状和瓦片一致：`[[rank,[[lat,lon],...]],...]`。
- *   ② `opts.load_local(lat, lon, radius_m)` —— 异步提供者，**只许读本地**。
- *      app.js 接的是 `TileStore.local_area()`（内存 + IndexedDB，见 tiles.js），
- *      它是**纯本地**读取：没有网也照样返回手上有的那些瓦片拼出来的路网。
+ * ⚠️ **画图的这一帧永远只用本地已经解出来的数据**（②的返回值里那部分，或者③）。
+ *    下载是**后台**发生的：块到了由 `opts.on_tiles`（store 的 on_change）通知，
+ *    这里再读一次本地、重画。所以"没网也能看到当前位置一带的路网"仍然是结构
+ *    决定的 —— 网络那一层只负责**把缺的块填进缓存**，填不进去就画手上有的。
+ *    自测里用"fetch 一律抛错"把这条钉住（见 phone/test/mapview.mjs 第 4 节）。
  *
- * ⚠️ 这两条**都不联网**。`local_area` 故意不排下载、不碰 fetch；瓦片的下载是
- *    map.js 那条路的事（导航中它自己会做）。所以"没网也能看到当前位置一带的
- *    路网"这件事不是承诺，而是这一层的结构决定的 —— 自测里用"fetch 一律抛错"
- *    把它钉住（见 phone/test/mapview.mjs 第 4 节）。
+ * ⚠️ 为什么地图要自己排下载：瓦片原来只在**导航过程中**由 map.js 下载，
+ *    于是用户打开 App 看到的是**一张空地图** —— 除非他先开始导航。用户的原话
+ *    是"我要在手机端 app 看到地图"，空地图不算。现在的顺序是：
+ *      视野停稳（三道闸门）-> load_area(视野中心, 视野半径) -> 缺的块排队
+ *        -> 到一块就 on_change -> 重画一次
+ *    三道闸门（移动 120m / 1.5s / 范围涨 30%）就是这里的节流：拖着地图跑的时候
+ *    不会每帧发请求；而且 store 那边还有自己的并发上限、失败冷却和"上游没有"
+ *    的记账，两层加起来不可能打出请求风暴。
  *
- *   ③ 快照优先顺序：`ways()` 有数据就用它，否则用 `load_local` 拿回来的那份。
- *      两者形状完全相同，所以画的时候只有一条代码路径。
+ *  ④ 快照优先顺序：`ways()` 有数据就用它，否则用 ②/③ 拿回来的那份。
+ *     两者形状完全相同，所以画的时候只有一条代码路径。
  *
  * ===========================================================================
  * 画什么（图层顺序，从下到上）
@@ -162,7 +175,7 @@
   // 单位是 **CSS 像素**，所以高 DPI 下这个阈值不会跟着 DPR 放大。
   const MIN_STEP_PX = 0.7;
 
-  // 本地瓦片重读的最小间隔（毫秒）与最小移动距离（米）。见 _refresh_local。
+  // 重取这一带的最小间隔（毫秒）与最小移动距离（米）。见 _refresh_area。
   const LOCAL_MIN_PERIOD_MS = 1500;
   const LOCAL_MIN_MOVE_M = 120.0;
   // 取本地瓦片的半径 = 视图对角半径 × 这个系数 + 这点余量（米）。
@@ -418,7 +431,10 @@
      *   w / h        没有 canvas 时的 CSS 尺寸（自测用）
      *   dpr          返回 devicePixelRatio 的函数（自测用）
      *   ways         同步路网提供者 `() => [[rank,[[lat,lon],...]],...]`
-     *   load_local   异步**只读本地**的取路网函数 `(lat,lon,radius_m) => {ways,have,need,coverage}`
+     *   load_area    异步**先本地、缺的排下载** `(lat,lon,radius_m) => {ways,have,need,coverage,downloading,reason}`
+     *   load_local   异步**只读本地**（明确离线时用；不给就退回 load_area）
+     *   online       返回当前是否联网（自测注入；默认读 navigator.onLine）
+     *   on_tiles     瓦片到货通知（app.js 接 TileStore.on_change）
      *   pos          位置提供者 `() => [lat,lon,heading] | null`
      *   route        航线提供者 `() => [[lat,lon],...] | null`
      *   center       还没有定位时的初始中心 `[lat, lon]`
@@ -439,7 +455,9 @@
       this.log = o.log || (() => {});
 
       this.ways = o.ways || null;
+      this.load_area = o.load_area || null;
       this.load_local = o.load_local || null;
+      this._online_fn = o.online || null;
       this.pos_provider = o.pos || null;
       this.route_provider = o.route || null;
       this.on_status = o.on_status || null;
@@ -456,13 +474,22 @@
       this.dpr = 1;
 
       // 本地瓦片那一层（见文件头"数据从哪来"）
-      this.local = { ways: [], have: 0, need: 0, coverage: 'idle', reason: '' };
+      //   ways/have/need   本地已经解出来的路网与块数
+      //   coverage         上游覆盖：have | partial | none | unknown | off
+      //   downloading      store 这一次**新排**了几块（>0 = 正在下）
+      //   offline          这一轮走的是"明确离线"那条路（一个请求都没发）
+      //   network          这一轮用的是联网那条路（load_area）
+      this.local = { ways: [], have: 0, need: 0, coverage: 'idle', reason: '',
+                     downloading: 0, offline: false, network: false };
       this._loading = false;
+      this._area_dirty = false;    // 瓦片到货 -> 下一轮允许越过三道闸门读一次
       this._load_at = null;
       this._load_t = -1e9;
       this._load_radius = 0;
       this.local_loads = 0;
       this.local_errors = 0;
+      this.area_loads = 0;         // 走了几次**联网**那条路（诊断/自测读）
+      this.tiles_stats = null;     // 最近一次 on_tiles_changed 带上来的下载记账
 
       // 手势状态
       this._pointers = new Map();
@@ -573,38 +600,65 @@
       return Math.hypot(v.w, v.h) * 0.5 * v.mpp * LOCAL_RADIUS_K + LOCAL_RADIUS_PAD_M;
     }
 
+    /** 现在有没有网。默认读 navigator.onLine（拿不到就当有网 —— 多试一次不亏）。 */
+    is_online() {
+      if (this._online_fn) {
+        try { return this._online_fn() !== false; } catch (_e) { return true; }
+      }
+      if (typeof navigator !== 'undefined' && navigator &&
+          navigator.onLine === false) return false;
+      return true;
+    }
+
     /**
-     * 后台读一次本地瓦片（**不联网**）。
+     * 取一次这一带的路网。
      *
-     * 三道闸门（满足任一才真去读）：位置动了够远、离上次够久、**要的范围明显变大**
+     * 联网时走 `load_area`（**先本地、缺的排下载**），明确离线时走 `load_local`
+     * （只读本地，一个请求都不发）。两条路都会立刻返回"手上已经有的那部分"，
+     * 所以画图这一帧**永远不等网络**。
+     *
+     * 三道闸门（满足任一才真去取）：位置动了够远、离上次够久、**要的范围明显变大**
      * （缩小视图之后要的瓦片多了，不该等满一个周期）。
      *
-     * ⚠️ 这三道闸门是**必须**的，而且这里**不能**再暴露一个"强制"入口给 tick：
-     *    tick 会被 invalidate() 直接调起来，而加载完成的回调又会调 invalidate() ——
-     *    一旦"每次 tick 都强制重读"，就变成 读->tick->再读 的自激循环，
-     *    症状是浏览器/Node 直接把内存吃爆（这条真的踩过一次）。
-     *    闸门在**发起请求时**就更新（不等回调），所以这个循环天然断掉。
+     * ⚠️ 这三道闸门是**必须**的，而且这里**不能**再给 tick 一个"每次强制重取"的
+     *    入口：tick 会被 invalidate() 直接调起来，而取完的回调又会 invalidate() ——
+     *    一旦"每次 tick 都强制重取"，就变成 取->tick->再取 的自激循环，症状是
+     *    内存直接被吃爆（这条真的踩过一次）。
+     *    唯一的例外是 `_area_dirty`：瓦片**真的到货**时置上，允许越过闸门读一次，
+     *    读完就清掉 —— 它由"下载完成"驱动（下载队列会清空、失败的块有冷却），
+     *    所以同样不会自激。
      */
-    _refresh_local() {
-      if (!this.load_local || this._loading) return false;
+    _refresh_area() {
       const v = this.view;
-      if (!v) return false;
+      if (!v || this._loading) return false;
+      const offline = !this.is_online();
+      // 离线时**只用** load_local；没给 load_local 就退回 load_area
+      // （那种情况下 store 自己的 cooldown/absent 记账会挡住重复请求）。
+      const loader = offline ? (this.load_local || this.load_area)
+                             : (this.load_area || this.load_local);
+      if (!loader) return false;
+      const use_network = !offline && (loader === this.load_area);
+
       const now = this._now_ms();
       const moved = this._load_at
         ? nm.distance_m(v.lat, v.lon, this._load_at[0], this._load_at[1]) : Infinity;
       const r = this.load_radius_m();
       const grew = !(this._load_radius > 0) || r > this._load_radius * 1.3;
-      if (moved < LOCAL_MIN_MOVE_M && (now - this._load_t) < LOCAL_MIN_PERIOD_MS && !grew) {
+      const dirty = this._area_dirty;
+      if (!dirty && moved < LOCAL_MIN_MOVE_M &&
+          (now - this._load_t) < LOCAL_MIN_PERIOD_MS && !grew) {
         return false;
       }
       this._loading = true;
+      this._area_dirty = false;
       this._load_t = now;
       this._load_at = [v.lat, v.lon];
       this._load_radius = r;
       const lat = v.lat;
       const lon = v.lon;
+      if (use_network) this.area_loads += 1;
       Promise.resolve()
-        .then(() => this.load_local(lat, lon, r))
+        .then(() => loader.call(null, lat, lon, r))
         .then((res) => {
           this._loading = false;
           if (!res) return;
@@ -614,23 +668,52 @@
             need: Array.isArray(res.need) ? res.need.length : 0,
             coverage: res.coverage || 'unknown',
             reason: res.reason || '',
+            downloading: Number.isFinite(res.downloading) ? res.downloading : 0,
+            offline: offline,
+            network: use_network,
           };
           this.local_loads += 1;
+          if (this.local.downloading > 0) {
+            this.log(`[mapview] 这一带缺 ${this.local.downloading} 块瓦片，已在后台排队` +
+                     `（本地已有 ${this.local.have}/${this.local.need} 块）`);
+          }
           this.invalidate();
         })
         .catch((e) => {
-          // 本地读失败（存储坏了/没有 IndexedDB）：**只影响这一层**，
+          // 取数失败（存储坏了/没有 IndexedDB/网络异常）：**只影响这一层**，
           // 地图继续画手上有的东西，绝不能变成一个异常。
           this._loading = false;
           this.local_errors += 1;
-          this.log(`[mapview] 本地瓦片读取失败（地图继续画已有的数据）：${e}`);
+          this.log(`[mapview] 这一带取数失败（地图继续画已有的数据）：${e}`);
         });
+      return true;
+    }
+
+    /**
+     * 瓦片到货（app.js 把 `TileStore.on_change` 接到这里）。
+     *
+     * 只做两件事：置一个"允许越过闸门读一次"的标记 + 排一次重画。
+     * **不直接递归调用取数** —— 那样会和 invalidate() 里的 tick 组成自激循环
+     * （见 _refresh_area 的说明）。这里置的标记是**一次性**的。
+     */
+    on_tiles_changed(store) {
+      this._area_dirty = true;
+      const st = store || null;
+      if (st && st.stats && typeof st.stats === 'function') {
+        try {
+          const s = st.stats();
+          this.tiles_stats = { done: s.done, packs: s.packs, pending: s.pending,
+                               inflight: s.inflight, bytes: s.bytes };
+        } catch (_e) { /* 记账失败不影响画图 */ }
+      }
+      this.invalidate();
       return true;
     }
 
     /** 把本地路网那一层扔掉（界面上"关掉街道路网底图"时调）。 */
     drop_local() {
-      this.local = { ways: [], have: 0, need: 0, coverage: 'off', reason: '' };
+      this.local = { ways: [], have: 0, need: 0, coverage: 'off', reason: '',
+                     downloading: 0, offline: false, network: false };
       this._load_at = null;
       this._load_radius = 0;
       this.invalidate();
@@ -737,7 +820,7 @@
       }
       if (this.view === null) return false;
 
-      this._refresh_local();
+      this._refresh_area();
       const snap = this.snapshot();
       const t0 = this._now_ms();
       this.draw(ctx, snap);
@@ -1017,23 +1100,31 @@
       this._text(g, 'N', x, y + 6.0, 10.0, '#e9eff7', 'center', 'top');
     }
 
-    /** 左上角状态角标：路网从哪来、块数、跟随还是自由查看。 */
+    /** 左上角状态角标：路网从哪来、块数、在不在下载、跟随还是自由查看。 */
     _draw_badges(g, v, snap, report) {
+      const loc = snap.local || {};
+      const dl = loc.downloading || 0;
       let text;
       if (snap.source === 'none') {
-        text = '暂无路网（本地无缓存）';
+        // ⚠️ "还没有路网"和"正在下第一块"必须长得不一样：前者像坏了，
+        //    后者只要等一下。真机上地图空白时用户看到的正是这一行。
+        text = dl > 0 ? `正在下载 ${dl} 块…` : '暂无路网（本地无缓存）';
       } else {
         const src = snap.source === 'local' ? '离线瓦片' : '本地路网';
-        const cov = snap.local && snap.local.need
-          ? ` ${snap.local.have}/${snap.local.need}块` : '';
+        const cov = loc.need ? ` ${loc.have}/${loc.need}块` : '';
         text = `${src}${cov} · ${report.drawn}段`;
+        if (dl > 0) text += ` · 补${dl}`;
       }
       const line2 = snap.follow ? '跟随当前位置' : '自由查看（点「回到当前位置」）';
-      const wpx = Math.max(this._text_w(g, text, 10.5), this._text_w(g, line2, 10.5)) + 12.0;
+      const line3 = loc.offline ? '离线：只画已缓存的路网' : '';
+      const h = line3 ? 36.0 : 26.0;
+      const wpx = Math.max(this._text_w(g, text, 10.5), this._text_w(g, line2, 10.5),
+                           this._text_w(g, line3, 9.5)) + 12.0;
       g.fillStyle = BADGE_BG;
-      g.fillRect(6.0, 6.0, wpx, 26.0);
+      g.fillRect(6.0, 6.0, wpx, h);
       this._text(g, text, 12.0, 10.0, 10.5, TEXT_COLOR, 'left', 'top');
       this._text(g, line2, 12.0, 21.0, 9.5, DIM_COLOR, 'left', 'top');
+      if (line3) this._text(g, line3, 12.0, 31.0, 9.5, DIM_COLOR, 'left', 'top');
     }
 
     /** 一行字。测量宽度失败（自测里的假 ctx）就按字号粗估。 */
@@ -1063,29 +1154,44 @@
     status() {
       const v = this.view;
       const src = this.stats.source;
+      const loc = this.local;
+      const dl = loc.downloading || 0;
       let state = 'idle';
       let short = '—';
       if (!v) {
         state = 'unavailable';
         short = '无中心';
       } else if (src === 'none') {
-        state = (this.local_errors > 0) ? 'unavailable' : 'empty';
-        short = '暂无路网';
-      } else if (src === 'local') {
+        // 一块都没有：分四种说法，**它们对应完全不同的下一步**
+        //   downloading  正在下，等一下就好
+        //   coverage none 上游确认这一带没有 -> 别等了（预生成瓦片只含主路/次干道）
+        //   coverage off 用户自己关掉了底图
+        //   其它         说不准（索引没取到/网络问题）-> 可以重试
+        if (dl > 0) { state = 'downloading'; short = `下载中 ${dl}`; }
+        else if (loc.coverage === 'none' || loc.coverage === 'off') {
+          state = 'empty'; short = '暂无路网';
+        } else if (this.local_errors > 0) { state = 'unavailable'; short = '取数失败'; }
+        else { state = 'empty'; short = '暂无路网'; }
+      } else if (dl > 0) {
+        state = 'downloading';
+        short = `已就绪·补${dl}`;
+      } else if (loc.offline) {
         state = 'offline';
         short = '离线';
       } else {
         state = 'ok';
         short = '已就绪';
       }
-      const cov = this.local.need
-        ? `本地瓦片 ${this.local.have}/${this.local.need} 块` : '本地瓦片 0 块';
+      const cov = loc.need
+        ? `本地瓦片 ${loc.have}/${loc.need} 块` : '本地瓦片 0 块';
       const parts = [
         cov,
+        dl > 0 ? `正在下 ${dl} 块` : '',
         `${this.stats.drawn_segs} 段 / ${this.stats.pts} 点`,
         this.follow ? '跟随中' : '自由查看',
         v ? `z${v.zoom.toFixed(1)} · ${v.mpp.toFixed(2)} m/像素` : '',
         v ? `${v.lat.toFixed(5)}, ${v.lon.toFixed(5)}` : '',
+        loc.reason || '',
       ].filter(Boolean);
       return {
         state: state,
@@ -1098,9 +1204,11 @@
         segs: this.stats.segs,
         drawn_segs: this.stats.drawn_segs,
         pts: this.stats.pts,
-        local_have: this.local.have,
-        local_need: this.local.need,
-        local_coverage: this.local.coverage,
+        local_have: loc.have,
+        local_need: loc.need,
+        local_coverage: loc.coverage,
+        downloading: dl,
+        offline: !!loc.offline,
       };
     }
 

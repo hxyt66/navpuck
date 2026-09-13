@@ -784,8 +784,8 @@ await (async () => {
 
   const assets = [...SW.matchAll(/^\s*'([a-z_]+\.js)',?$/gm)].map((m) => m[1]);
   ok(assets.includes('search.js'), 'sw.js 的预缓存清单里有 search.js');
-  ok(/const CACHE = 'navpuck-phone-v16'/.test(SW),
-     'sw.js 的缓存版本号 bump 到 v16（忘了的话手机上的 PWA 里就没有 search.js）');
+  ok(/const CACHE = 'navpuck-phone-v17'/.test(SW),
+     'sw.js 的缓存版本号 bump 到 v17（忘了的话手机上的 PWA 里就没有 search.js）');
   eq(scripts.filter((s) => !assets.includes(s)), [],
      'index.html 里的每个 <script> 都在 sw.js 的预缓存清单里');
   const i_s = scripts.indexOf('search.js');

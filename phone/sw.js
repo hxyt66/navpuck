@@ -124,8 +124,19 @@
  *        位置 → 导航起点 → 地图中心"，都没有时照搜，但界面如实写"未按位置排序"。
  *        ⚠️ 第十四次同样的坑：不 bump，手机上的 PWA 里没有 search.js，
  *        搜索那一栏会一直显示"搜索模块没加载成功"。
+ *    v17：修复"打包部署下底图永远空白"。tiles.js 的 load_root() 在从
+ *        IndexedDB 恢复 root 时漏设 pack_z，于是 pack_z 停在 0（被当成散块
+ *        部署），拿 z14 的坐标去比打包索引的 z10 范围 → 每块都判成"超出发布
+ *        范围" → 全部标 absent → 永远不下瓦片。真机症状是地图一直空白且
+ *        重启不自愈。
+ *        ⚠️ **第十五次同样的坑，而且这次是我自己踩的**：改完 tiles.js 直接
+ *        重建 APK 装进手机，忘了 bump 这一行 —— 结果 Service Worker 继续发
+ *        navpuck-phone-v16 缓存里的**旧 tiles.js**（实测 51,247 B、不含新加的
+ *        _adopt_root），修复在包里但从没被执行，真机上症状一模一样。
+ *        诊断靠 DevTools 协议读 caches.keys() + 比对缓存内文件内容才看出来。
+ *        **凡是动了 ASSETS 里的文件，这一行必须一起改。**
  */
-const CACHE = 'navpuck-phone-v16';
+const CACHE = 'navpuck-phone-v17';
 
 // 仅预缓存本应用自身的静态资源
 const ASSETS = [

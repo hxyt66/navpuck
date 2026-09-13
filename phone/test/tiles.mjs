@@ -1252,6 +1252,161 @@ await (async () => {
        '问包里**没有**的那一块 -> 返回 null（不是抛，也不是给错块）');
   }
 })();
+
+// ===========================================================================
+section('10] 索引缓存分支：pack_z 必须和 root 一起被采用（真机踩过的坑）');
+// ===========================================================================
+//
+// 这一节补的是一个**只有真机才暴露**的 bug（父 agent 现场抓的）：
+//
+//   load_root() 从 IndexedDB 恢复缓存索引那条分支**只设了 this.root，漏了
+//   pack_z**，而且缓存新鲜就提前 return —— 后面那句从网络索引里赋 pack_z
+//   根本执行不到。于是 pack_z 停在 0（= 散块部署）：
+//
+//       _container_xy() 按 z14 算坐标
+//         -> root_covers() 拿 z14 的 x（13809）去比**打包索引**的 z10 范围
+//            （xr=[720,895]）
+//         -> 每一块都判成"超出发布范围" -> 全塞进 absent -> 永远不下瓦片
+//
+//   真机症状：地图面板空白、"本地瓦片 0/20 块"、不报错、fetch 与 CORS 全正常、
+//   重启 App 也不自愈。定位靠的是 `pack_z=0` + `absent=20` 这两个内部量。
+//
+// ⚠️ **为什么原来七套自测全绿却漏了它**：Node 里没有真 IndexedDB，
+//    `this.db` 为 null，**整条缓存分支被跳过**，pack_z 每次都从新取的索引里
+//    正确赋值 —— 又是一次"假依赖比真依赖宽松"。
+//    所以这一节**必须**用假 IndexedDB 把那条分支真的走一遍。
+await (async () => {
+  const Z = 14;
+  const PZ = 10;
+  const LAT = 41.8057, LON = 123.4315;
+  const HERE = TL.tile_of(LAT, LON, Z);
+
+  // 一片打包站点：骑手脚下 3×3 块，塞进 z10 包
+  const loose = {};
+  const ids = [];
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      const x = HERE.x + dx, y = HERE.y + dy;
+      const id = TL.tile_id(Z, x, y);
+      ids.push(id);
+      loose[`https://t/${id}.npt`] = mk_tile(Z, x, y, [
+        [0, dm_of([[dx * 100, dy * 100], [dx * 100 + 60, dy * 100 + 60]])],
+      ]);
+    }
+  }
+  Object.assign(loose, site_files(Z, ids));
+  const packed = pack_site(loose, Z, PZ);
+  const root_j = JSON.parse(packed.files['https://t/index.json']);
+  eq(root_j.pack, PZ, `（前置）打包站点的 index.json 里有 pack=${PZ}`);
+
+  /** 造一个 store，并往它的（假）IndexedDB 里**真的**写一份 root 缓存。 */
+  async function seeded_store(cached_j, cached_t, now_s) {
+    const idb = new FakeIdb();
+    const site = fake_site(packed.files);
+    const st = new TL.TileStore({
+      fetch: site, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: idb, now: () => now_s,
+    });
+    // ⭐ 用**真实的** TileDb 写路径种缓存（不是往假实现里塞内部结构），
+    //    所以这条 CoTest 覆盖的是 load_root -> meta_get 的真实代码路径。
+    await st.db.meta_put('root', { t: cached_t, j: cached_j });
+    return { st, site, idb };
+  }
+
+  // ---- 10a) 缓存新鲜：走缓存分支，pack_z 必须从缓存里被采用 ----
+  {
+    const now = 100000;
+    const { st, site } = await seeded_store(root_j, now - 10, now);
+    const r = await st.load_root(false);
+    ok(!!r, 'load_root(false) 从缓存里拿到了索引');
+    eq(st.root_state, 'ok', 'root_state = ok');
+    eq(st.pack_z, PZ, `⭐ 缓存分支也拿到了 pack_z=${PZ}（修复前这里是 0）`);
+    eq(st.index_level(), PZ, `index_level() = ${PZ}（覆盖索引按**包**的层级取列）`);
+    eq(site.log.length, 0, '缓存新鲜时**一个网络请求都没有**（连 index.json 都不取）');
+
+    // 下游后果：容器坐标必须是 z10 那一套，并且在发布范围之内
+    const cid = st.container_id(TL.tile_id(Z, HERE.x, HERE.y));
+    eq(cid.split('/')[0], String(PZ), `container_id 用的是 z${PZ} 坐标（${cid}）`);
+    const xy = st._container_xy(TL.tile_id(Z, HERE.x, HERE.y));
+    eq(st.root_covers([xy[0]], [xy[1]]), true,
+       '⭐ 按容器坐标查发布范围 -> 在范围内（修复前这里恒为 false，于是每块都被标 absent）');
+  }
+
+  // ---- 10b) 反向：缓存里没有 pack 字段 -> 散块部署，不能误判成打包 ----
+  {
+    const now = 100000;
+    const no_pack = Object.assign({}, root_j);
+    delete no_pack.pack;
+    const { st } = await seeded_store(no_pack, now - 10, now);
+    await st.load_root(false);
+    eq(st.pack_z, 0, '缓存里没有 pack 字段 -> pack_z = 0（散块部署，不许当打包）');
+    eq(st.index_level(), Z, `散块部署的索引层级 = zoom = z${Z}`);
+    eq(st.container_id(TL.tile_id(Z, HERE.x, HERE.y)),
+       TL.tile_id(Z, HERE.x, HERE.y), '散块部署时容器就是这块瓦片自己');
+    // 非法 pack（>= zoom / 0 / 不是数字）也一律当散块
+    for (const bad of [0, 14, 20, '10', null]) {
+      const j = Object.assign({}, root_j, { pack: bad });
+      const s2 = await seeded_store(j, now - 10, now);
+      await s2.st.load_root(false);
+      eq(s2.st.pack_z, 0, `pack=${JSON.stringify(bad)} 是非法值 -> pack_z = 0`);
+    }
+  }
+
+  // ---- 10c) 缓存过期：先采用缓存的 pack_z，再去网络刷新 ----
+  {
+    const now = 100000;
+    const { st, site } = await seeded_store(root_j, now - (TL.INDEX_MAX_AGE_S + 10), now);
+    await st.load_root(false);
+    eq(st.pack_z, PZ, '过期缓存也会先被采用（至少下次不会用错层级）');
+    ok(site.log.some((u) => /index\.json$/.test(u)), '缓存过期时**真的**去重新取了 index.json');
+    eq(st.pack_z, PZ, '刷新之后 pack_z 仍然是 10（网络索引也是打包部署）');
+
+    // 网络索引变了（散块了）：必须以网络的为准，不能停在缓存的 10
+    const loose_site = fake_site(Object.assign(site_files(Z, ids), {}));
+    const st2 = new TL.TileStore({
+      fetch: loose_site, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: new FakeIdb(), now: () => now,
+    });
+    await st2.db.meta_put('root', { t: now - (TL.INDEX_MAX_AGE_S + 10), j: root_j });
+    await st2.load_root(false);
+    eq(st2.pack_z, 0,
+       '⭐ 上游从打包改成散块之后，过期缓存的 pack_z 会被**网络索引**纠正回 0');
+  }
+
+  // ---- 10d) 症状级回归：缓存分支拿到 pack_z 之后，这一带**真的下得下来** ----
+  {
+    const now = 100000;
+    const { st, site } = await seeded_store(root_j, now - 10, now);
+    const r1 = await st.load_area(LAT, LON, 800);
+    await settle(st);
+    const r2 = await st.load_area(LAT, LON, 800);
+    eq(r2.have.length > 0, true,
+       `⭐ 缓存分支 -> load_area 真的拿到了 ${r2.have.length} 块（真机上这里是 0）`);
+    eq(st.absent.size, 0,
+       '⭐ absent = 0（修复前是 20：每块都被误判成"超出发布范围"）');
+    ok(r2.ways.length > 0, `解出 ${r2.ways.length} 段路网（地图上就是这些线）`);
+    eq(st.packs_done > 0, true, `真的下了 ${st.packs_done} 个 .npk 包`);
+    ok(site.log.some((u) => /\.npk$/.test(u)), '网络请求里确实有 .npk（走的是打包路径）');
+
+    // ---- 反例：把 pack_z 打回 0 = **修复前**的行为，同一片区域就一块都下不来 ----
+    //      （这条不是"测着玩"：它就是真机上"地图永远空白"的最小复现）
+    const { st: st_bad, site: site_bad } = await seeded_store(root_j, now - 10, now);
+    await st_bad.load_root(false);
+    eq(st_bad.pack_z, PZ, '（前置）修复后的代码拿到 10');
+    st_bad.pack_z = 0;                       // 模拟修复前：漏设 pack_z
+    st_bad._cols.clear();
+    const rb = await st_bad.load_area(LAT, LON, 800);
+    await settle(st_bad);
+    eq(rb.have.length, 0, '（反例）pack_z=0 时一块都拿不到 —— 真机症状的最小复现');
+    ok(st_bad.absent.size > 0,
+       `（反例）而且 ${st_bad.absent.size} 块被误标成"上游没有"（absent）—— ` +
+       '就是真机上 absent=20 的来路');
+    eq(rb.coverage, 'none',
+       '（反例）覆盖被判成 none —— 界面于是告诉用户"这一带没有离线瓦片"，' +
+       '而瓦片其实好端端地发布着');
+  }
+})();
+
 end_sections();
 
 // ===========================================================================
