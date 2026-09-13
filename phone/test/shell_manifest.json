@@ -1,0 +1,23 @@
+{
+  "note": "被 sw.js 预缓存的文件的 sha256。⚠️ 改了它们中的任何一个，就必须让 CACHE 版本号一起变 —— 跑 `node phone/test/sw_cache.mjs --fix` （它会 bump sw.js 里那一行并重写本文件）。",
+  "cache": "navpuck-phone-v23",
+  "files": {
+    "index.html": "b3409ecb3cb12fe6b873a0a53db2ca0b8abc86267dba12244aac54014af402c7",
+    "style.css": "5ace4239a84cad81541c0d549a5d612d13b8dca3b46f10c86057ad18afa0a321",
+    "manifest.webmanifest": "29ae551f8ee31ecda492d8579bf8f5dc165aa3dbd8a4cc45c3f69e986446ae82",
+    "icon.svg": "9f6850da943ad0fa39ef0dbc58fa593c5e22b5df30c3dc244bfaf89db7601d0d",
+    "crashlog.js": "38239e2c19bd1643134fea6c7f414c2bf6a6b19f0e2ae5c91161b82292b32b76",
+    "navmath.js": "213a840e5814c4ba2662c51c828f8887c6b17a198db68cc3d004c14b583b07f9",
+    "proto.js": "eb5aa986e8df970bd816f35ae8d99078d0435bcd4433915db60c261f1bd33b76",
+    "route.js": "0c82238ce1f04e18eb12954658be71660f4454b2ba4a16b2f96efb170860ce1b",
+    "tiles.js": "aef7c6f8fadea3fea9c3b189d1cec18cd173859e2bcbfb9f06b30f8f5f87a2df",
+    "map.js": "984f46250f725b683ddf750af376bb08a6c9e87af5e5de4ae5e6aea49a2eebe1",
+    "mapview.js": "83c229ffbfd845bcdb0ed4a90c92c4325ded2f98cf6c1816fc1282bf6dc28cae",
+    "search.js": "8a95ed46d3102e25727b7c8b3202ae3905d84836a8603fe63b5e8ec8637d1fa9",
+    "ble_native.js": "ad3032b24271f8b3e405def2df3a209e30ba4931317e253def3727caec33e7da",
+    "ble.js": "f819db68078de4d2dec141e80ed43263ddc5b3ec5f0f6114daf8c52a7e19b547",
+    "fgs.js": "767910729a2eeda58cd47736fd6a9f404dcca86435ed11af03846837fe00f03c",
+    "fgs_ui.js": "054525e47c0c564f96f963cc464aa4b233bba1610d75c918b0514a7a85d0d138",
+    "app.js": "456f43e5b98e98f49dbd31a69efd2b84a8a44e5c7e9b2d1f054cdad7dfcc1de4"
+  }
+}

@@ -37,13 +37,16 @@ phone/
     ├── selftest.mjs        字节级自测（黄金向量，320 项）
     ├── parity.mjs          Python ↔ JS 行为对拍（161 项，需要有 python）
     ├── pyref.py            对拍用的 Python 参考实现（由 parity.mjs 调用）
-    ├── tiles.mjs           离线瓦片自测（129 项，含真起 python 的格式对拍）
-    ├── mapview.mjs         手机端地图自测（243 项：投影/边界/**离线**/手势/DPI/性能）
+    ├── tiles.mjs           离线瓦片自测（158 项，含真起 python 的格式对拍 + 索引缓存的 pack_z）
+    ├── mapview.mjs         手机端地图自测（309 项：投影/边界/离线/取瓦片/手势/DPI/性能）
     ├── pngctx.mjs          自测用的软件 Canvas 替身 + PNG 编码（只有 mapview.mjs 用）
     ├── search.mjs          地点搜索自测（156 项：偏置/文案区分/点选/竞态，**不联网**）
+    ├── sw.mjs              Service Worker 自测（96 项：预缓存/缓存优先/**版本自检**）
+    ├── sw_cache.mjs        预缓存清单的守卫 + 修（`--fix`）；被 sw.mjs 调用，也能单独跑
+    ├── shell_manifest.json 被预缓存文件的 sha256（和 CACHE 版本号绑成一个不变式）
     ├── integration.mjs     BLE/主循环集成自测（333 项，全伪造、不联网）
-    ├── ui.mjs              index.html ↔ app.js 界面接线自测（452 项，DOM 打桩）
-    └── run-all.mjs         一次跑齐上面七套
+    ├── ui.mjs              index.html ↔ app.js 界面接线自测（456 项，DOM 打桩）
+    └── run-all.mjs         一次跑齐上面八套
 ```
 
 ★ = 与 Python 有对应关系的移植文件。**没有构建步骤、没有 npm、没有框架**：
@@ -53,12 +56,13 @@ phone/
 
 ```bash
 cd <navpuck 根目录>
-node phone/test/run-all.mjs          # 七套一起跑，任一套失败则非 0 退出
+node phone/test/run-all.mjs          # 八套一起跑，任一套失败则非 0 退出
 node phone/test/selftest.mjs         # 只跑字节级
 node phone/test/parity.mjs           # 只跑 Python 对拍（需要 python 在 PATH 里）
 node phone/test/tiles.mjs            # 只跑离线瓦片
 node phone/test/mapview.mjs          # 只跑手机端地图
 node phone/test/search.mjs           # 只跑地点搜索
+node phone/test/sw.mjs               # 只跑 Service Worker / 版本一致性
 node phone/test/integration.mjs      # 只跑集成
 node phone/test/ui.mjs               # 只跑界面接线
 ```
@@ -69,15 +73,16 @@ node phone/test/ui.mjs               # 只跑界面接线
 NAVPUCK_SEARCH_LIVE=1 node phone/test/search.mjs     # PowerShell: $env:NAVPUCK_SEARCH_LIVE="1"
 ```
 
-七套各管一段，缺一不可：
+八套各管一段，缺一不可：
 
 | 套件 | 管什么 | 抓得到的典型问题 |
 |---|---|---|
 | `selftest.mjs` | 字节级 | 字段顺序、CRC、分片边界、解析器重同步 |
 | `parity.mjs` | 与 `navigator.py` 的语义 | 取整方式、投影、路口下标、视野值 |
-| `tiles.mjs` | 离线瓦片 | `.npt`/`.npk` 格式理解错、缓存没落盘、有瓦片还去问 Overpass |
-| `mapview.mjs` | 手机端地图 | 投影算错（车画在路外面）、跨 180°、离线画不出来、手势/DPI 弄错 |
+| `tiles.mjs` | 离线瓦片 | `.npt`/`.npk` 格式理解错、缓存没落盘、**索引缓存里漏设 `pack_z`**、有瓦片还去问 Overpass |
+| `mapview.mjs` | 手机端地图 | 投影算错（车画在路外面）、跨 180°、离线画不出来、手势/DPI 弄错、**视野太大时疯狂要瓦片** |
 | `search.mjs` | 地点搜索 | 没带位置偏置（搜到别的省）、"没找到"和"失败"说成同一句、点选了却没用上、过期响应覆盖新结果 |
+| `sw.mjs` | Service Worker / 版本一致性 | **改了被预缓存的文件却忘了 bump `CACHE`**（"代码改了、手机上还是老样子"）、离线回退被弄坏、新版本不自愈 |
 | `integration.mjs` | 接线 | 分片降档、队列丢谁、30 秒重发、看门狗、端到端闭环 |
 | `ui.mjs` | `index.html` ↔ `app.js` | id 拼错、按钮没绑上、初始化崩、面板没更新 |
 
@@ -361,9 +366,25 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
    `Navigator._to_local`）。所以**地图上量到的距离和导航算出来的距离是同一个数**。
    地图固定**北朝上**（不跟车头转）：静止找路时车头朝上的地图会自己乱转，更难读；
    朝向由车标箭头表达。（设备那块圆屏是车头朝上的 —— 那是另一个使用场景。）
-3. **这一层一个网络请求都不发**。路网只来自已经缓存过的离线瓦片和 `OsmMapSource`
-   手上那份数据。所以"骑到没信号的地方地图还在"是**结构**决定的，不是承诺 ——
-   `mapview.mjs` 第 4 节用一个"只会抛错的 fetch"把这件事钉死（fetch 调用次数必须为 0）。
+3. **地图自己按视野取瓦片，但绘制的那一帧永远不等网络**。视野停稳之后
+   （三道闸门：移动 120 m / 1.5 s / 范围涨 30%）对当前视野中心调
+   `TileStore.load_area()` —— 先本地、缺的**排进下载队列**；块到了由 `on_change`
+   通知地图重画。**没有这一条，用户不先开始导航就只能看到一张空地图**（瓦片原来
+   只在导航过程中由 `map.js` 下载）—— 真机上就是这么发现的。
+   离线（`navigator.onLine === false`）时只读本地、**一个请求都不发**；
+   弱网下画图那一帧也只用本地已经解出来的数据，所以"骑到没信号的地方地图还在"
+   仍然是**结构**决定的（`mapview.mjs` 第 4 节用一个"只会抛错的 fetch"钉着它）。
+
+   ⚠️ 取数**有上界**，这也是真机抓出来的：地图被缩到 z7（视野跨度约 140 km）时，
+   `tiles_for_area()` 会生成 **4489 块** z14 瓦片（真机日志原话
+   `这一带缺 19 块瓦片…（本地已有 1581/4489 块）`），再往下就是"把全国 583,973 块
+   下到手机里"。现在半径夹到 4 km（z14 下约 25 块），视野跨度 > 12 km 时
+   只读本地不排下载，界面上写"视野太大：放大后才补瓦片"。
+
+   ⚠️ 另外，下载在**打包部署**下是按 z10 整包取的（一个包 ≈ 1.2 MB / 覆盖
+   30 km × 30 km），所以"打开地图"在数据上大约是一次 1~4 MB 的量级，
+   之后同一片区域就全离线了 —— 这是 `tiles.js` 里"整包缓存"那个决定的代价，
+   不是这一层引入的。
 
 界面与手势：
 
@@ -528,7 +549,7 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
 `proto.js` / `navmath.js` 的任何改动，都要：
 
 ```bash
-node phone/test/run-all.mjs       # 六套全跑，必须全绿
+node phone/test/run-all.mjs       # 八套全跑，必须全绿
 python tools/selftest.py          # PC/C++ 侧没被搞坏，必须 50/50
 ```
 
@@ -542,21 +563,39 @@ python tools/navpuck_proto.py --selfcheck
 python tools/selftest.py
 ```
 
-### 改了 `phone/` 里任何一个**被预缓存的文件**之后
+### 改了 `phone/` 里任何一个**被预缓存的文件**之后（这个坑踩了十五次）
 
 `sw.js` 的 `ASSETS` 清单里那些文件（`index.html` / `style.css` / `app.js` /
 `proto.js` / `navmath.js` / `route.js` / `tiles.js` / `map.js` / `mapview.js` /
 `search.js` / `ble.js` / `ble_native.js` / `fgs.js` / `fgs_ui.js` /
-`manifest.webmanifest` / `icon.svg`）改完，**必须**把 `sw.js` 顶部的
-`CACHE` 版本号 +1（当前是 `navpuck-phone-v16`）。Service Worker 是**缓存优先**的：
-版本号不变，手机上的 PWA 会一直吃旧副本，症状是"代码明明改了、手机上还是老样子"——
-而且因为改动本身没生效，用户根本看不出是缓存问题。
+`manifest.webmanifest` / `icon.svg`）改完，**必须**让 `sw.js` 顶部的 `CACHE`
+版本号跟着变。Service Worker 是**缓存优先**的：版本号不变，手机上的 PWA（和 APK）
+会一直吃旧副本，症状是"代码明明改了、手机上还是老样子"——**而且看起来像没修**。
+
+这件事**踩了十五次**，而且每次都很贵：最近一次是改完 `tiles.js` 直接重建 APK，
+真机上跑的还是缓存里那一份旧文件（实测 51,247 B、不含新函数），网络/CORS/IndexedDB
+全都正常，最后是靠 DevTools 协议读 `caches.keys()` 逐个比对字节才定位到的。
+
+所以现在**不靠人记得**了，两道防线都装上：
+
+| 防线 | 什么时候生效 | 怎么用 |
+|---|---|---|
+| **测试期**：`phone/test/shell_manifest.json` 记着每个被预缓存文件的 sha256，和 `CACHE` 绑成一个不变式 | 跑自测时（**最早**能发现的地方） | 直接跑 `node phone/test/run-all.mjs`；红了就照着提示跑 `node phone/test/sw_cache.mjs --fix`（它会 bump 版本号 + 重写清单，一步到位） |
+| **运行时**：Service Worker 自己核对"缓存里的字节 vs 线上的字节"（版本自检） | 任何人**都不记得**的时候 | 页面在 `init()` 末尾问一句；不一样就整体更新缓存 + 在**没在导航、蓝牙没连着**的时候自动刷新。另外 SW 在 `activate` 里也会把跑着旧代码的页面顶掉重载一次（**自举那一环**：旧代码里没有"问一句"这回事，只能由 SW 来干） |
+
+⚠️ 两条**都不会动"缓存优先"这条服务策略**：自检是后台的、失败就忽略、离线照旧从
+缓存起来。**故意没做** "JS/CSS 走 network-first" —— 弱网下脚本请求会一直挂着等
+（可能几十秒），而缓存优先是立刻起来；摩托车的场景恰恰是"信号时有时无"，
+而且 network-first 还会造出"新 app.js + 旧 index.html"的版本错配。
+
+当前版本号**不要在这里写死**：以 `sw.js` 里那一行和 `phone/test/shell_manifest.json`
+为准，`node phone/test/sw_cache.mjs` 会校验两者一致（`phone/test/sw.mjs` 第 1 节也钉着）。
 
 ⚠️ **新加的文件也必须进 `ASSETS`**：不进清单的话，离线打开 PWA 时那个文件取不到
 （`fgs.js` / `fgs_ui.js` 就这么漏过一次；`mapview.js` 漏了的话症状是
 "手机上地图那一块整个缺失"，而它恰恰是**最需要离线可用**的东西；
 `search.js` 漏了的话搜索那一栏会一直写"搜索模块没加载成功"）。
-
-`phone/test/mapview.mjs` 第 1 节会核对"`index.html` 里的每个 `<script>` 都在
-`sw.js` 的 `ASSETS` 里"，以及缓存版本号是不是当前这个值 —— 忘了改会被自测抓住
-（`phone/test/search.mjs` 第 4 节同样钉了一遍）。
+`phone/test/mapview.mjs` / `search.mjs` / `sw.mjs` 都会核对
+"`index.html` 里的每个 `<script>` 都在 `sw.js` 的 `ASSETS` 里"。
+（`sw.js` **自己**不在 `ASSETS` 里 —— 浏览器每次导航都会按字节比对它，
+所以改了 `sw.js` 不需要 bump 任何东西。）

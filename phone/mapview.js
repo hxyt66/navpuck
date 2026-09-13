@@ -175,12 +175,27 @@
   // 单位是 **CSS 像素**，所以高 DPI 下这个阈值不会跟着 DPR 放大。
   const MIN_STEP_PX = 0.7;
 
-  // 重取这一带的最小间隔（毫秒）与最小移动距离（米）。见 _refresh_area。
+  // 取这一带的最小间隔（毫秒）与最小移动距离（米）。见 _refresh_area。
   const LOCAL_MIN_PERIOD_MS = 1500;
   const LOCAL_MIN_MOVE_M = 120.0;
   // 取本地瓦片的半径 = 视图对角半径 × 这个系数 + 这点余量（米）。
   const LOCAL_RADIUS_K = 1.15;
   const LOCAL_RADIUS_PAD_M = 250.0;
+
+  // ⚠️⚠️ 取数的**上界**：这两个数是真机上抓出来的，不是拍脑袋。
+  //
+  // 现场：地图被拖/缩到 z7 左右（视野跨度约 140 km）时，
+  // `tiles_for_area(视野半径)` 会生成 **4489 块** z14 瓦片，然后
+  //   · `local_area` 为每一块查一次 IndexedDB（每次刷新 4489 次！），
+  //   · `load_area` 还会把缺的排进下载队列 —— 全国 583,973 块，
+  //     照着这个路子下去就是"把整个中国下到手机里"。
+  // 真机日志原话：`这一带缺 19 块瓦片，已在后台排队（本地已有 1581/4489 块）`。
+  //
+  // 所以：半径先**夹住**（一次最多要 4 km 一圈，z14 下约 25 块），
+  // 视野再大就**只读本地、不排下载**（放大到街区尺度才会补）。
+  // 我们有数据的只有 z14 街道级瓦片，"缩到看全省"本来就不是它的用场。
+  const LOAD_MAX_RADIUS_M = 4000.0;
+  const LOAD_MAX_VIEW_SPAN_M = 12000.0;
 
   // 每帧的最小间隔（毫秒）：5Hz。真机上再快也没有意义（位置本身就是 1~10Hz、
   // 屏幕也就那么大），而 5Hz 的重画在省电上明显好于"每个 on_ui 都重画"。
@@ -489,6 +504,7 @@
       this.local_loads = 0;
       this.local_errors = 0;
       this.area_loads = 0;         // 走了几次**联网**那条路（诊断/自测读）
+      this._last_log_key = '';     // 日志去重（见 _log_once）
       this.tiles_stats = null;     // 最近一次 on_tiles_changed 带上来的下载记账
 
       // 手势状态
@@ -593,11 +609,34 @@
       } catch (_e) { return null; }
     }
 
-    /** 要读多大一圈本地瓦片（米）：视图对角半径 × 系数 + 余量。 */
+    /**
+     * 要读多大一圈本地瓦片（米）：视图对角半径 × 系数 + 余量，**并且夹住上界**
+     * （见 LOAD_MAX_RADIUS_M：不夹的话缩到省级就是几千块瓦片）。
+     */
     load_radius_m() {
       const v = this.view;
       if (!v) return 0;
-      return Math.hypot(v.w, v.h) * 0.5 * v.mpp * LOCAL_RADIUS_K + LOCAL_RADIUS_PAD_M;
+      const r = Math.hypot(v.w, v.h) * 0.5 * v.mpp * LOCAL_RADIUS_K + LOCAL_RADIUS_PAD_M;
+      return Math.min(r, LOAD_MAX_RADIUS_M);
+    }
+
+    /** 视野是不是已经大到"要这一带的瓦片没有意义"（这时候只读本地、不排下载）。 */
+    area_too_wide() {
+      const v = this.view;
+      if (!v) return true;
+      return Math.hypot(v.w, v.h) * v.mpp > LOAD_MAX_VIEW_SPAN_M;
+    }
+
+    /**
+     * 同一句话连着重复就跳过（见 _refresh_area 里那两行日志的说明）。
+     * 用 key 而不是整句文本：数字一直在变（"本地已有 3/25" -> "4/25"）时
+     * 仍然算"同一件事"，不该每变一次就打一行。
+     */
+    _log_once(key, msg) {
+      if (this._last_log_key === key) return false;
+      this._last_log_key = key;
+      this.log(msg);
+      return true;
     }
 
     /** 现在有没有网。默认读 navigator.onLine（拿不到就当有网 —— 多试一次不亏）。 */
@@ -632,12 +671,13 @@
       const v = this.view;
       if (!v || this._loading) return false;
       const offline = !this.is_online();
-      // 离线时**只用** load_local；没给 load_local 就退回 load_area
+      const wide = this.area_too_wide();
+      // 离线 / 视野太大 -> **只用** load_local；没给 load_local 就退回 load_area
       // （那种情况下 store 自己的 cooldown/absent 记账会挡住重复请求）。
-      const loader = offline ? (this.load_local || this.load_area)
-                             : (this.load_area || this.load_local);
+      const loader = (offline || wide) ? (this.load_local || this.load_area)
+                                       : (this.load_area || this.load_local);
       if (!loader) return false;
-      const use_network = !offline && (loader === this.load_area);
+      const use_network = !offline && !wide && (loader === this.load_area);
 
       const now = this._now_ms();
       const moved = this._load_at
@@ -671,11 +711,23 @@
             downloading: Number.isFinite(res.downloading) ? res.downloading : 0,
             offline: offline,
             network: use_network,
+            too_wide: wide,
           };
           this.local_loads += 1;
+          // ⚠️ 这两行日志**必须去重**：`on_tiles_changed` 会让"读一次"越过闸门，
+          //    而一次连线里几十块瓦片陆续到货 -> 每块都触发一次读 -> 每块都打一行，
+          //    真机上实测刷到 ~60 行/秒（日志面板和崩溃黑匣子都被它灌满）。
+          //    只在**状态真的变了**的时候打（同一句话连着重复就跳过）。
           if (this.local.downloading > 0) {
-            this.log(`[mapview] 这一带缺 ${this.local.downloading} 块瓦片，已在后台排队` +
-                     `（本地已有 ${this.local.have}/${this.local.need} 块）`);
+            this._log_once('dl' + this.local.downloading + '/' + this.local.have,
+              `[mapview] 这一带缺 ${this.local.downloading} 块瓦片，已在后台排队` +
+              `（本地已有 ${this.local.have}/${this.local.need} 块）`);
+          }
+          if (wide && !offline) {
+            this._log_once('wide',
+              '[mapview] 视野太大（跨度 > ' +
+              `${(LOAD_MAX_VIEW_SPAN_M / 1000).toFixed(0)}km）：这一轮只读本地、` +
+              '不排下载（我们的瓦片是 z14 街道级，放大才补）');
           }
           this.invalidate();
         })
@@ -1116,7 +1168,8 @@
         if (dl > 0) text += ` · 补${dl}`;
       }
       const line2 = snap.follow ? '跟随当前位置' : '自由查看（点「回到当前位置」）';
-      const line3 = loc.offline ? '离线：只画已缓存的路网' : '';
+      const line3 = loc.offline ? '离线：只画已缓存的路网'
+        : (loc.too_wide ? '视野太大：放大后才补瓦片' : '');
       const h = line3 ? 36.0 : 26.0;
       const wpx = Math.max(this._text_w(g, text, 10.5), this._text_w(g, line2, 10.5),
                            this._text_w(g, line3, 9.5)) + 12.0;
@@ -1187,6 +1240,7 @@
       const parts = [
         cov,
         dl > 0 ? `正在下 ${dl} 块` : '',
+        loc.too_wide ? '视野太大（放大后才补瓦片）' : '',
         `${this.stats.drawn_segs} 段 / ${this.stats.pts} 点`,
         this.follow ? '跟随中' : '自由查看',
         v ? `z${v.zoom.toFixed(1)} · ${v.mpp.toFixed(2)} m/像素` : '',
@@ -1354,6 +1408,7 @@
     ROAD_STYLE, ROAD_STYLE_FALLBACK, ROUTE_COLOR, ROUTE_WIDTH, POS_COLOR, BG,
     WIDTH_BASE_ZOOM, MIN_STEP_PX, MIN_PERIOD_MS,
     LOCAL_MIN_PERIOD_MS, LOCAL_MIN_MOVE_M, LOCAL_RADIUS_K, LOCAL_RADIUS_PAD_M,
+    LOAD_MAX_RADIUS_M, LOAD_MAX_VIEW_SPAN_M,
     _pos_of, _lon_within, _seg_bbox,
   };
 }));

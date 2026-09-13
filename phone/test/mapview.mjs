@@ -415,16 +415,15 @@ section('1] 地图真的被接进 index.html / sw.js / style.css');
   ok(i_det > 0 && i_map < i_det, '地图在所有折叠面板（<details>）之前 —— 不会被折叠起来');
   ok(i_map < i_grid, '地图排在"实时状态"数字面板之前（用户第一眼看到的是地图）');
 
-  // Service Worker：新文件必须进预缓存清单，而且缓存版本号必须 +1 ——
-  // 不然手机上（缓存优先）永远吃不到这一版。
+  // Service Worker：新文件必须进预缓存清单
   const assets = [...SW.matchAll(/^\s*'([a-z_]+\.js)',?$/gm)].map((m) => m[1]);
   ok(assets.includes('mapview.js'), 'sw.js 的预缓存清单里有 mapview.js');
-  // ⚠️ 这个版本号每加一个被预缓存的文件就要 +1（v15 加 mapview.js，v16 加 search.js，
-  //    v17 修 tiles.js 的 pack_z bug —— 那次改了文件却忘了 bump，SW 继续发旧副本，
-  //    修复在包里但从没执行过，真机症状和"没修"一模一样）。
-  //    故意写死在这里：忘了 bump，手机上的 PWA 会一直吃旧副本。
-  ok(/const CACHE = 'navpuck-phone-v17'/.test(SW),
-     'sw.js 的缓存版本号已经 bump 到 v17（不然手机上的 PWA 吃的是旧副本）');
+  // ⚠️ "版本号有没有跟着内容变"这件事**不在这一套里断言**：那是
+  //    phone/test/sw.mjs 的事（它用 `shell_manifest.json` 的内容哈希来判，
+  //    比在这里写死一个 vNN 可靠得多 —— 写死的话每加一个文件都要改两处，
+  //    而"改了两处但漏了第三处"正是历史上反复出问题的模式）。
+  ok(/const CACHE = 'navpuck-phone-v\d+'/.test(SW),
+     'sw.js 的 CACHE 名字符合 navpuck-phone-v<数字>（一致性守卫见 phone/test/sw.mjs）');
   const needed = scripts.filter((s) => s !== 'mapview.js');
   eq(needed.filter((s) => !assets.includes(s)), [],
      'index.html 里的每个 <script> 都在 sw.js 的预缓存清单里');
@@ -1122,6 +1121,108 @@ await (async () => {
     ok(ctx.texts().some((s) => /离线/.test(s)), '角标上写着"离线"（用户知道这是缓存里的）');
   }
 
+  // ---- 4b-6) ⭐ 视野太大时必须**停下来**（真机上抓到的：缩到省级会要 4489 块）----
+  //
+  //  真机日志原话：`这一带缺 19 块瓦片，已在后台排队（本地已有 1581/4489 块）`。
+  //  那时候地图被拖/缩到了 z7 左右（视野跨度约 140 km）。不夹住的话：
+  //    · `local_area` 每次刷新查 4489 次 IndexedDB；
+  //    · `load_area` 会照着 583,973 块全国瓦片的路子往下排下载。
+  {
+    const wide_view = MV.make_view({ lat: LAT, lon: LON, zoom: 7, w: 240, h: 240 });
+    const ctxw = new RecCtx();
+    const site = fake_site(Z, ids, undefined, 0);
+    Object.assign(site.files, site_files);
+    const store = new TL.TileStore({
+      fetch: site, bases: ['https://t/'], storage: fake_storage(),
+      indexedDB: null, now: () => 1000, now_ms: () => 1000000,
+    });
+    let area_calls = 0;
+    let local_calls = 0;
+    const mv = new MV.MapView(null, {
+      ctx: ctxw, w: 240, h: 240, center: [LAT, LON], zoom: 7,
+      now_ms: () => 1000000, online: () => true,
+      load_area: (a, b, r) => { area_calls += 1; return store.load_area(a, b, r); },
+      load_local: (a, b, r) => { local_calls += 1; return store.local_area(a, b, r); },
+    });
+    mv.view = MV.make_view(wide_view);
+    ok(mv.area_too_wide(), 'z7（跨度约 140 km）：判定为"视野太大"');
+    eq(mv.load_radius_m(), MV.LOAD_MAX_RADIUS_M,
+       `⭐ 半径被夹到 ${MV.LOAD_MAX_RADIUS_M} 米（不夹的话是几万米 -> 几千块瓦片）`);
+    // 夹住之后要的块数是**有界**的
+    const probe_store = new TL.TileStore({ bases: ['https://t/'], indexedDB: null });
+    const need_wide = probe_store.tiles_for_area(LAT, LON, mv.load_radius_m(), 0);
+    ok(need_wide.length <= 36,
+       `⭐ 夹住之后一次最多要 ${need_wide.length} 块（真机上没夹时是 4489 块）`);
+    MV.make_view({ lat: LAT, lon: LON, zoom: 8, w: 240, h: 240 });
+
+    mv.tick(true);
+    await sleep(30);
+    eq(area_calls, 0, '⭐ 视野太大时**不排下载**（一个网络请求都不发）');
+    eq(local_calls, 1, '而是只读本地（load_local）');
+    eq(mv.area_loads, 0, 'area_loads 仍然是 0');
+    eq(mv.local.too_wide, true, '结果里标了 too_wide=true（界面据此说明"放大后才补"）');
+    eq(site.log.length, 0, '确实一个网络请求都没发');
+    eq(store.packs_done, 0, '也没有下任何包');
+    ok(mv.status().detail.includes('视野太大'), `状态详情里写明了原因：${mv.status().detail}`);
+
+    // 对照：缩小到街区尺度（z16）之后，同一套东西就会去取
+    {
+      const near_view = MV.make_view({ lat: LAT, lon: LON, zoom: 16, w: 240, h: 240 });
+      const ctx2 = new RecCtx();
+      const site2 = fake_site(Z, ids, undefined, 0);
+      Object.assign(site2.files, site_files);
+      const store2 = new TL.TileStore({
+        fetch: site2, bases: ['https://t/'], storage: fake_storage(),
+        indexedDB: null, now: () => 1000, now_ms: () => 1000000,
+      });
+      let area2 = 0;
+      const mv2 = new MV.MapView(null, {
+        ctx: ctx2, w: 240, h: 240, center: [LAT, LON], zoom: 16,
+        now_ms: () => 1000000, online: () => true,
+        load_area: (a, b, r) => { area2 += 1; return store2.load_area(a, b, r); },
+        load_local: (a, b, r) => store2.local_area(a, b, r),
+      });
+      mv2.view = MV.make_view(near_view);
+      ok(!mv2.area_too_wide(), 'z16（街区尺度）：不算"视野太大"');
+      ok(mv2.load_radius_m() < MV.LOAD_MAX_RADIUS_M,
+         `z16 要的半径是 ${mv2.load_radius_m().toFixed(0)} 米（没被夹，就是视野真正需要的）`);
+      mv2.tick(true);
+      await sleep(5);
+      eq(area2, 1, '（对照）z16 时照常取瓦片');
+    }
+  }
+
+  // ---- 4b-7) 日志不能刷屏（真机上实测刷到 ~60 行/秒）----
+  //
+  //  现场：视野太大 + 一批瓦片陆续到货（每块都触发一次"越过闸门读一次"），
+  //  于是"视野太大…"那一行被打了 60 次/秒，把日志面板和崩溃黑匣子灌满 ——
+  //  它本身不是功能 bug，但会把真正有用的那几行淹掉。
+  {
+    const logs = [];
+    const wide_view = MV.make_view({ lat: LAT, lon: LON, zoom: 7, w: 240, h: 240 });
+    const store = new TL.TileStore({
+      fetch: async () => { throw new TypeError('不该联网'); },
+      bases: ['https://t/'], storage: fake_storage(), indexedDB: null,
+      now: () => 1000, now_ms: () => 1000000,
+    });
+    store.db = fake_db({});
+    const mv = new MV.MapView(null, {
+      ctx: new RecCtx(), w: 240, h: 240, center: [LAT, LON], zoom: 7,
+      now_ms: () => 1000000, online: () => true,
+      load_local: (a, b, r) => store.local_area(a, b, r),
+      log: (l) => logs.push(String(l)),
+    });
+    mv.view = MV.make_view(wide_view);
+    for (let i = 0; i < 30; i += 1) {
+      mv.on_tiles_changed(store);       // 假装 30 块瓦片陆续到货
+      mv.tick(true);
+      await sleep(2);
+    }
+    const wide_lines = logs.filter((l) => /视野太大/.test(l)).length;
+    eq(wide_lines, 1, `⭐ 同一句话只打了一次（实得 ${wide_lines} 次 / 30 次触发）`);
+    ok(logs.length <= 3, `日志总行数也被压住了（${logs.length} 行）`);
+  }
+
   // ---- 4b-5) 联网但网络全挂：不崩、不发疯（冷却 + absent 记账兜住）----
   {
     let calls = 0;
@@ -1452,10 +1553,13 @@ section('7] 渲染内容（记录型 ctx：图层、分组、抽稀、裁剪）'
     const c5 = new RecCtx();
     const mv5 = new MV.MapView(null, { w: 240, h: 240, ctx: c5, now_ms: () => 1000000 });
     mv5.view = MV.make_view({ lat: 30, lon: 120, zoom: 15, w: 240, h: 240 });
-    mv5.draw(c5, { view: mv5.view, ways: [], route: null, pos: null, source: 'none',
-                   local: { ways: [], have: 0, need: 4, coverage: 'unknown',
-                            downloading: 3, offline: false, network: true } });
+    // ⚠️ status() 读的是**这个视图自己的 local**（由取数回调写进去的），不是快照 ——
+    //    draw() 刻意是纯函数、不写自己的状态。所以这里要像取数回调那样把 local 填上。
+    mv5.local = { ways: [], have: 0, need: 4, coverage: 'unknown', reason: '',
+                  downloading: 3, offline: false, network: true };
     mv5.stats.source = 'none';
+    mv5.draw(c5, { view: mv5.view, ways: [], route: null, pos: null, source: 'none',
+                   local: mv5.local });
     eq(mv5.status().state, 'downloading', '正在下 3 块时状态是 downloading');
     eq(mv5.status().short, '下载中 3', '短状态写成"下载中 3"（用户知道等一下就好）');
     ok(/正在下 3 块/.test(mv5.status().detail), '详情里也有"正在下 3 块"');
@@ -1465,10 +1569,11 @@ section('7] 渲染内容（记录型 ctx：图层、分组、抽稀、裁剪）'
     const c6 = new RecCtx();
     const mv6 = new MV.MapView(null, { w: 240, h: 240, ctx: c6, now_ms: () => 1000000 });
     mv6.view = MV.make_view({ lat: 30, lon: 120, zoom: 15, w: 240, h: 240 });
-    mv6.draw(c6, { view: mv6.view, ways: [], route: null, pos: null, source: 'none',
-                   local: { ways: [], have: 0, need: 4, coverage: 'none',
-                            downloading: 0, offline: false, network: true } });
+    mv6.local = { ways: [], have: 0, need: 4, coverage: 'none', reason: '上游没有这一带',
+                  downloading: 0, offline: false, network: true };
     mv6.stats.source = 'none';
+    mv6.draw(c6, { view: mv6.view, ways: [], route: null, pos: null, source: 'none',
+                   local: mv6.local });
     eq(mv6.status().state, 'empty', '上游说没有时状态是 empty（不是 downloading）');
     eq(mv6.status().short, '暂无路网', '短状态是"暂无路网"');
   }
@@ -1695,7 +1800,8 @@ await (async () => {
     const area_ways = [[0, [[30.0, 120.0], [30.003, 120.003]]]];
     let on_change_prev = 0;
     const tiles = {
-      on_change: null,
+      // 假装这是 map.js 早就挂好的那个 on_change（tiles_dirty）
+      on_change: () => { on_change_prev += 1; },
       local_area(lat, lon, r) { return Promise.resolve({ ways: local_ways, have: ['a'], need: ['a', 'b'] }); },
       load_area(lat, lon, r) {
         area_args = [lat, lon, r];
@@ -1712,9 +1818,9 @@ await (async () => {
 
     // ⭐ on_change 必须**链式**接：map.js 自己也挂了一个（tiles_dirty），
     //    覆盖掉它 = 导航中底图不再跟着新瓦片更新，而且完全看不出来。
-    tiles.on_change = () => { on_change_prev += 1; };      // 假装这是 map.js 的
-    eq(app.mapview_watch_tiles(app.map_source), true, 'mapview_watch_tiles 接上了');
-    eq(app.mapview_watch_tiles(app.map_source), false, '幂等：第二次不再重复包一层');
+    eq(tiles._navpuck_mv_wrapper === tiles.on_change, true,
+       'mapview_load_area 顺手把 on_change 包了一层');
+    eq(app.mapview_watch_tiles(app.map_source), false, '幂等：接好之后不再重复包一层');
     let mv_tiles_hits = 0;
     const real_on_tiles = mv.on_tiles_changed.bind(mv);
     mv.on_tiles_changed = (st) => { mv_tiles_hits += 1; return real_on_tiles(st); };
@@ -1722,6 +1828,11 @@ await (async () => {
     eq(on_change_prev, 1, '⭐ map.js 原来那个 on_change 照样被调到（没有被覆盖掉）');
     eq(mv_tiles_hits, 1, '⭐ 地图那一份也被调到了（两边都要）');
     mv.on_tiles_changed = real_on_tiles;
+
+    // 万一别处把 on_change 换掉了：再调一次必须**重新包**，不能以为"接过了"
+    tiles.on_change = () => { on_change_prev += 1; };
+    eq(app.mapview_watch_tiles(app.map_source), true,
+       'on_change 被换掉之后再接一次会重新包一层（不是"以为接过了"把通知丢掉）');
 
     // 离线开关
     const desc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');

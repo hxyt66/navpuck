@@ -1500,6 +1500,11 @@
       this._search_last = null;
       this._search_fetch = null;
       this._search_picked = -1;
+      // Service Worker 版本自检（见 shell_check）：会不会刷、刷过没有、有没有
+      // 因为"正在导航"而押后。
+      this._sw_controller_hooked = false;
+      this._shell_reloaded = false;
+      this._shell_reload_pending = '';
       // 屏幕常亮（Screen Wake Lock）的持有者：懒创建，见 wake()
       this._wake = null;
       // 上一次画进状态面板的"循环/屏幕常亮"快照（只在变化时重画，见
@@ -2150,6 +2155,108 @@
       return true;
     }
 
+    // -- Service Worker 的"版本自检"（见 sw.js 顶部那一段）-------------------
+    //
+    // 那个"改了文件忘了 bump CACHE、手机上一直吃旧副本"的坑已经踩了十五次，
+    // 症状永远一样：**代码改了、手机上还是老样子**，而且看起来像没修。
+    // 这里配合 sw.js 的结构性防线：问一句"缓存里的是最新的吗"，如果 SW 说
+    // 变了（它会把缓存整体更新掉），就在**安全的时候**刷新页面 ——
+    // 于是修复**当次打开就生效**，不需要任何人记得 bump 什么。
+    //
+    // ⚠️ 两条安全边界：
+    //   1) **正在导航 / 蓝牙连着时绝不刷新** —— 刷新会掐断 BLE 和 10Hz 循环，
+    //      骑在路上这么干比"用着旧版本"严重得多。那种情况只记一行日志，
+    //      等 `stop_nav()` 的时候再刷。
+    //   2) 只会刷一次（`_shell_reloaded`）：SW 那边更新完缓存之后，下次自检
+    //      会报"没变化"，所以不可能形成刷新循环 —— 这个标志只是多一层保险。
+    shell_check() {
+      try {
+        if (typeof navigator === 'undefined' || !navigator.serviceWorker) return false;
+        const swreg = navigator.serviceWorker;
+        if (!swreg.controller) return false;            // 没有 SW 控制（file:// 等）
+        const self = this;
+        // 新 SW 接管时也走同一条路（比如 ASSETS 里加了文件 -> sw.js 变了）
+        if (!this._sw_controller_hooked) {
+          this._sw_controller_hooked = true;
+          try {
+            swreg.addEventListener('controllerchange', () => {
+              self.log('[sw] 新的 Service Worker 已接管：等一个安全的时机刷新');
+              self.shell_reload_when_safe('controllerchange');
+            });
+          } catch (_e) { /* 老浏览器没有这个事件，忽略 */ }
+          // Service Worker 直接发来的"我刚装完新版本"（见 sw.js 的 reload_clients：
+          // navigate() 万一被 WebView 挡了，就走这条让页面自己刷新）
+          try {
+            swreg.addEventListener('message', (ev) => {
+              const d = ev && ev.data;
+              if (d && d.type === 'shell-install-changed') {
+                self.log('[sw] 收到"新版本已装好"的通知：等一个安全的时机刷新');
+                self.shell_reload_when_safe('sw-install-changed');
+              }
+            });
+          } catch (_e) { /* 忽略 */ }
+        }
+        if (typeof MessageChannel === 'function') {
+          const ch = new MessageChannel();
+          ch.port1.onmessage = (ev) => this.on_shell_status(ev.data);
+          // ⚠️ 必须把 **port2** 交给 SW，自己在 port1 上收：
+          //    MessageChannel 是"一端 postMessage、**另一端** onmessage"，
+          //    把 port1 递出去就等于把回答发给了自己没听的另一端 ——
+          //    页面上表现为"自检永远没有回答"，而且不报任何错。
+          //    （这条是被 phone/test/sw.mjs 抓出来的。）
+          swreg.controller.postMessage({ type: 'check-shell' }, [ch.port2]);
+        } else {
+          swreg.controller.postMessage({ type: 'check-shell' });
+        }
+        return true;
+      } catch (e) {
+        this.log(`[sw] 版本自检没做成（不影响使用）：${e}`);
+        return false;
+      }
+    }
+
+    /** SW 对"版本自检"的回答。 */
+    on_shell_status(msg) {
+      if (!msg || msg.type !== 'shell-status') return false;
+      if (!msg.checked) {
+        this.log(`[sw] 版本自检跳过（${msg.reason || '?'}）`);
+        return false;
+      }
+      if (!msg.changed) {
+        this.log('[sw] 版本自检：缓存里的就是最新的');
+        return false;
+      }
+      this.log(`[sw] ⭐ 版本自检发现缓存**不是**最新的：${(msg.files || []).join('、')}` +
+               '（缓存已整体更新）');
+      this.shell_reload_when_safe('shell-changed');
+      return true;
+    }
+
+    /** 刷新页面（只在"没在导航、蓝牙没连着"时真的刷）。 */
+    shell_reload_when_safe(why) {
+      if (this._shell_reloaded) return false;
+      const navigating = !!this.nav;
+      const linked = !!(this.ble && this.ble.connected);
+      if (navigating || linked) {
+        // 等 stop_nav() 的时候再刷；这里只记一笔
+        this._shell_reload_pending = why || 'shell';
+        this.log(`[sw] 新版本已就绪，但正在导航（nav=${navigating} ble=${linked}）：` +
+                 '停止导航后自动刷新（或下次打开就是新的）');
+        this.toast('新版本已就绪：停止导航后自动刷新', 6000);
+        return false;
+      }
+      this._shell_reloaded = true;
+      this._shell_reload_pending = '';
+      this.log(`[sw] 立刻刷新以启用新版本（${why || 'shell'}）`);
+      this.toast('已更新到新版本，正在重新加载…', 4000);
+      try {
+        if (typeof location !== 'undefined' && location.reload) {
+          setTimeout(() => { location.reload(); }, 250);
+        }
+      } catch (_e) { /* 刷不了就算了，下次打开也是新的 */ }
+      return true;
+    }
+
     /**
      * 把 `TileStore.on_change` 接到地图上（**幂等**）。
      *
@@ -2158,16 +2265,22 @@
      *    "导航中底图不再跟着新瓦片更新"，而且完全看不出来是哪一步弄坏的。
      */
     mapview_watch_tiles(ms) {
-      if (!ms || !ms.tiles || ms.tiles._navpuck_mv_watched) return false;
-      const prev = ms.tiles.on_change;
+      if (!ms || !ms.tiles) return false;
+      const st = ms.tiles;
+      // 已经接好的判据是"**现在挂着的就是我们的包装**"，不是一个布尔标记：
+      // 万一别处后来把 on_change 换掉了（map.js 换实例、自测里替换 stub），
+      // 这里会重新包一层，而不是以为"接过了"把通知丢掉。
+      if (st._navpuck_mv_wrapper && st.on_change === st._navpuck_mv_wrapper) return false;
+      const prev = st.on_change;
       const self = this;
-      ms.tiles.on_change = function (store) {
+      const wrapper = function (store) {
         try { if (prev) prev(store); } catch (_e) { /* map.js 那边出错不该拖累地图 */ }
         try {
-          if (self.mapview) self.mapview.on_tiles_changed(store || ms.tiles);
+          if (self.mapview) self.mapview.on_tiles_changed(store || st);
         } catch (_e) { /* 地图重画失败也不影响导航 */ }
       };
-      ms.tiles._navpuck_mv_watched = true;
+      st.on_change = wrapper;
+      st._navpuck_mv_wrapper = wrapper;
       return true;
     }
 
@@ -3442,6 +3555,8 @@
       // 这里同样**不 await**：release() 内部也不允许抛错。
       this.wake().release();
       this.render_awake_loop(this._ui_last);
+      // 版本自检发现新版本、但当时正在导航 -> 现在安全了，补上那次刷新。
+      if (this._shell_reload_pending) this.shell_reload_when_safe('deferred');
     }
 
     // -- 启动 --------------------------------------------------------------
@@ -3813,6 +3928,14 @@
         //    等于 1Hz 重画；它还兼管"跟着定位走"和"本地瓦片刚读回来就上屏"。
         this.mapview_frame(false);
       }, 1000);
+
+      // ---- Service Worker 版本自检 -------------------------------------------
+      //
+      // 放**最后**：它可能（在确认新版本之后）立刻刷新页面，而那时界面已经
+      // 完全就绪，刷新不会留下半个初始化状态。见 shell_check 那一段的说明。
+      // 在 PWA / APK 里都会跑；没有 Service Worker（file:// 直开）时它直接
+      // 返回 false，什么都不做。
+      this.shell_check();
 
       this.set_link_state('idle', {});
       this.set_status(null);

@@ -197,6 +197,122 @@
   // 搜索主体
   // -------------------------------------------------------------------------
 
+  // -------------------------------------------------------------------------
+  // 查询归一化 + 阶梯（中文地名搜索的两个实测坑）
+  // -------------------------------------------------------------------------
+
+  /** 有没有汉字。用来判断"该不该按中文的规则处理"。 */
+  const CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+  function _has_cjk(s) { return CJK_RE.test(s); }
+
+  /**
+   * 去掉**汉字之间**的空格。
+   *
+   * ⭐ 这是实测出来的坑，不是洁癖。Photon 把查询按空白切成 token 再做前缀
+   *    匹配，而中文没有词间空格 —— 一旦中间多一个空格，匹配就断掉：
+   *
+   *      "沈阳师范大学"  -> 8 条，第一条就是 amenity=university 的沈阳师范大学
+   *      "沈阳 师范大学"  -> 只剩 2 条，而且**师范大学本体不见了**
+   *
+   *    中文输入法很容易带出空格，用户也可能顺手敲一个。只删汉字与汉字之间的
+   *    空格；汉字与拉丁字母之间保留（"西湖 West Lake" 这种是有意义的）。
+   */
+  function _strip_cjk_spaces(s) {
+    return s.replace(/([\u3400-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u9fff\uf900-\ufaff])/g, '$1');
+  }
+
+  /**
+   * 行政前缀。带这些前缀的长查询在 Photon 上会**返回毫不相干的结果**：
+   *
+   *     "辽宁省沈阳市" -> 辽宁省辽阳市公安局文圣分局   ← 跑到辽阳去了
+   *     "沈阳市"       -> 沈阳市 ✅
+   *     "沈阳"         -> 沈阳 / 沈阳市 / 沈阳故宫 ✅
+   *
+   * 逐级剥掉前缀再查，能把它拉回来。
+   */
+  const ADMIN_SUFFIXES = ['省', '市', '自治区', '特别行政区', '地区', '自治州', '盟',
+                          '县', '区', '旗', '镇', '乡', '街道'];
+
+  /**
+   * 生成查询阶梯：从最具体到最宽。**按顺序试，前面的够用就不试后面的**
+   * （省请求，也对公共实例客气）。
+   *
+   * 只对含汉字的查询做阶梯 —— 英文查询切词本来就是对的，动它反而会坏。
+   */
+  function _query_variants(raw) {
+    const out = [];
+    const push = (s) => {
+      const t = String(s || '').trim();
+      if (t && out.indexOf(t) < 0) out.push(t);
+    };
+
+    const q = _strip_cjk_spaces(raw);
+    push(q);
+    if (!_has_cjk(q)) return out;          // 纯拉丁：不做阶梯
+
+    // ① 剥**开头**的行政前缀。只在开头剥：
+    //    "辽宁省沈阳市" -> "沈阳市" -> "沈阳"
+    //    逐字剥，因为可能是多级（省+市）
+    let s = q;
+    for (let i = 0; i < 4 && s.length > 2; i++) {
+      const m = s.match(/^(.{2,8}?(?:省|自治区|特别行政区|市|地区|自治州|盟))/);
+      if (!m) break;
+      const rest = s.slice(m[1].length);
+      if (rest.length < 2) break;          // 别剥到只剩一个字
+      s = rest;
+      push(s);
+    }
+
+    // ② 核心词：去掉**结尾**的行政后缀。
+    //    "沈阳市" -> "沈阳"；"熊岳镇" -> "熊岳"
+    //    实测「沈阳北站」->「北站」会跑偏（返回北站街道/北站路），所以
+    //    这一条**只在前面几级都没结果时**才用，而且结果要和别的合并排序，
+    //    不能单独采用。
+    const core = q.replace(
+      new RegExp('(?:' + ADMIN_SUFFIXES.join('|') + ')+$'), '');
+    if (core.length >= 2) push(core);
+
+    return out;
+  }
+
+  /**
+   * 一个结果的名字和查询文本**对得上多少**。用来排序，也用来判断"该不该
+   * 继续往下试阶梯"。
+   *
+   * 为什么需要它：实测「辽宁省沈阳市」第一轮返回 7 条，全是
+   * "辽宁省辽阳市公安局文圣分局"这类 —— Photon 只把"辽宁省"当匹配依据。
+   * 条数够多，但一条都不对。按条数判断会永远走不到「沈阳市」那一轮；
+   * 按分数判断就能跑完阶梯，再把真正对得上的排到前面。
+   */
+  function _match_score(name, query_text) {
+    const n = String(name || '');
+    const qy = String(query_text || '');
+    if (!n || !qy) return 0;
+    if (n === qy) return 100;                 // 完全一样
+    if (n.indexOf(qy) >= 0) return 90;        // 结果名包含完整查询
+    if (qy.indexOf(n) >= 0) return 70;        // 查询包含结果名（回退轮的常见情况）
+    // 两边都不互相包含时，看**公共前缀**有多长 —— 中文地名常带后缀差异
+    // （"沈阳市" vs "沈阳"），前缀越长越可能是同一个地方
+    let i = 0;
+    const m = Math.min(n.length, qy.length);
+    while (i < m && n.charCodeAt(i) === qy.charCodeAt(i)) i++;
+    if (i >= 2) return 40 + Math.min(i, 8);
+    return 5;                                 // 基本不沾边
+  }
+
+  /** 到这个分数就算"确实命中了"，可以停止往下试阶梯。 */
+  const SCORE_GOOD = 70;
+
+  /**
+   * 一轮查询够不够用（条数下限）。只作为辅助条件 —— 主判据是 _match_score。
+   * 3 是实测挑的：正常地名查询一般能给 3 条以上。
+   */
+  const ENOUGH_RESULTS = 3;
+  /** 阶梯最多打几轮，免得公共实例被我们打爆。 */
+  const MAX_ROUNDS = 3;
+
+  // -------------------------------------------------------------------------
+
   /**
    * 搜地点。
    *
@@ -214,7 +330,9 @@
    */
   function search(query, opts) {
     const o = opts || {};
-    const q = String(query == null ? '' : query).trim();
+    // ⭐ 先归一化：去掉**汉字之间**的空格（理由见 _strip_cjk_spaces 的实测）。
+    //    这样 "沈阳 师范大学" 和 "沈阳师范大学" 查到的是同一批东西。
+    const q = _strip_cjk_spaces(String(query == null ? '' : query).trim());
 
     if (!q) {
       return Promise.resolve({
@@ -288,8 +406,27 @@
         });
     }
 
-    function try_photon() {
-      const params = ['q=' + encodeURIComponent(q), 'limit=' + limit];
+    function try_photon(query_text, want_limit) {
+      const params = [
+        'q=' + encodeURIComponent(query_text), 'limit=' + want_limit,
+        // ⭐ lang=default 是**必须**的，不是可选优化。
+        //
+        // Photon 按请求的 Accept-Language 决定返回哪种语言的名字，而
+        // **浏览器不允许 JS 覆盖 Accept-Language**（它是 forbidden header，
+        // fetch 会静默忽略）。手机 WebView 发的正是英文，于是真机上
+        // 「沈阳师范大学」返回的是：
+        //     name = Shenyang Normal University
+        //     city = Shenyang / state = Liaoning Province / country = China
+        // 连地址整条都是英文 —— 用户报的"搜出来是英文的"就是这个。
+        //
+        // 实测（都带 Accept-Language: en-US,en;q=0.9）：
+        //     lang=default -> 沈阳师范大学 / 黄河北大街 / 沈阳市 / 辽宁省 / 中国
+        //     lang=de, fr  -> 同上（这两个语言没有译文，退回本地名）
+        //     lang=en      -> Shenyang Normal University
+        //     lang=zh,zh-CN-> HTTP 400（komoot 这个实例压根没配中文）
+        // default 语义也最贴切：**要本地名**。
+        'lang=default',
+      ];
       if (biased) {
         params.push('lat=' + lat, 'lon=' + lon, 'zoom=' + BIAS_ZOOM);
       }
@@ -302,7 +439,7 @@
         })
         .then(function (j) {
           const feats = (j && Array.isArray(j.features)) ? j.features : [];
-          const list = _dedupe(feats.map(_from_photon).filter(Boolean)).slice(0, limit);
+          const list = _dedupe(feats.map(_from_photon).filter(Boolean)).slice(0, want_limit);
           // ⭐ 命中了空数组也算**成功**：这代表"确实没这个地方"，
           //    和"请求失败"是两回事，界面文案完全不同。
           return { ok: true, results: list, source: 'photon',
@@ -312,8 +449,73 @@
 
     if (want === 'nominatim') return try_nominatim('').then(finish);
 
-    return try_photon().then(finish).catch(function (e) {
-      const why = 'Photon 失败：' + (e && e.message ? e.message : e);
+    // ---- Photon 查询阶梯 ----
+    // 从最具体查到最宽，**前面的够用就停** —— 省请求，也对公共实例客气
+    // （komoot 那个实例是别人捐的算力）。
+    //
+    // 为什么要有阶梯（都是实测）：
+    //   "辽宁省沈阳市" -> 返回「辽宁省辽阳市公安局文圣分局」，跑到辽阳去了
+    //   "沈阳市"       -> 正确
+    //   "沈阳故宫"     -> 只 1 条；回退搜「故宫」+ 偏置能拿 3 条
+    // 合并顺序 = 阶梯顺序，所以**越具体的匹配排越前**。
+    const variants = _query_variants(q).slice(0, MAX_ROUNDS);
+    let acc = [];
+    let last_err = '';
+
+    // ⭐ "够不够用"必须看**匹配质量**，不能看条数。
+    //    实测反例：「辽宁省沈阳市」第一轮就返回 7 条 —— 数量早就够了，
+    //    可全是"辽宁省辽阳市公安局文圣分局"这种（Photon 把"辽宁省"当成了
+    //    唯一的匹配依据）。按条数停会永远走不到「沈阳市」那一轮。
+    //    所以：第一轮结果里**只要有一条名字真的和查询对得上**才提前收工。
+    function top_score(list, query_text) {
+      let best = 0;
+      for (const it of list) {
+        const s = _match_score(it.name, query_text);
+        if (s > best) best = s;
+      }
+      return best;
+    }
+
+    function step(i) {
+      if (i >= variants.length) return Promise.resolve();
+      return try_photon(variants[i], limit)
+        .then(function (r) {
+          acc = acc.concat(r.results);
+          // 第一轮就命中得很准 -> 不用再问；否则继续往下试
+          if (i === 0 && top_score(r.results, q) >= SCORE_GOOD) return;
+          if (i > 0 && acc.length >= ENOUGH_RESULTS &&
+              top_score(acc, q) >= SCORE_GOOD) return;
+          return step(i + 1);
+        })
+        .catch(function (e) {
+          last_err = (e && e.message) ? e.message : String(e);
+          // 第一轮就网络失败 -> 不必再问后面几轮，直接交给兜底
+          if (i === 0) throw e;
+          return step(i + 1);
+        });
+    }
+
+    return step(0).then(function () {
+      // 合并后再去重（不同轮次很容易命中同一个地物），
+      // 然后**按匹配质量排序**：越具体的匹配排越前。
+      // 没有这一步的话，「辽宁省沈阳市」会把辽阳那条排在真正的沈阳市前面
+      // —— 因为它来自第一轮。
+      const uniq = _dedupe(acc);
+      const scored = uniq.map(function (it, idx) {
+        return { it: it, s: _match_score(it.name, q), idx: idx };
+      });
+      scored.sort(function (a, b) {
+        if (b.s !== a.s) return b.s - a.s;
+        return a.idx - b.idx;          // 同分保持原顺序（阶梯顺序 = 具体程度）
+      });
+      const list = scored.map(function (x) { return x.it; }).slice(0, limit);
+      return finish({ ok: true, results: list, source: 'photon',
+                      biased: biased, error: '', from_cache: false,
+                      // 让界面/自测看得出走了几轮（诊断用，不是门面）
+                      rounds: Math.min(variants.length, MAX_ROUNDS),
+                      queries: variants });
+    }).catch(function (e) {
+      const why = 'Photon 失败：' + (e && e.message ? e.message : (last_err || e));
       if (want === 'photon') {
         return finish({ ok: false, results: [], source: '', biased: biased,
                         error: why, from_cache: false });
@@ -351,5 +553,9 @@
     SEARCH_TIMEOUT_MS, SEARCH_LIMIT_DEFAULT, SEARCH_CACHE_MAX, BIAS_ZOOM,
     // 纯函数导出，自测直接喂数据（不联网）
     _from_photon, _from_nominatim, _dedupe, _valid_latlon,
+    // 查询归一化 / 阶梯 / 匹配打分：自测要直接钉这三个
+    // （它们修的都是真机上抓到的真问题，不是重构）
+    _strip_cjk_spaces, _query_variants, _has_cjk, _match_score,
+    ENOUGH_RESULTS, MAX_ROUNDS, ADMIN_SUFFIXES, SCORE_GOOD,
   };
 }));

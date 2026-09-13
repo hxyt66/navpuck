@@ -784,8 +784,10 @@ await (async () => {
 
   const assets = [...SW.matchAll(/^\s*'([a-z_]+\.js)',?$/gm)].map((m) => m[1]);
   ok(assets.includes('search.js'), 'sw.js 的预缓存清单里有 search.js');
-  ok(/const CACHE = 'navpuck-phone-v17'/.test(SW),
-     'sw.js 的缓存版本号 bump 到 v17（忘了的话手机上的 PWA 里就没有 search.js）');
+  // 版本号的一致性（"改了文件忘了 bump"）由 phone/test/sw.mjs 用内容哈希判，
+  // 这里只确认名字形状 —— 写死 vNN 的话每加一个文件都要改好几处。
+  ok(/const CACHE = 'navpuck-phone-v\d+'/.test(SW),
+     'sw.js 的 CACHE 名字符合 navpuck-phone-v<数字>（一致性守卫见 phone/test/sw.mjs）');
   eq(scripts.filter((s) => !assets.includes(s)), [],
      'index.html 里的每个 <script> 都在 sw.js 的预缓存清单里');
   const i_s = scripts.indexOf('search.js');
@@ -841,6 +843,108 @@ if (process.env.NAVPUCK_SEARCH_LIVE) {
     }
     SR.clear_cache();
   }
+}
+
+// ---------------------------------------------------------------------------
+// 12] 中文查询的三个真机坑
+//
+// 为什么这一节和别的不同：**前几轮我在电脑上测一直是中文，真机上却是英文。**
+// 原因是 Photon 按 Accept-Language 决定返回哪种语言的名字，而浏览器不允许
+// JS 覆盖这个头（forbidden header）。本机 fetch 不发它，手机 WebView 发的是
+// 英文 —— 于是「沈阳师范大学」在手机上返回 "Shenyang Normal University"，
+// city/state/country 也全变英文。
+// 所以下面刻意**用带 Accept-Language: en 的请求**来测，那才是手机的环境。
+// ---------------------------------------------------------------------------
+section('12] 中文查询：语言 / 空格 / 长查询（模拟手机的 Accept-Language）');
+
+{
+  // ---- 12a) lang=default 必须出现在 Photon 的 URL 里 ----
+  const seen = [];
+  const spy = (url) => {
+    seen.push(String(url));
+    return Promise.resolve({ ok: true, status: 200,
+      json: () => Promise.resolve({ features: [] }) });
+  };
+  await SR.search('沈阳师范大学', { lat: 41.8, lon: 123.42, fetch: spy });
+  ok(seen.length > 0, '（前置）确实发了请求');
+  ok(seen.every((u) => /[?&]lang=default(&|$)/.test(u)),
+     '⭐ Photon 请求里带 lang=default（否则手机上名字和地址全是英文）');
+  ok(!seen.some((u) => /[?&]lang=(zh|zh-CN|en)(&|$)/.test(u)),
+     '没有用 zh/zh-CN（komoot 实例上这两个值是 HTTP 400）也没有用 en');
+  SR.clear_cache();
+
+  // ---- 12b) 去汉字间空格 ----
+  eq(SR._strip_cjk_spaces('沈阳 师范大学'), '沈阳师范大学',
+     '汉字之间的空格被去掉（否则 token 匹配断掉，主结果丢失）');
+  eq(SR._strip_cjk_spaces('沈阳  师范 大学'), '沈阳师范大学', '多个空格也去');
+  eq(SR._strip_cjk_spaces('西湖 West Lake'), '西湖 West Lake',
+     '汉字与拉丁字母之间的空格**保留**（那是有意义的）');
+  eq(SR._strip_cjk_spaces('West Lake'), 'West Lake', '纯拉丁不动');
+
+  // ---- 12c) 查询阶梯 ----
+  const v1 = SR._query_variants('辽宁省沈阳市');
+  ok(v1.length >= 2, '长行政查询会展开成多级');
+  eq(v1[0], '辽宁省沈阳市', '第一级是原样（最具体优先）');
+  ok(v1.includes('沈阳市'), '剥掉省之后剩下「沈阳市」');
+  eq(SR._query_variants('沈阳师范大学')[0], '沈阳师范大学', '短地名不做多余展开');
+  ok(SR._query_variants('沈阳市').includes('沈阳'), '去掉结尾的「市」得到核心词');
+  eq(SR._query_variants('West Lake').length, 1, '纯拉丁查询不做阶梯（切词本来就是对的）');
+
+  // ---- 12d) 匹配打分：这是"够不够用"的判据，**不是条数** ----
+  eq(SR._match_score('沈阳市', '沈阳市'), 100, '完全一样 = 最高分');
+  ok(SR._match_score('沈阳师范大学附属学校', '沈阳师范大学') >= 90,
+     '结果名包含完整查询 = 高分');
+  ok(SR._match_score('沈阳市', '辽宁省沈阳市') >= SR.SCORE_GOOD,
+     '查询包含结果名 = 够好（这正是「辽宁省沈阳市」回退轮拿到的那种）');
+  ok(SR._match_score('辽宁省辽阳市公安局文圣分局', '辽宁省沈阳市') < SR.SCORE_GOOD,
+     '⭐ 只沾了「辽宁省」的无关结果**达不到** SCORE_GOOD —— 这条就是'
+     + '「辽宁省沈阳市」返回辽阳市公安局那个 bug 的守卫');
+  ok(SR._match_score('', 'x') === 0 && SR._match_score('x', '') === 0, '空值给 0');
+
+  // ---- 12e) 核心断言：长查询不能让无关结果排前面 ----
+  // 假 fetch 复刻 Photon 对「辽宁省沈阳市」的真实行为：
+  // 第一轮塞一堆只沾"辽宁省"的无关结果（**数量够多**，所以按条数判断会提前收工），
+  // 第二轮才给真正的沈阳市。
+  const fake = (url) => {
+    const q = decodeURIComponent((String(url).match(/[?&]q=([^&]*)/) || [])[1] || '');
+    const feats = q === '辽宁省沈阳市'
+      ? [{ properties: { name: '辽宁省辽阳市公安局文圣分局', city: '辽阳市' },
+           geometry: { coordinates: [123.21655, 41.28515] } },
+         { properties: { name: '辽宁省锦州市小东种畜场', city: '锦州市' },
+           geometry: { coordinates: [122.33568, 42.02896] } },
+         { properties: { name: '辽宁省本溪市人民检察院', city: '本溪市' },
+           geometry: { coordinates: [123.81768, 41.30216] } },
+         { properties: { name: '辽宁省营口市中级人民法院', city: '营口市' },
+           geometry: { coordinates: [122.21082, 40.62326] } }]
+      : [{ properties: { name: '沈阳市', city: '沈阳市' },
+           geometry: { coordinates: [123.42791, 41.80261] } }];
+    return Promise.resolve({ ok: true, status: 200,
+      json: () => Promise.resolve({ features: feats }) });
+  };
+  const r = await SR.search('辽宁省沈阳市', { lat: 41.8, lon: 123.42, fetch: fake });
+  ok(r.ok, '长查询成功');
+  ok(r.results.length > 0, '拿到了结果');
+  eq(r.results[0].name, '沈阳市',
+     '⭐ 真正的「沈阳市」排第一（修复前是辽阳市公安局排第一）');
+  SR.clear_cache();
+
+  // ---- 12f) 带空格与不带空格必须等价 ----
+  const spy2 = (url) => {
+    const q = decodeURIComponent((String(url).match(/[?&]q=([^&]*)/) || [])[1] || '');
+    const f = (q === '沈阳师范大学')
+      ? [{ properties: { name: '沈阳师范大学' },
+           geometry: { coordinates: [123.409, 41.9057] } }]
+      : [];
+    return Promise.resolve({ ok: true, status: 200,
+      json: () => Promise.resolve({ features: f }) });
+  };
+  const a = await SR.search('沈阳师范大学', { lat: 41.8, lon: 123.42, fetch: spy2 });
+  SR.clear_cache();
+  const b = await SR.search('沈阳 师范大学', { lat: 41.8, lon: 123.42, fetch: spy2 });
+  eq(a.results.length, b.results.length, '带空格与不带空格结果条数一致');
+  eq(b.results[0] && b.results[0].name, '沈阳师范大学',
+     '⭐ 带空格的查询也能拿到大学本体（修复前只剩 railway=stop）');
+  SR.clear_cache();
 }
 
 end_sections();
