@@ -711,6 +711,39 @@
      * 取头部索引。拿不到也不致命：root = null 时"覆盖未知"，
      * 调用方会照样去试着下瓦片（顶多多几个 404）。
      */
+    /**
+     * 采用一份头部索引。**root / root_t / root_state / pack_z 必须一起设。**
+     *
+     * ⚠️ 这里踩过一个只有真机才暴露的坑：从 IndexedDB 缓存恢复 root 时只设了
+     *    root，漏了 pack_z，于是 pack_z 停在 0（= 散块部署）。它**不报错**，
+     *    而是静默地永远加载不出底图：
+     *
+     *      pack_z = 0
+     *        -> _container_xy() 按 z14 算容器坐标
+     *        -> root_covers() 拿 z14 的 x（如 13809）去比**打包索引**的范围
+     *           （xr=[720,895]，那是 z10 的）
+     *        -> 每一块都判成"超出发布范围"
+     *        -> 每一块都塞进 this.absent
+     *        -> 永远不下载，地图永远空白，而且**重启 App 也不自愈**
+     *           （缓存新鲜期内每次都走那条分支）
+     *
+     *    症状和"瓦片根本没发布"一模一样，极难分辨。真机上是靠
+     *    `absent=20 / pack_z=0` 这两个内部量才定位到的。
+     *
+     *    自测抓不到它：Node 里没有 IndexedDB（this.db 为 null），缓存分支
+     *    整个被跳过，pack_z 每次都从新取的索引里正确赋值。
+     *    —— 又是一次"假依赖比真依赖宽松"。
+     */
+    _adopt_root(j, t) {
+      this.root = j;
+      this.root_t = t;
+      this.root_state = 'ok';
+      // 部署形态由**索引**说了算，不是客户端猜的：有 `pack` 字段就是打包部署。
+      // 这样一来同一次发布里不可能出现"客户端以为散块、服务端是包"的错配。
+      this.pack_z = (j && typeof j.pack === 'number' && j.pack > 0 &&
+                     j.pack < this.zoom) ? j.pack : 0;
+    }
+
     async load_root(force) {
       if (!this.ready()) { this.root_state = 'none'; return null; }
       if (this.root && !force && (this._now() - this.root_t) < INDEX_MAX_AGE_S) {
@@ -720,9 +753,8 @@
       if (!force && this.db) {
         const rec = await this.db.meta_get('root');
         if (rec && rec.j && typeof rec.t === 'number') {
-          this.root = rec.j;
-          this.root_t = rec.t;
-          this.root_state = 'ok';
+          // ⭐ 必须走 _adopt_root，不能只赋 this.root —— 那样会漏掉 pack_z
+          this._adopt_root(rec.j, rec.t);
           if ((this._now() - rec.t) < INDEX_MAX_AGE_S) return this.root;
         }
       }
@@ -737,13 +769,8 @@
           if (j.z !== undefined && j.z !== this.zoom) {
             throw new Error(`索引是 z${j.z}，本端是 z${this.zoom}`);
           }
-          this.root = j;
-          this.root_t = this._now();
-          this.root_state = 'ok';
-          // ⭐ 部署形态由**索引**说了算，不是客户端猜的：有 `pack` 字段就是打包部署。
-          //    这样一来同一次发布里不可能出现"客户端以为散块、服务端是包"的错配。
-          this.pack_z = (typeof j.pack === 'number' && j.pack > 0 &&
-                         j.pack < this.zoom) ? j.pack : 0;
+          // ⭐ 走 _adopt_root：root 与 pack_z 必须一起设（见上面的长注释）
+          this._adopt_root(j, this._now());
           if (this.db) this.db.meta_put('root', { t: this.root_t, j: j });
           return this.root;
         } catch (e) {
