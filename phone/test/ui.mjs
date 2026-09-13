@@ -114,10 +114,12 @@ class FakeElement {
   addEventListener(ev, cb) {
     (this._listeners[ev] = this._listeners[ev] || []).push(cb);
   }
-  /** 触发事件（模拟用户操作）。 */
-  fire(ev) {
+  /** 触发事件（模拟用户操作）。extras 用来补 pointerId / offsetX 这类字段。 */
+  fire(ev, extras) {
     const list = this._listeners[ev] || [];
-    for (const cb of list) cb({ target: this, type: ev });
+    for (const cb of list) {
+      cb(Object.assign({ target: this, type: ev, preventDefault() {} }, extras || {}));
+    }
     return list.length;
   }
   hasListener(ev) { return (this._listeners[ev] || []).length > 0; }
@@ -214,11 +216,21 @@ const P = require(path.join(PHONE_DIR, 'proto.js'));
 const NM = require(path.join(PHONE_DIR, 'navmath.js'));
 const RT = require(path.join(PHONE_DIR, 'route.js'));
 const MAP = require(path.join(PHONE_DIR, 'map.js'));
+// 手机端地图（mapview.js）：和 index.html 一样排在 map.js 之后、app.js 之前。
+// ⚠️ 不挂这一个的话，app.js 里地图那一块会走"模块没加载"的分支 ——
+//    那测到的就不是真实的接线了（第 9a 节专门点按钮/看状态面板）。
+const MV = require(path.join(PHONE_DIR, 'mapview.js'));
+// 地点搜索（search.js）：无依赖，和 index.html 一样挂在 app.js 之前。
+// ⚠️ 不挂它的话，app.js 里搜索那一栏会走"模块没加载"的分支 —— 那测到的
+//    就不是真实接线了（第 9a 节之后有一节专门点搜索按钮）。
+const SEARCH = require(path.join(PHONE_DIR, 'search.js'));
 const BLE = require(path.join(PHONE_DIR, 'ble.js'));
 globalThis.NavPuckMath = NM;
 globalThis.NavPuckProto = P;
 globalThis.NavPuckRoute = RT;
 globalThis.NavPuckMap = MAP;
+globalThis.NavPuckMapView = MV;
+globalThis.NavPuckSearch = SEARCH;
 globalThis.NavPuckBle = BLE;
 
 // ---------------------------------------------------------------------------
@@ -251,10 +263,15 @@ section('1] index.html 自身的完整性');
   //    底图改成离线优先后新增了 tiles.js（瓦片格式解码 + IndexedDB 缓存 +
   //    沿路预取）。map.js 在构造 OsmMapSource 时就要用 root.NavPuckTiles，
   //    所以它必须排在 route.js **之后**、map.js **之前**。
+  //    —— 手机端地图（mapview.js）同理：app.js 在 init() 里就要用它建视图，
+  //    所以它排在 map.js 之后、app.js 之前（它自己只依赖 navmath），
+  //    而 ui.mjs 里另有一节专门钉"地图真的被接进 index.html 且能被建起来"。
+  //    —— 地点搜索（search.js）无依赖，同样必须在 app.js 之前（init() 里要用）。
+  //    它更完整的行为自测在 phone/test/search.mjs。
   eq(SCRIPT_SRCS,
      ['crashlog.js', 'navmath.js', 'proto.js', 'route.js', 'tiles.js', 'map.js',
-      'ble_native.js', 'ble.js', 'fgs.js', 'fgs_ui.js', 'app.js'],
-     'script 加载顺序与依赖顺序一致（crashlog -> navmath -> proto -> route -> tiles -> map -> ble_native -> ble -> fgs -> fgs_ui -> app）');
+      'mapview.js', 'search.js', 'ble_native.js', 'ble.js', 'fgs.js', 'fgs_ui.js', 'app.js'],
+     'script 加载顺序与依赖顺序一致（crashlog -> navmath -> proto -> route -> tiles -> map -> mapview -> search -> ble_native -> ble -> fgs -> fgs_ui -> app）');
 
   // 重复 id 会让 getElementById 静默取到第一个，是"界面上有个元素永远不更新"的经典原因
   const seen = new Map();
@@ -961,6 +978,142 @@ section('9] 街道路网底图：状态说得清楚、关掉就真的不发请�
   // 收尾：切回"打开"，别把状态留给后面的用例
   app.set_map_enabled(true, true);
   eq(globalThis.localStorage.getItem('navpuck.opt.map.v1'), '1', '收尾：选择恢复成"打开"');
+}
+
+// ---------------------------------------------------------------------------
+section('9a] 手机端地图（mapview.js）：按钮、状态、离线都真的接上了');
+// ---------------------------------------------------------------------------
+//
+// 第 1 节只钉了"index.html 里有这些 id"，这一节把**真的点一遍**补上：
+//   - App.init() 里建的 MapView 用的是页面上真实的 #mapview；
+//   - 点「回到当前位置 / 放大 / 缩小」真的会改视图（不是只绑了个空函数）；
+//   - 画完一帧之后 #mapview-state / #mapview-detail 真的被写上（用户看得见）；
+//   - 底图关掉时地图那一块写的是"已关闭"，不是"暂无路网"（两件事不能混）。
+//
+// ⚠️ DOM 桩里的 FakeElement 没有 getContext，所以这里给 #mapview 补一个
+//    **只记调用**的最小 2D 上下文 —— tick() 每一帧都会重新问 canvas.getContext，
+//    所以 init() 之后再补也来得及（App 建 MapView 时并不需要上下文）。
+{
+  const app = APP.app;
+  const cv = BY_ID.get('mapview');
+  ok(cv && cv.tagName === 'CANVAS', '页面上有 #mapview 且是 <canvas>');
+  ok(cv.hasListener('pointerdown') && cv.hasListener('pointermove') &&
+     cv.hasListener('pointerup') && cv.hasListener('wheel') && cv.hasListener('dblclick'),
+     '#mapview 上挂齐了拖动/滚轮/双击的手势监听');
+  for (const id of ['mapview-here-btn', 'mapview-zoom-in', 'mapview-zoom-out']) {
+    ok(BY_ID.get(id).hasListener('click'), `#${id} 绑上了 click`);
+  }
+
+  const drawn = { moveTo: 0, lineTo: 0, stroke: 0, texts: [] };
+  cv.getContext = () => ({
+    setTransform() {}, fillRect() {}, beginPath() {}, closePath() {},
+    moveTo() { drawn.moveTo += 1; }, lineTo() { drawn.lineTo += 1; },
+    stroke() { drawn.stroke += 1; }, fill() {}, arc() {},
+    fillText(s) { drawn.texts.push(s); },
+    measureText(s) { return { width: String(s).length * 5.5 }; },
+    fillStyle: '', strokeStyle: '', lineWidth: 1, lineCap: '', lineJoin: '',
+    font: '', textAlign: '', textBaseline: '',
+  });
+
+  const mv = app.mapview_instance();
+  ok(mv instanceof globalThis.NavPuckMapView.MapView, 'App 里拿着一个真的 MapView');
+  eq(app.mapview_frame(true), true, '补上上下文之后画得出一帧');
+
+  eq(BY_ID.get('mapview-state').textContent, mv.status().short,
+     `状态格写的是地图状态（"${BY_ID.get('mapview-state').textContent}"）`);
+  ok(['ok', 'offline', 'empty', 'idle', 'unavailable']
+       .includes(BY_ID.get('mapview-state').dataset.state),
+     '状态格带 data-state（配色用）');
+  ok(BY_ID.get('mapview-detail').textContent.length > 0, '详情那一行有内容（不是空白）');
+  ok(drawn.texts.some((s) => /北朝上/.test(s)), '画面上画了比例尺（带"北朝上"）');
+  ok(drawn.texts.some((s) => /路网|离线瓦片|本地/.test(s)), '画面上画了数据来源角标');
+
+  // 三个按钮真的改视图
+  mv.follow = false;
+  BY_ID.get('mapview-here-btn').fire('click');
+  eq(mv.follow, true, '点「回到当前位置」之后重新跟随');
+  const z0 = mv.view.zoom;
+  BY_ID.get('mapview-zoom-in').fire('click');
+  ok(mv.view.zoom > z0, `点「放大」真的放大了（z${z0.toFixed(1)} -> z${mv.view.zoom.toFixed(1)}）`);
+  BY_ID.get('mapview-zoom-out').fire('click');
+  ok(Math.abs(mv.view.zoom - z0) < 1e-9, '点「缩小」缩回原样');
+
+  // 拖一下地图：停止跟随（用户手动看过的地方不能被定位拽走）
+  mv.follow = true;
+  mv.attach(cv);
+  cv.fire('pointerdown', { pointerId: 1, offsetX: 10, offsetY: 10 });
+  cv.fire('pointermove', { pointerId: 1, offsetX: 120, offsetY: 90 });
+  cv.fire('pointerup', { pointerId: 1 });
+  eq(mv.follow, false, '在画布上拖一下：停止跟随');
+
+  // 底图关掉：地图那一块必须说"已关闭"，而不是"暂无路网"
+  app.set_map_enabled(false, true);
+  eq(BY_ID.get('mapview-state').textContent, '已关闭', '关掉底图后地图状态格 = 已关闭');
+  ok(/只画航线与当前位置/.test(BY_ID.get('mapview-detail').textContent),
+     '关掉底图后详情说清楚"只画航线与当前位置"');
+  eq(globalThis.localStorage.getItem('navpuck.opt.map.v1'), '0', '（顺带）选择被持久化');
+  app.set_map_enabled(true, true);
+  eq(globalThis.localStorage.getItem('navpuck.opt.map.v1'), '1', '重新打开后选择持久化成"打开"');
+  app.mapview_frame(true);
+  ok(BY_ID.get('mapview-state').textContent !== '已关闭', '重新打开后状态格不再是"已关闭"');
+}
+
+// ---------------------------------------------------------------------------
+section('9a2] 地点搜索：输入框/按钮真的接上了（行为自测见 search.mjs）');
+// ---------------------------------------------------------------------------
+//
+// 这一节只钉"界面接线"：id 在、监听器在、`enterkeyhint` 写着"search"。
+// 真正的行为（偏置、结果渲染、点选填坐标、"没找到"和"失败"文案不同、竞态）
+// 在 phone/test/search.mjs 里测 —— 那边有一套更完整的 DOM 打桩
+// （需要 createElement/appendChild，ui.mjs 这套桩刻意保持最小）。
+{
+  const app = APP.app;
+  ok(HTML_IDS.has('search-input'), 'index.html 里有 #search-input');
+  ok(HTML_IDS.has('search-btn'), 'index.html 里有 #search-btn（搜索按钮）');
+  ok(HTML_IDS.has('search-results'), 'index.html 里有 #search-results（结果列表）');
+  ok(HTML_IDS.has('search-info'), 'index.html 里有 #search-info（状态那一行）');
+  ok(/id="search-input"[^>]*enterkeyhint="search"/.test(HTML) ||
+     /enterkeyhint="search"[^>]*id="search-input"/.test(HTML),
+     '搜索框带 enterkeyhint="search"（手机键盘右下角就是"搜索"）');
+  ok(BY_ID.get('search-input').hasListener('keydown'), '#search-input 绑了 keydown（回车触发）');
+  ok(BY_ID.get('search-input').hasListener('search'), '#search-input 绑了 search（清空小叉）');
+  ok(BY_ID.get('search-btn').hasListener('click'), '#search-btn 绑了 click');
+
+  // 搜索框必须在纬度/经度**上面** —— "搜地名"比"手输六位小数"自然
+  const i_search = HTML.indexOf('id="search-input"');
+  const i_lat = HTML.indexOf('id="dest-lat"');
+  ok(i_search > 0 && i_search < i_lat, '搜索框排在纬度/经度输入框之前（目的地面板最上面）');
+  ok(HTML.indexOf('id="dest-preset"') > i_lat, '常用地点下拉保留在坐标框之后');
+  // 它必须在 <h2>目的地</h2> 之后（也就是在目的地面板里）
+  ok(i_search > HTML.indexOf('<h2>目的地</h2>'), '搜索框在「目的地」面板里');
+
+  // search.js 必须真的被 index.html 加载（否则 app.js 会走"模块没加载"分支）
+  ok(SCRIPT_SRCS.indexOf('search.js') > SCRIPT_SRCS.indexOf('mapview.js'),
+     'search.js 排在 mapview.js 之后');
+  ok(SCRIPT_SRCS.indexOf('search.js') < SCRIPT_SRCS.indexOf('app.js'),
+     'search.js 排在 app.js 之前');
+  ok(!!globalThis.NavPuckSearch, 'search.js 加载后挂了 root.NavPuckSearch');
+
+  // ⭐ 回车真的会发起搜索。**这一条走的是完整的真实路径**：回车事件 ->
+  //    App.do_search -> search.js.search -> 全局 fetch（这一套里的 fetch 必失败）。
+  //    所以它同时也证明了"搜索失败"这条路不会把界面搞崩。
+  const si = BY_ID.get('search-input');
+  const sinfo = BY_ID.get('search-info');
+  si.value = '西湖';
+  const before = sinfo.textContent;
+  si.fire('keydown', { key: 'Enter' });
+  await sleep(60);
+  eq(sinfo.dataset.state, 'error',
+     '回车真的发起了搜索（测试环境没有网络，所以是"搜索失败"那一档）');
+  ok(sinfo.textContent !== before, `状态行被更新了：${sinfo.textContent.slice(0, 30)}…`);
+  ok(/搜索失败/.test(sinfo.textContent) && !/没找到/.test(sinfo.textContent),
+     '失败文案里没有混进"没找到"');
+
+  // 按钮走同一个入口（点一下也应该重新发起）
+  BY_ID.get('search-btn').fire('click');
+  await sleep(60);
+  ok(sinfo.dataset.state === 'error' || sinfo.dataset.state === 'loading',
+     '「搜索」按钮也能发起搜索');
 }
 
 // ---------------------------------------------------------------------------

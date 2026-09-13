@@ -16,13 +16,16 @@ ESP32-S3 圆屏，不需要 USB、不需要电脑、不需要任何地图 API ke
 
 ```
 phone/
-├── index.html              界面骨架（32 个 id 由 app.js 按名取用）
+├── index.html              界面骨架（id 由 app.js 按名取用）
 ├── style.css               深色移动端样式（四种链路状态配色）
 ├── app.js                  ★ 主控：Navigator 主循环 + 界面绑定（navigator.py 的移植）
 ├── proto.js                ★ 线协议：编解码 + CRC + FrameParser（navpuck_proto.py 的移植）
 ├── navmath.js              ★ 测地数学（navmath.py 的移植）
 ├── route.js                ★ 航线/加密/路口识别/OSRM（navigator.py 的 Route 类移植）
 ├── map.js                  ★ Overpass 路网 + 缓存 + 正北投影（OsmMapSource 的移植）
+├── tiles.js                ★ 离线瓦片：.npt / NPK1 解码 + IndexedDB 缓存 + 沿路预取
+├── mapview.js              ★ 手机上的地图：Canvas 画路网（拖动/双指缩放/回到当前位置）
+├── search.js               地点搜索：Photon（免费无 key）+ Nominatim 兜底
 ├── ble.js                  ★ Web Bluetooth：NUS、分片试探、队列、重连、看门狗
 ├── ble_native.js           ★ 原生（Capacitor）传输：扫描/连接/MTU/**自适应分片**（APK 走这条）
 ├── crashlog.js             崩溃黑匣子：危险操作前同步落盘 + 下次启动显示"上次异常结束"
@@ -31,12 +34,16 @@ phone/
 ├── manifest.webmanifest    PWA 清单
 ├── icon.svg                图标（maskable）
 └── test/
-    ├── selftest.mjs        字节级自测（黄金向量，285 项）
+    ├── selftest.mjs        字节级自测（黄金向量，320 项）
     ├── parity.mjs          Python ↔ JS 行为对拍（161 项，需要有 python）
     ├── pyref.py            对拍用的 Python 参考实现（由 parity.mjs 调用）
-    ├── integration.mjs     BLE/主循环集成自测（164 项，全伪造、不联网）
-    ├── ui.mjs              index.html ↔ app.js 界面接线自测（166 项，DOM 打桩）
-    └── run-all.mjs         一次跑齐上面四套
+    ├── tiles.mjs           离线瓦片自测（129 项，含真起 python 的格式对拍）
+    ├── mapview.mjs         手机端地图自测（243 项：投影/边界/**离线**/手势/DPI/性能）
+    ├── pngctx.mjs          自测用的软件 Canvas 替身 + PNG 编码（只有 mapview.mjs 用）
+    ├── search.mjs          地点搜索自测（156 项：偏置/文案区分/点选/竞态，**不联网**）
+    ├── integration.mjs     BLE/主循环集成自测（333 项，全伪造、不联网）
+    ├── ui.mjs              index.html ↔ app.js 界面接线自测（452 项，DOM 打桩）
+    └── run-all.mjs         一次跑齐上面七套
 ```
 
 ★ = 与 Python 有对应关系的移植文件。**没有构建步骤、没有 npm、没有框架**：
@@ -46,21 +53,43 @@ phone/
 
 ```bash
 cd <navpuck 根目录>
-node phone/test/run-all.mjs          # 四套一起跑，任一套失败则非 0 退出
+node phone/test/run-all.mjs          # 七套一起跑，任一套失败则非 0 退出
 node phone/test/selftest.mjs         # 只跑字节级
 node phone/test/parity.mjs           # 只跑 Python 对拍（需要 python 在 PATH 里）
+node phone/test/tiles.mjs            # 只跑离线瓦片
+node phone/test/mapview.mjs          # 只跑手机端地图
+node phone/test/search.mjs           # 只跑地点搜索
 node phone/test/integration.mjs      # 只跑集成
 node phone/test/ui.mjs               # 只跑界面接线
 ```
 
-四套各管一段，缺一不可：
+想用**真网络**跑一次搜索（拿真实结果对照，见 `search.mjs` 第 5 节）：
+
+```bash
+NAVPUCK_SEARCH_LIVE=1 node phone/test/search.mjs     # PowerShell: $env:NAVPUCK_SEARCH_LIVE="1"
+```
+
+七套各管一段，缺一不可：
 
 | 套件 | 管什么 | 抓得到的典型问题 |
 |---|---|---|
 | `selftest.mjs` | 字节级 | 字段顺序、CRC、分片边界、解析器重同步 |
 | `parity.mjs` | 与 `navigator.py` 的语义 | 取整方式、投影、路口下标、视野值 |
+| `tiles.mjs` | 离线瓦片 | `.npt`/`.npk` 格式理解错、缓存没落盘、有瓦片还去问 Overpass |
+| `mapview.mjs` | 手机端地图 | 投影算错（车画在路外面）、跨 180°、离线画不出来、手势/DPI 弄错 |
+| `search.mjs` | 地点搜索 | 没带位置偏置（搜到别的省）、"没找到"和"失败"说成同一句、点选了却没用上、过期响应覆盖新结果 |
 | `integration.mjs` | 接线 | 分片降档、队列丢谁、30 秒重发、看门狗、端到端闭环 |
 | `ui.mjs` | `index.html` ↔ `app.js` | id 拼错、按钮没绑上、初始化崩、面板没更新 |
+
+`mapview.mjs` 里"离线"那一条是用**一个只会抛错的 fetch** 把网络彻底掐死来证的
+（不是"失败了才说离线"）：整段读取和渲染过程里 `fetch` 调用次数必须是 **0**。
+它的渲染断言走一个**记录型上下文**（把每个 `moveTo/lineTo/stroke` 记下来），
+所以既不需要浏览器、也不需要 canvas 这种原生依赖；设了环境变量
+`NAVPUCK_MV_PNG=<路径>` 时还会把同一批调用软件栅格化成一张 PNG，用来肉眼确认。
+
+`search.mjs` 里所有 fetch 也都是**注入的假实现**（公共 Photon 是别人捐的算力，
+自测去打它既慢又会因为网络抖动假红）。它有一节"真网络实测"，但只有显式设了
+`NAVPUCK_SEARCH_LIVE=1` 才会跑 —— 想拿真实结果对照时再开。
 
 `parity.mjs` 在没有 Python 的机器上会打印 **SKIP** 并以 0 退出 —— 那是"没执行"，
 不是"通过"。字节级一致性由 `selftest.mjs` 独立覆盖。
@@ -317,6 +346,87 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
 `phone/test/parity.mjs` 的 4b 节会**直接读 `app.js` 的源码**核对这 11 个字段
 各自用了哪个取整函数，防止测试与实现各改一半、结果测试自己通过。
 
+### 手机上的地图（`mapview.js`，这一版新增）
+
+**用户的诉求就是这一条**："我要在手机端 app 看到地图"。在这之前手机端只有控制
+面板和一堆数字 —— 地图只出现在设备那块圆屏上（而且只有手机推过去的那一点视距）。
+
+实现上的三个决定，都是被这个工程的既有约束逼出来的：
+
+1. **不引入任何地图库**（Leaflet / MapLibre / Mapbox 都用不上）。瓦片是我们自产的
+   **矢量** `.npt`（NPK1 打包），不是栅格 PNG，库吃不了；而且路网本来就已经在内存 /
+   IndexedDB 里（`OsmMapSource.ways` / `TileStore.local_area()`），接一个库反而是
+   绕远路。真正需要的渲染能力只有：画折线、画一个箭头、写三行字。
+2. **投影和工程其它地方是同一套**（局部正北平面，米；见 `route.js` / `map.js` /
+   `Navigator._to_local`）。所以**地图上量到的距离和导航算出来的距离是同一个数**。
+   地图固定**北朝上**（不跟车头转）：静止找路时车头朝上的地图会自己乱转，更难读；
+   朝向由车标箭头表达。（设备那块圆屏是车头朝上的 —— 那是另一个使用场景。）
+3. **这一层一个网络请求都不发**。路网只来自已经缓存过的离线瓦片和 `OsmMapSource`
+   手上那份数据。所以"骑到没信号的地方地图还在"是**结构**决定的，不是承诺 ——
+   `mapview.mjs` 第 4 节用一个"只会抛错的 fetch"把这件事钉死（fetch 调用次数必须为 0）。
+
+界面与手势：
+
+| 操作 | 效果 |
+|---|---|
+| 单指拖动 / 鼠标拖动 | 平移（同时**停止跟随**，面板上会写明"自由查看"） |
+| 双指捏合 / 滚轮 | 以手势位置为锚缩放（锚点下面的地理位置不动） |
+| 双击 | 放大一档 |
+| `回到当前位置` | 重新打开跟随，并把中心挪回当前位置 |
+| `放大` / `缩小` | 缩放一档（**不**打断跟随） |
+
+高 DPI：画布的像素尺寸 = CSS 尺寸 × `devicePixelRatio`，再用
+`setTransform(dpr,0,0,dpr,0,0)` 把绘制坐标系缩放回 CSS 像素 —— 不做这一步的话，
+手机上整张图是糊的，而 CSS 尺寸没变，看起来完全像"浏览器的问题"。
+
+底图开关（`选项 → 显示街道路网底图`）关掉时，地图**不再画街道路网**，只画航线与
+当前位置 —— 那个勾选框的字面意思就是"显示街道路网底图"，说到就要做到。
+
+性能（开发机实测，240×240 一屏、每条折线 8 个点、整帧 = 底色 + 全部路网 + 航线 +
+车标 + 比例尺）：600 段中位 **0.57 ms**，1200 段 **1.16 ms**；真实数据（杭州西湖一带
+6 块 z14 瓦片 = 3128 段 / 11461 点，480×480）**0.10 ms/帧**。
+⚠️ 这些是**JS 侧**（投影 + 整段裁剪 + 分组 + 路径构造）的耗时，**不包含**浏览器的
+光栅化；量它的那个上下文什么都不画。瓶颈在"每个点的投影"和"每段的包围盒裁剪"
+（实测裁剪 11461 个点约 0.39 ms），两者都是 O(点数) 且没有 O(N²) 的东西。
+
+### 按地名搜目的地（`search.js`，这一版新增）
+
+骑行途中在手机上输六位小数的经纬度是不现实的，所以「目的地」面板**最上面**现在
+是搜索框，手输经纬度降级成兜底（没有网络时还能用），常用地点下拉照旧保留。
+
+**⭐ 位置偏置不是可选项**（这是实测出来的，不是"最好带上"）：
+
+| 查询 | 偏置 | 第一条 |
+|---|---|---|
+| 杭州西湖 | **无** | `22.7272, 120.3230` **台湾高雄楠梓區**（`landuse=residential`）|
+| 西湖 | 杭州 (30.2545,120.1350) | `30.2460, 120.1431` `water=lake` ← 正确的西湖 |
+| 天安门 | 北京 (39.9097,116.3974) | `39.9074, 116.3913` `historic=city_gate` ← 真正的城楼 |
+
+不带偏置那次差了 **837 公里、跨了一个省**。偏置的取法：
+**当前位置 → 导航起点 → 地图中心**；三个都没有时**照搜**，但界面上会如实写
+"未按位置排序 / 没有位置，结果可能来自别的城市"。
+
+结果列表每条显示：**名称 + 副标题（省·市·区·街道）+ 距偏置点多远**。
+副标题用来分辨同名地点（「西湖」在杭州、福州、日本山梨县、台北都有）；
+距离超过 50 km 的那条会**标黄**——这是"搜到别的城市/省份"唯一一眼能看出来的信号。
+点一条就把坐标填进下面的纬度/经度，并把地图挪过去（顺带关掉跟随，否则下一帧
+就被定位拽回来）。
+
+三条容易踩的边界（都有自测钉着）：
+
+1. **"没找到" ≠ "搜索失败"**。`search.js` 区分 `ok:true, results:[]`（上游明确说
+   没有这个地方）和 `ok:false`（这次没问成）。界面两套文案、两套配色 ——
+   混成一句，用户会对着网络问题一直换关键词。
+2. **点选之后必须把"常用地点"下拉清回"自定义坐标"**：`read_destination()` 里
+   预设是**优先于**坐标框的，不清掉就会出现"坐标框变了、实际用的还是下拉里那个"。
+3. **过期响应必须丢掉**：连着搜两次时，先发的慢请求回来不能覆盖后发的结果
+   （用请求序号挡）。
+
+代价要说清楚：**OSM 在中国的 POI 覆盖弱于高德/百度**（店铺名、小区名尤其），
+道路名/地名/车站/景点尚可。这是不买需要 key 的服务的必然结果，不是实现问题。
+兜底的 Nominatim（OSM 官方）**在这台开发机上连不通**（DNS 能解析、TCP 连不上），
+所以那条路只有假 fetch 的自测覆盖，**没有**真网络验证 —— 界面文案不依赖它一定工作。
+
 ---
 
 ## 5. 已知的坑与未验证项
@@ -418,7 +528,7 @@ Overpass 就一定有明确结论（成功、来自缓存、还是不可用 + �
 `proto.js` / `navmath.js` 的任何改动，都要：
 
 ```bash
-node phone/test/run-all.mjs       # 四套全跑，必须全绿
+node phone/test/run-all.mjs       # 六套全跑，必须全绿
 python tools/selftest.py          # PC/C++ 侧没被搞坏，必须 50/50
 ```
 
@@ -435,11 +545,18 @@ python tools/selftest.py
 ### 改了 `phone/` 里任何一个**被预缓存的文件**之后
 
 `sw.js` 的 `ASSETS` 清单里那些文件（`index.html` / `style.css` / `app.js` /
-`map.js` / `ble.js` / `route.js` / `proto.js` / `navmath.js` / `manifest.webmanifest`
-/ `icon.svg`）改完，**必须**把 `sw.js` 顶部的 `CACHE` 版本号 +1
-（当前是 `navpuck-phone-v4`）。Service Worker 是**缓存优先**的：版本号不变，
-手机上的 PWA 会一直吃旧副本，症状是"代码明明改了、手机上还是老样子"——
+`proto.js` / `navmath.js` / `route.js` / `tiles.js` / `map.js` / `mapview.js` /
+`search.js` / `ble.js` / `ble_native.js` / `fgs.js` / `fgs_ui.js` /
+`manifest.webmanifest` / `icon.svg`）改完，**必须**把 `sw.js` 顶部的
+`CACHE` 版本号 +1（当前是 `navpuck-phone-v16`）。Service Worker 是**缓存优先**的：
+版本号不变，手机上的 PWA 会一直吃旧副本，症状是"代码明明改了、手机上还是老样子"——
 而且因为改动本身没生效，用户根本看不出是缓存问题。
 
-这一版（`v3` → `v4`）改的正是底图那套（`map.js` 的镜像顺序 / 超时 / sticky +
-本文件），所以**必须在手机上看到 `v4` 才会拿到这个修复**。
+⚠️ **新加的文件也必须进 `ASSETS`**：不进清单的话，离线打开 PWA 时那个文件取不到
+（`fgs.js` / `fgs_ui.js` 就这么漏过一次；`mapview.js` 漏了的话症状是
+"手机上地图那一块整个缺失"，而它恰恰是**最需要离线可用**的东西；
+`search.js` 漏了的话搜索那一栏会一直写"搜索模块没加载成功"）。
+
+`phone/test/mapview.mjs` 第 1 节会核对"`index.html` 里的每个 `<script>` 都在
+`sw.js` 的 `ASSETS` 里"，以及缓存版本号是不是当前这个值 —— 忘了改会被自测抓住
+（`phone/test/search.mjs` 第 4 节同样钉了一遍）。

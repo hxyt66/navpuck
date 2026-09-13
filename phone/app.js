@@ -33,10 +33,24 @@
   const proto = root.NavPuckProto;
   const rt = root.NavPuckRoute;
   const mapmod = root.NavPuckMap;
+  // 地图视图（Canvas 画路网，见 phone/mapview.js）。**可以缺席**：文件没加载
+  // 成功时地图那一块显示"模块没加载"，导航/蓝牙/10Hz 一条都不受影响 ——
+  // 和 mapmod 的容错是同一个路数，但这个是"用户能看到地图"的唯一入口，
+  // 所以缺席时必须说清楚（见 App.mapview_instance）。
+  const mvmod = root.NavPuckMapView;
+  // 地点搜索（Photon，见 phone/search.js）。**可以缺席**：文件没加载成功时
+  // 搜索那一栏会写"搜索模块没加载"，手输经纬度/常用地点照常能用。
+  const srch = root.NavPuckSearch;
 
   // 界面选项的持久化键。手机上的 PWA 每次打开都要重新勾一遍很烦，而
   // "关掉街道路网底图"（省流量、省电、Overpass 挂了）恰恰正是要记住的选择。
   const PREF_MAP_KEY = 'navpuck.opt.map.v1';
+
+  // 搜索结果里"离得太远"的阈值（米）。超过它就把那一条标出来
+  // （黄框 + 黄字距离）—— 这是"搜到了别的城市/省份"唯一能被一眼看出来的
+  // 地方：不带位置偏置搜「西湖」拿到的那个同名地点在 800 公里外，
+  // 光看名字和"浙江省杭州市"这种副标题是分不出来的（副标题也可能是空的）。
+  const SEARCH_FAR_M = 50000.0;
 
   // ⚠️ "底图已关闭"那句话**只有 map.js 里那一份**（OsmMapSource.status() 也用
   //    它）。这里取出同一个常量，是为了 map.js 自己都没加载成功时（底图源都
@@ -1468,6 +1482,24 @@
       this.log_lines = [];
       this.map_enabled = true;  // "显示街道路网底图"（init 时从存储里恢复）
       this.map_source = null;   // 懒创建的 OsmMapSource（缓存/退避/状态都在它身上）
+      // 手机端地图视图（Canvas，见 phone/mapview.js）：懒创建 + 全局唯一。
+      // 它画的路线折线单独存一份（[[lat,lon],...]）——Route 对象里的点是
+      // RoutePoint（带 cum_m/name），而地图只关心几何，转换一次就够了。
+      this.mapview = null;
+      this._mv_route = null;
+      this._mv_last = null;     // 最近一次地图状态（诊断/自测读）
+      // 地点搜索（见 phone/search.js）：
+      //   search_results  当前列出来的结果（点选时按**下标**取，所以每次搜索
+      //                   都整批替换，不做增量）
+      //   _search_seq     请求序号：用户连着搜两次时，先回来的那个旧响应必须
+      //                   被丢掉（否则界面会被一个过期的结果覆盖）
+      //   _search_fetch   **自测注入用**；浏览器里一直是 null（search.js 会用
+      //                   全局 fetch）
+      this.search_results = [];
+      this._search_seq = 0;
+      this._search_last = null;
+      this._search_fetch = null;
+      this._search_picked = -1;
       // 屏幕常亮（Screen Wake Lock）的持有者：懒创建，见 wake()
       this._wake = null;
       // 上一次画进状态面板的"循环/屏幕常亮"快照（只在变化时重画，见
@@ -1935,6 +1967,10 @@
       // 模拟行驶的实时读数：走到哪了、速度多少、航向多少（过弯时会变）。
       // 每帧都刷，因为它就是"这条路真的在动"的证据。
       this.update_sim_readout();
+      // ⭐ 地图：on_ui 是 10Hz 调的，而地图**不需要**跟着 10Hz 重画
+      //    （位置本身就没那么快，而且每帧重画白烧电）。mapview.js 内部有
+      //    5Hz 节流，这里只管"来敲一下"。
+      this.mapview_frame(false);
     }
 
     /**
@@ -2033,9 +2069,467 @@
       };
     }
 
+    // -- 地图（Canvas，手机端唯一"能看见地图"的地方）------------------------
+    //
+    // 用户的诉求就是这一块："我要在手机端 app 看到地图"。以前手机端只有控制
+    // 面板和一堆数字，地图**只出现在设备那块圆屏上**（而且只有手机推过去的那
+    // 一点视距）。现在这一块把同一份路网画在手机上：不引入任何地图库、不需要
+    // 付费底图服务，数据只来自**已经缓存的离线瓦片** + 已规划航线。
+    //
+    // 三条边界：
+    //   1) 地图这一层**一个网络请求都不发**。路网要么是 OsmMapSource 已经拿到
+    //      的那份（它自己离线优先），要么是本地瓦片（TileStore.local_area，
+    //      纯 IndexedDB 读）。所以"没有网也能看到当前位置一带的路网"是结构
+    //      决定的，不是承诺（自测用"fetch 一律抛错"钉着它）。
+    //   2) 它**绝不阻塞导航**：画一帧是纯 CPU（240×240 上实测 <1ms，见自测的
+    //      性能那节），而且每帧最多画一次（mapview.js 里 5Hz 节流）。
+    //   3) 底图开关关掉时地图**不画街道路网**（只画航线与当前位置）—— 那个
+    //      勾选框的字面意思就是"显示街道路网底图"，说到就要做到。
+
+    /**
+     * 地图视图：**懒创建 + 全局唯一**。
+     *
+     * 唯一是必须的：画布尺寸/DPR/视图中心/手势状态/本地瓦片缓存全挂在它身上，
+     * 每次重画都新建一个的话，用户拖动一下地图就被重置回当前位置了。
+     *
+     * @returns {MapView|null} null = mapview.js 没加载成功，或页面上没有画布
+     */
+    mapview_instance() {
+      if (this.mapview) return this.mapview;
+      const cv = $('mapview');
+      if (!mvmod || !mvmod.MapView) {
+        this.log('[mapview] 地图模块（mapview.js）没加载成功：手机上看不到地图' +
+                 '（导航、蓝牙、10Hz 更新都照常）');
+        return null;
+      }
+      if (!cv) {
+        this.log('[mapview] 页面上没有 #mapview 画布：手机上看不到地图');
+        return null;
+      }
+      const self = this;
+      const demo = rt.DEMO_ROUTE;
+      try {
+        this.mapview = new mvmod.MapView(cv, {
+          // ① 同步：OsmMapSource 手上那份（离线瓦片优先、Overpass 兜底）
+          ways: () => self.mapview_ways(),
+          // ② 异步、**只读本地**：本地瓦片（内存 + IndexedDB）
+          load_local: (lat, lon, r) => self.mapview_load_local(lat, lon, r),
+          pos: () => self.mapview_pos(),
+          route: () => self._mv_route,
+          // 还没有定位时的初始中心：内置演示航线的起点。不这么做的话，
+          // 第一次打开页面是一片空白，看起来就像"地图坏了"。
+          center: [demo[0][0], demo[0][1]],
+          on_status: (st) => self.mapview_status(st),
+          log: (l) => self.log(l),
+        });
+      } catch (e) {
+        this.mapview = null;
+        this.log(`[mapview] 地图视图建不起来：${e}（导航不受影响）`);
+        return null;
+      }
+      this.mapview.attach(cv);
+      this.log('[mapview] 地图已就绪：拖动平移、双指/滚轮缩放、' +
+               '「回到当前位置」回到跟随（数据只来自已缓存的离线瓦片）');
+      return this.mapview;
+    }
+
+    /**
+     * 地图要画的路网（同步，每帧调）。
+     *
+     * 只认 `OsmMapSource.ways`：它的形状是 `[[rank,[[lat,lon],...]],...]`，
+     * 而瓦片解码、Overpass 兜底、缓存全都已经在那一层处理过了（见 map.js）。
+     * 底图关掉时返回 null —— 地图退回"只画航线与当前位置"。
+     */
+    mapview_ways() {
+      if (!this.map_enabled) return null;
+      const ms = this.map_source || (this.nav && this.nav.map_src);
+      if (ms && Array.isArray(ms.ways) && ms.ways.length) return ms.ways;
+      return null;
+    }
+
+    /**
+     * 从**本地瓦片**里取一片路网（内存 + IndexedDB，**完全离线**）。
+     *
+     * ⚠️ 用的是 `TileStore.local_area()`：它只读本地、不排下载、不碰 fetch
+     *    （见 tiles.js 里那段说明）。所以这一条路径在飞行模式下也照样出数据 ——
+     *    这正是用户要的"没网也能看到当前位置一带的路网"。
+     *
+     * 它同时覆盖了"还没开始导航"这个场景：导航循环不跑的时候没有人去调
+     * OsmMapSource.refresh()，地图就自己从本地瓦片里把这一带读出来。
+     */
+    mapview_load_local(lat, lon, radius_m) {
+      if (!this.map_enabled) return null;
+      const ms = this.map_source_instance();
+      if (!ms || !ms.tiles) return null;
+      try {
+        if (typeof ms.tiles.local_area === 'function') {
+          return ms.tiles.local_area(lat, lon, radius_m);
+        }
+      } catch (e) {
+        this.log(`[mapview] 本地瓦片读取出错（地图继续画已有的）：${e}`);
+      }
+      return null;
+    }
+
+    /**
+     * 地图上"当前位置"从哪来：**和导航用的是同一个位置源**。
+     *
+     * 优先级由 active_source() 决定（模拟行驶 > 手动位置 > GPS），所以地图上
+     * 那个绿点和设备屏幕上那台车**永远是同一个点** —— 不会出现"手机说在这、
+     * 设备画在那"。没有定位就退回导航起点（用户按过"用当前位置作起点"的那个）。
+     */
+    mapview_pos() {
+      const src = this.active_source();
+      if (src && src.lat !== null && src.lon !== null &&
+          Number.isFinite(src.lat) && Number.isFinite(src.lon)) {
+        return [src.lat, src.lon, src.heading];
+      }
+      if (this.start_lat !== null && this.start_lon !== null) {
+        return [this.start_lat, this.start_lon, null];
+      }
+      return null;
+    }
+
+    /**
+     * 画一帧地图。**在页面后台时直接跳过**（屏幕都没亮，画了也看不见，
+     * 只是白烧电）。
+     *
+     * @param {boolean} force true = 忽略 5Hz 节流（手势、按钮、刚拿到数据）
+     */
+    mapview_frame(force) {
+      const mv = this.mapview_instance();
+      if (!mv) return false;
+      if (this.page_hidden()) return false;
+      try {
+        return mv.tick(!!force);
+      } catch (e) {
+        // 地图画不出来绝不能让 10Hz 循环看到异常（on_ui 会调到这里）
+        this.log(`[mapview] 画一帧出错（本次跳过）：${e}`);
+        return false;
+      }
+    }
+
+    /** 把地图状态写进面板（和底图那一格同一个路数：短格 + 一行详情）。 */
+    mapview_status(st) {
+      this._mv_last = st;
+      const el = $('mapview-state');
+      const d = $('mapview-detail');
+      // 底图关掉时**不要**说"暂无路网" —— 那看起来像"这一带没数据"，
+      // 而事实是用户自己关掉的。状态必须说得清楚。
+      if (!this.map_enabled) {
+        if (el) { el.textContent = '已关闭'; el.dataset.state = 'idle'; }
+        if (d) {
+          d.textContent = '街道路网底图已关闭：地图只画航线与当前位置（一个请求都不发）。' +
+            '在「选项」里重新勾上就能恢复。';
+          d.classList.remove('warn');
+        }
+        return;
+      }
+      if (el) {
+        el.textContent = st.short;
+        el.dataset.state = st.state || '';
+      }
+      if (d) {
+        d.textContent = st.detail || '';
+        d.classList.toggle('warn', st.state === 'empty' || st.state === 'unavailable');
+      }
+    }
+
+    /** 设置地图上的航线折线（null = 清掉）。 */
+    set_mapview_route(pts, recenter) {
+      this._mv_route = (pts && pts.length >= 2) ? pts : null;
+      const mv = this.mapview_instance();
+      if (!mv) return false;
+      if (recenter && pts && pts.length >= 2) {
+        mv.follow = true;
+        mv.set_center(pts[0][0], pts[0][1], true);
+      }
+      mv.invalidate();
+      this.mapview_frame(true);
+      return true;
+    }
+
+    // -- 地点搜索（见 phone/search.js）--------------------------------------
+    //
+    // 用户的诉求："输个地名就能当目的地"。以前只能手输经纬度或者从 7 个预设里
+    // 挑一个 —— 骑行途中在手机上输六位小数是不现实的。
+    //
+    // ⚠️ 四条不能破的边界（前两条是 search.js 里实测出来的，不是猜的）：
+    //   1) **必须带位置偏置**。不带偏置搜「西湖」会返回**台湾高雄**的同名地点
+    //      （实测差 800 公里、跨了一个省）。偏置取"当前位置 → 导航起点 →
+    //      地图中心"，一个都没有时**照搜**，但在界面上如实写"未按位置排序"。
+    //   2) **"没这个地方"和"请求失败"必须长得不一样**。search.js 已经区分好了
+    //      （`ok:true, results:[]` vs `ok:false`），界面这一层不许把它们揉成
+    //      同一句话 —— 前者换个词就行，后者要等网络。
+    //   3) 搜索**绝不拖累导航**：它整条路都在 try/catch 里，`search()` 本身也
+    //      承诺永不 reject，任何异常都只表现为"这次没搜到"。
+    //   4) 点选结果时**必须把"常用地点"下拉清回"自定义坐标"** ——
+    //      `read_destination()` 里预设是优先于坐标框的（见那里的说明），不清掉
+    //      的话用户点了搜索结果、坐标框也变了，但按"规划并开始导航"用的还是
+    //      下拉里那个旧地点。这个坑很隐蔽，自测里专门钉了一条。
+
+    /** 偏置点从哪来：当前位置 > 导航起点 > 地图中心 > 没有。 */
+    search_bias() {
+      const src = this.active_source();
+      if (src && Number.isFinite(src.lat) && Number.isFinite(src.lon)) {
+        return { lat: src.lat, lon: src.lon, from: 'gps' };
+      }
+      if (Number.isFinite(this.start_lat) && Number.isFinite(this.start_lon)) {
+        return { lat: this.start_lat, lon: this.start_lon, from: 'start' };
+      }
+      const mv = this.mapview;
+      if (mv && mv.view && Number.isFinite(mv.view.lat) && Number.isFinite(mv.view.lon)) {
+        return { lat: mv.view.lat, lon: mv.view.lon, from: 'map' };
+      }
+      return null;
+    }
+
+    /** 偏置来源的人话（界面上要说清楚"这次是按什么排的"）。 */
+    _bias_text(bias) {
+      if (!bias) return '未按位置排序';
+      if (bias.from === 'gps') return '按当前位置排序';
+      if (bias.from === 'start') return '按导航起点排序';
+      return '按地图中心排序';
+    }
+
+    /** 写搜索状态行（三种状态三套配色，见 style.css 的 #search-info）。 */
+    set_search_info(state, text) {
+      const el = $('search-info');
+      if (!el) return false;
+      el.textContent = text || '';
+      el.dataset.state = state || '';
+      el.classList.toggle('warn', state === 'empty');
+      return true;
+    }
+
+    /** 清空结果列表（不含状态行）。 */
+    clear_search_results() {
+      this.search_results = [];
+      this._search_picked = -1;
+      const box = $('search-results');
+      if (box) {
+        this._clear_children(box);
+        box.hidden = true;
+      }
+      return true;
+    }
+
+    /**
+     * 清掉一个元素的全部子节点。
+     *
+     * ⚠️ 刻意**不用 innerHTML**：结果里的 `name`/`detail` 是从 OSM（第三方）
+     *    来的字符串，拼进 HTML 就是一个注入口子。全程 `createElement` +
+     *    `textContent`，浏览器只会把它当文本。
+     *    （那个 `n > 500` 的上限是防"某个元素的 removeChild 没有真的删掉"时
+     *      这里转成死循环 —— 循环里的 bug 比多一行判断贵得多。）
+     */
+    _clear_children(el) {
+      if (!el) return 0;
+      let n = 0;
+      while (el.firstChild && n < 500) {
+        el.removeChild(el.firstChild);
+        n += 1;
+      }
+      return n;
+    }
+
+    /**
+     * 搜地名。
+     *
+     * @param {string} [query] 不给就读输入框
+     * @returns {Promise<object|null>} search.js 的返回值；没发请求时 null
+     */
+    async do_search(query) {
+      const input = $('search-input');
+      const raw = (query === undefined || query === null) ? (input ? input.value : '') : query;
+      const q = String(raw == null ? '' : raw).trim();
+
+      // 请求序号：这一次搜索的编号。回来时对不上就说明用户又搜了一次，
+      // 这时的旧结果必须**整批丢掉**，不能覆盖新的（弱网下这很常见）。
+      this._search_seq += 1;
+      const seq = this._search_seq;
+
+      if (!srch || typeof srch.search !== 'function') {
+        this.clear_search_results();
+        this.set_search_info('error',
+          '搜索模块（search.js）没加载成功：不能按地名搜索。' +
+          '手输下面的纬度/经度，或者用「常用地点」都不受影响。');
+        this.log('[search] search.js 没加载成功：搜索那一栏不可用（其余功能照常）');
+        return null;
+      }
+
+      // 空输入**不发请求**（search.js 也是这么约定的）。这里只说清楚该做什么。
+      if (!q) {
+        this.clear_search_results();
+        this.set_search_info('idle', '请输入地名再搜索（例如「西湖」「广州塔」）。');
+        return null;
+      }
+
+      const bias = this.search_bias();
+      this.set_search_info('loading', `搜索中…「${q}」`);
+      this.log(`[search] 「${q}」${bias
+        ? `偏置=${bias.lat.toFixed(5)},${bias.lon.toFixed(5)}（${this._bias_text(bias)}）`
+        : '**没有位置偏置**：结果可能来自别的城市/省份'}`);
+
+      let res = null;
+      try {
+        const opts = { limit: srch.SEARCH_LIMIT_DEFAULT };
+        if (bias) { opts.lat = bias.lat; opts.lon = bias.lon; }
+        if (this._search_fetch) opts.fetch = this._search_fetch;
+        res = await srch.search(q, opts);
+      } catch (e) {
+        // search.js 承诺永不 reject，但界面这一层不能"假设别人守约"。
+        res = { ok: false, results: [], error: String(e && e.message ? e.message : e),
+                biased: !!bias, source: '', from_cache: false };
+      }
+      if (seq !== this._search_seq) {
+        this.log(`[search] 「${q}」的结果已过期（用户又搜了一次），丢弃`);
+        return res;
+      }
+
+      this._search_last = { q, res, bias };
+      this.search_results = Array.isArray(res.results) ? res.results : [];
+      this._search_picked = -1;
+      this.render_search_results(this.search_results, res, bias);
+
+      const tail = res.from_cache ? '（来自缓存）' : '';
+      if (!res.ok) {
+        // ⚠️ 失败就是失败：不许写成"没找到"。
+        this.set_search_info('error', `搜索失败：${res.error || '未知原因'}。` +
+          '导航不受影响 —— 可以直接填下面的纬度/经度，或者用「常用地点」。');
+        this.log(`[search] 「${q}」失败：${res.error || '未知原因'}`);
+      } else if (this.search_results.length === 0) {
+        // ⚠️ "没这个地方"是成功的一种（请求通了、上游明确没这条），
+        //    和上面那条失败**必须**区分开 —— 处理办法完全不同。
+        this.set_search_info('empty', `没找到「${q}」这个地方${tail}。` +
+          `换个说法试试（例如加城市名），或者直接填经纬度` +
+          `${bias ? '' : '；另外这次**没有位置**，带不上位置偏置'}` +
+          '（用「用当前位置作起点」或地图拿到位置后会更准）。');
+        this.log(`[search] 「${q}」0 条（${res.source || '?'}）—— 确认"没这个地方"，不是请求失败`);
+      } else {
+        this.set_search_info('done',
+          `找到 ${this.search_results.length} 条 · ${this._bias_text(bias)}${tail}` +
+          (bias ? '' : ' ⚠️ 没有位置偏置：结果可能来自别的城市/省份，看下面的距离'));
+        this.log(`[search] 「${q}」→ ${this.search_results.length} 条（${res.source || '?'}${tail}）`);
+      }
+      return res;
+    }
+
+    /**
+     * 把结果画成可点的列表。
+     *
+     * 每条三行信息：名称 / 副标题（省·市·区·街道）/ 距离。
+     * **副标题是必须的** —— 同名地点（"西湖"全国有好几个）光看名字分不出来；
+     * **距离也是必须的** —— 800 公里外那条唯一的线索就是"812km"这个数。
+     */
+    render_search_results(results, res, bias) {
+      const box = $('search-results');
+      if (!box) return 0;
+      const doc = (typeof document !== 'undefined') ? document : null;
+      const list = Array.isArray(results) ? results : [];
+      this._clear_children(box);
+      if (!doc || list.length === 0) {
+        box.hidden = true;
+        return 0;
+      }
+      for (let i = 0; i < list.length; i += 1) {
+        box.appendChild(this._mk_search_item(list[i], i, bias, doc));
+      }
+      box.hidden = false;
+      return list.length;
+    }
+
+    /** 造一条结果的 DOM（全程 textContent，不用 innerHTML，见 _clear_children）。 */
+    _mk_search_item(r, i, bias, doc) {
+      const item = doc.createElement('button');
+      item.type = 'button';
+      item.className = 'search-item';
+      item.dataset.index = String(i);
+
+      const name = doc.createElement('span');
+      name.className = 'search-name';
+      name.textContent = (r && r.name) ? String(r.name) : '(未命名)';
+      item.appendChild(name);
+
+      const detail = doc.createElement('span');
+      detail.className = 'search-detail';
+      // 副标题没有内容时，退化成 OSM 类型（`water=lake`）——总之不能是空白
+      detail.textContent = (r && r.detail) ? String(r.detail)
+        : ((r && r.kind) ? String(r.kind) : '');
+      item.appendChild(detail);
+
+      if (bias && r && Number.isFinite(r.lat) && Number.isFinite(r.lon)) {
+        const m = nm.distance_m(bias.lat, bias.lon, r.lat, r.lon);
+        const dist = doc.createElement('span');
+        dist.className = 'search-dist';
+        dist.textContent = `距${this._bias_text(bias)} ${nm.format_distance(m)}`;
+        item.appendChild(dist);
+        // 超过 50km 就标出来：这是"搜到别的城市/省份"唯一看得见的信号
+        if (m > SEARCH_FAR_M) item.dataset.far = '1';
+      }
+
+      item.addEventListener('click', () => this.pick_search_result(i));
+      return item;
+    }
+
+    /**
+     * 点选一条结果 -> 填进目的地坐标。
+     *
+     * @returns {object|null} 被选中的那条（没有就 null）
+     */
+    pick_search_result(i) {
+      const r = this.search_results[i];
+      if (!r) return null;
+      // ⚠️ 见方法区开头第 4 条：不清掉预设，read_destination() 会继续用下拉里
+      //    那个旧地点（预设优先于坐标框）。
+      const sel = $('dest-preset');
+      if (sel) sel.value = '';
+      const la = $('dest-lat');
+      const lo = $('dest-lon');
+      const lat_s = Number(r.lat).toFixed(6);
+      const lon_s = Number(r.lon).toFixed(6);
+      if (la) la.value = lat_s;
+      if (lo) lo.value = lon_s;
+
+      this._search_picked = i;
+      const box = $('search-results');
+      if (box && box.children) {
+        for (let k = 0; k < box.children.length; k += 1) {
+          const ch = box.children[k];
+          if (ch && ch.dataset) {
+            if (k === i) ch.dataset.picked = '1';
+            else delete ch.dataset.picked;
+          }
+        }
+      }
+
+      const what = `${r.name || '(未命名)'}（${lat_s}, ${lon_s}）` +
+                   (r.detail ? ` · ${r.detail}` : '');
+      this.set_search_info('done', `已选：${what}`);
+      this.toast(`目的地：${r.name || lat_s + ', ' + lon_s}`, 5000);
+      this.log(`[search] 已选目的地：${what}` +
+        `${r.kind ? `　[${r.kind}]` : ''}${r.source ? `（来源 ${r.source}）` : ''}`);
+
+      // 在地图上把它显示出来 —— "这条在哪个城市"最直观的答案就是看一眼地图。
+      // ⚠️ 这会**关掉跟随**（否则下一帧就被定位拽回当前位置，等于没看）。
+      //    地图角标会写"自由查看（点「回到当前位置」）"，随时能回来。
+      if (this.mapview) {
+        try {
+          this.mapview.follow = false;
+          this.mapview.set_center(r.lat, r.lon, true);
+          this.mapview_frame(true);
+        } catch (e) {
+          this.log(`[search] 地图上定位这个点失败（忽略）：${e}`);
+        }
+      }
+      return r;
+    }
+
+
     // -- BLE 分片（闪退修复的调节口，见 phone/ble_native.js）------------------
     /**
      * 造策略对象 + 接好界面。**必须在造 transport 之前调用**：
+     *
      * transport 每一帧都要问它"这一帧最多能写多少字节"。
      */
     init_chunk_policy() {
@@ -2226,6 +2720,16 @@
       if (!quiet) {
         this.log(`[map] 街道路网底图已${want ? '打开' : '关闭'}`);
         this.toast(want ? '已打开街道路网底图' : '已关闭街道路网底图（不影响导航）');
+      }
+      // 地图那一块跟着变：关掉时把已经读进内存的本地路网也扔掉（否则地图上
+      // 还留着上一次画的路，看起来像"开关没生效"），然后立刻重画 + 重写状态。
+      // ⚠️ 状态必须**无条件**重写一次：mapview.js 内部对"状态文本没变"有去重
+      //    （见 _emit_status），不清掉那层去重的话，"关掉再打开"之后面板会一直
+      //    停在上一次的"已关闭"——而地图明明已经在画了。
+      if (this.mapview) {
+        if (!want) this.mapview.drop_local();
+        this.mapview_frame(true);
+        this.mapview_status(this.mapview.status());
       }
       return want;
     }
@@ -2666,6 +3170,17 @@
           `${route.points.length} 点 · ${route.maneuvers.length} 个转向点`;
       }
 
+      // ⭐ 地图上也要出现这条航线 —— 用户"规划并开始导航"之后第一件想确认的
+      //    事就是"它给我规划的这条线长什么样"。Route 的点是 RoutePoint
+      //    （带 cum_m/name），地图只要几何，所以在这里转成 [[lat,lon],...]。
+      //    ⚠️ 包一层 try：地图出任何问题都不该让"开始导航"失败。
+      this.route = route;
+      try {
+        this.set_mapview_route(route.points.map((p) => [p.lat, p.lon]), true);
+      } catch (e) {
+        this.log(`[mapview] 航线交给地图时出错（忽略，导航照常）：${e}`);
+      }
+
       // 模拟行驶：把刚规划出来的航线交给模拟源 —— 它**必须**先有航线才能沿路
       // 推进，所以 active_source() 要在这之后再取一次（在这之前它只能返回
       // GPS/手动源）。起点偏移也在这里重新应用一次：用户可能先规划、后勾选。
@@ -3072,6 +3587,39 @@
         }
       });
 
+      // ---- 地点搜索（见 phone/search.js）----
+      //
+      // 只在这两个时机发请求：**回车**和按「搜索」。刻意不做"边打边搜"——
+      // Photon 是别人捐出来的免费实例，每敲一个字就发一次请求是打限流的
+      // 标准姿势（search.js 里的缓存也是为这件事准备的）。
+      {
+        const si = $('search-input');
+        if (si) {
+          si.addEventListener('keydown', (ev) => {
+            // 手机键盘右下角那颗键就是"搜索"（index.html 里的 enterkeyhint），
+            // 桌面上是 Enter。两条都走同一个入口。
+            const key = (ev && (ev.key !== undefined ? ev.key : ev.keyCode));
+            if (key === 'Enter' || key === 13) {
+              if (ev.preventDefault) ev.preventDefault();
+              this.do_search();
+            }
+          });
+          // `type=search` 自带的那个"清空"小叉会发一个 search 事件
+          si.addEventListener('search', () => {
+            if (!si.value) {
+              this.clear_search_results();
+              this.set_search_info('idle', '已清空：输入地名再搜索。');
+            }
+          });
+        }
+        on('search-btn', 'click', () => this.do_search());
+        if (!srch) {
+          this.set_search_info('error',
+            '搜索模块（search.js）没加载成功：不能按地名搜索。' +
+            '手输纬度/经度或者用「常用地点」都不受影响。');
+        }
+      }
+
       on('opt-log', 'change', () => {
         document.body.classList.toggle('show-log', !!$('opt-log').checked);
       });
@@ -3106,6 +3654,43 @@
         const el = $('opt-map');
         this.set_map_enabled(!!(el && el.checked), false);
       });
+
+      // ---- 地图（Canvas，见 phone/mapview.js）------------------------------
+      //
+      // ⚠️ 建视图放在**这里**（底图开关恢复之后），因为地图画什么由
+      //    map_enabled 决定；放前面的话第一次状态写的还是旧值。
+      //
+      // 它和导航是**解耦**的：地图在"还没连接设备、还没定位"时就已经在了，
+      // 靠下面那个 1 秒的心跳刷新（有定位就跟着走、没有就停在演示起点）。
+      // 这样用户打开页面第一眼就能看到地图，而不是"必须先跑完整条链路"。
+      this.mapview_instance();
+      this.mapview_frame(true);
+      on('mapview-here-btn', 'click', () => {
+        const mv = this.mapview_instance();
+        if (!mv) return;
+        mv.recenter();
+        this.mapview_frame(true);
+        if (!this.mapview_pos()) {
+          this.toast('还没有定位：地图停在最后一次的位置', 5000);
+        } else if (mv.follow) {
+          this.toast('地图已回到当前位置');
+        }
+      });
+      on('mapview-zoom-in', 'click', () => {
+        const mv = this.mapview_instance();
+        if (mv) { mv.zoom_by(1.0); this.mapview_frame(true); }
+      });
+      on('mapview-zoom-out', 'click', () => {
+        const mv = this.mapview_instance();
+        if (mv) { mv.zoom_by(-1.0); this.mapview_frame(true); }
+      });
+      // 屏幕旋转 / 键盘弹出 / 面板展开都会改变画布的 CSS 尺寸。不重设的话，
+      // 高 DPI 下画布的实际像素尺寸就和布局对不上了（图会糊或者被拉伸）。
+      const on_layout = () => { if (this.mapview) this.mapview.on_resize(); };
+      if (root.addEventListener) {
+        root.addEventListener('resize', on_layout);
+        root.addEventListener('orientationchange', on_layout);
+      }
 
       // ---- BLE 分片（真机闪退的调节口，见 phone/ble_native.js）----
       // 恢复落盘的"上限/自动升档"，并把当前分片画进状态面板。
@@ -3160,6 +3745,10 @@
       setInterval(() => {
         if (this.ble) this.ble.tick_watchdog();
         this.tick_clock();
+        // ⭐ 地图的心跳：**导航没在跑的时候也要刷**（这正是"打开 app 就能看到
+        //    地图"的那条路）。mapview.js 内部有 5Hz 节流，所以 1 秒敲一次
+        //    等于 1Hz 重画；它还兼管"跟着定位走"和"本地瓦片刚读回来就上屏"。
+        this.mapview_frame(false);
       }, 1000);
 
       this.set_link_state('idle', {});

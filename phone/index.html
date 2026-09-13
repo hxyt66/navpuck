@@ -54,6 +54,36 @@
     ⚠️ 正在<b>模拟行驶</b>（沿航线自动推进，不是真实定位）
   </p>
 
+  <!-- ⭐⭐ 地图（Canvas，见 phone/mapview.js）。
+       用户最想要的就是它：以前手机端只有控制面板和数字，**一眼地图都没有**。
+       所以它放在连接区下面、状态面板上面 —— 第一屏就要能看到，**不是**折叠面板。
+
+       ⚠️ 它不依赖任何地图库（Leaflet/MapLibre 都用不上）：瓦片是自产的矢量
+       .npt（NPK1 打包），路网本来就已经在内存/IndexedDB 里，直接画折线即可。
+       数据只来自**已经缓存的离线瓦片** + 已规划航线，所以没有网络时照样能看。
+       拖动/双指缩放/滚轮缩放都在 mapview.js 里；按钮只是给单手操作的入口。 -->
+  <section class="panel map-panel" aria-label="地图">
+    <div class="map-head">
+      <h2>地图</h2>
+      <span id="mapview-state" class="map-state" data-state="idle">—</span>
+    </div>
+    <div class="map-wrap">
+      <!-- width/height 是兜底：app.js 会按 CSS 尺寸 × devicePixelRatio 重设
+           （见 mapview.js 的 resize()），否则高 DPI 手机上整张图是糊的。 -->
+      <canvas id="mapview" width="240" height="240"
+              aria-label="路网地图：可拖动平移、双指或滚轮缩放"></canvas>
+    </div>
+    <div class="btn-row">
+      <button id="mapview-here-btn" type="button" class="ghost">回到当前位置</button>
+      <button id="mapview-zoom-in" type="button" class="ghost">放大</button>
+      <button id="mapview-zoom-out" type="button" class="ghost">缩小</button>
+    </div>
+    <!-- 地图的详情（比例尺、块数、跟随/自由查看）：和 #map-detail 同一个路数 ——
+         日志默认收起，所以"地图为什么不跟着我走"必须常显一行说清楚。 -->
+    <p id="mapview-detail" class="hint">地图会在拿到定位（或开始导航）之后自动显示；
+      没有网络时画的是<b>已经缓存过的</b>离线瓦片。</p>
+  </section>
+
   <!-- 崩溃/异常捕获（crashlog.js）：上一轮如果**没有正常结束**，这里会显示
        崩溃前写入 localStorage 的最后几十行日志 + 原生侧记录（Java 异常栈 /
        WebView 渲染进程死亡）。闪退时进程没了，页面上那块 #log 一个字都不会留下，
@@ -149,6 +179,35 @@
   <!-- 目的地与路线 -->
   <section class="panel" aria-label="目的地">
     <h2>目的地</h2>
+
+    <!-- ⭐ 搜地名（见 phone/search.js）：放在纬度/经度**上面** —— 对用户来说
+         "搜个地名"比"手输经纬度"自然得多，手输那两个框是给没有网络（或者
+         搜不到）时兜底用的。
+
+         ⚠️ 位置偏置不是可选项：不带偏置搜「西湖」会返回**台湾高雄**的同名地点
+         （实测差 800 公里）。app.js 会把当前位置（拿不到就用地图中心）带上去，
+         并把"这次按什么排的 / 有没有偏置"写在 #search-info 上。 -->
+    <div class="fld">
+      <label for="search-input">搜地名</label>
+      <input id="search-input" type="search" enterkeyhint="search"
+             placeholder="如：西湖 / 广州塔" autocomplete="off" autocapitalize="off"
+             spellcheck="false">
+    </div>
+    <div class="btn-row">
+      <button id="search-btn" type="button" class="ghost">搜索</button>
+    </div>
+    <!-- 搜索状态：搜到了几条 / 没这个地方 / 请求失败，**三种说法必须不同**
+         （search.js 里 ok:true+空数组 = "没这个地方"，ok:false 才是失败）。
+         日志默认收起，所以这一行必须常显。 -->
+    <p id="search-info" class="hint">搜地名：结果会按你的位置排序（没有定位时按地图中心；
+      都没有时会提示"未按位置排序"）。</p>
+    <!-- 结果列表：每条 = 名称 + 副标题（省/市/区/街道，用来分辨同名地点）
+         + 距离。点一条就填进下面的纬度/经度。
+         role=group：里面是一组**按钮**（不是 listbox/option 那种选择控件），
+         写 listbox 会要求子节点是 option，那套语义和这里对不上。 -->
+    <div id="search-results" class="search-list" role="group"
+         aria-label="搜索结果" hidden></div>
+
     <div class="fld">
       <label for="dest-lat">纬度</label>
       <input id="dest-lat" type="number" step="any" inputmode="decimal" placeholder="纬度" autocomplete="off">
@@ -266,7 +325,9 @@
     <p class="hint">
       底图来自公共 Overpass 服务（免费、无 key），抓不到时<b>不影响导航</b>：路线、箭头、
       转向提示和 10Hz 更新照常。关掉它就一个 Overpass 请求都不发（省流量、省电，
-      Overpass 挂掉时也不会有任何等待）；这个选择会被记住。
+      Overpass 挂掉时也不会有任何等待）；这个选择会被记住。<br>
+      手机上那块<b>地图</b>也受影响：关掉之后地图只画航线与当前位置，不再画街道路网
+      （地图本来也<b>不</b>联网 —— 它只画已经缓存过的离线瓦片）。
     </p>
     <div class="opt">
       <label for="opt-osrm-profile">路线模式</label>
@@ -424,6 +485,16 @@
 <script src="route.js"></script>
 <script src="tiles.js"></script>
 <script src="map.js"></script>
+<!-- mapview.js：手机端地图（Canvas 画路网）。必须在 tiles.js 之后（它用瓦片那套
+     局部平面/常量对拍），并且在 app.js 之前（app.js 在 init() 里就要用它建视图）。
+     ⚠️ 它**不在也不会崩**：app.js 里 root.NavPuckMapView 为空时只写一行日志，
+     地图那一块显示"模块没加载"，导航/蓝牙/10Hz 一条都不受影响。 -->
+<script src="mapview.js"></script>
+<!-- search.js：地点搜索（Photon，免费无 key；见 phone/search.js 里那段"偏置不是
+     可选项"的实测说明）。它**无依赖**，所以位置随意；放这里是为了让它和
+     app.js 的顺序关系一眼可见。⚠️ 它不在也不会崩：app.js 里拿不到
+     root.NavPuckSearch 时，搜索那一栏会写"搜索模块没加载"，其余功能照常。 -->
+<script src="search.js"></script>
 <script src="ble_native.js"></script>
 <script src="ble.js"></script>
 <script src="fgs.js"></script>
